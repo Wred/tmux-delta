@@ -1,0 +1,138 @@
+# Git worktree helper functions
+
+# Create a worktree for a branch
+gwta() {
+  if ! git rev-parse --git-dir &>/dev/null; then
+    echo "Error: Not inside a git repository"
+    return 1
+  fi
+
+  local branch=${${1// /-}:l}
+  branch=${branch#origin/}
+  if [[ -z $branch ]]; then
+    echo "Usage: gwta <branch-name>"
+    return 1
+  fi
+
+  # Use the main worktree path so this works from any worktree
+  local main_tree=$(git worktree list | head -1 | awk '{print $1}')
+  local dir="$(dirname $main_tree)/$(basename $main_tree)-${branch//\//-}"
+
+  if git show-ref --verify --quiet "refs/heads/$branch"; then
+    git worktree add "$dir" "$branch"
+  elif git show-ref --verify --quiet "refs/remotes/origin/$branch"; then
+    git worktree add "$dir" -b "$branch" "origin/$branch"
+  else
+    # New branch — always base on the repo's default branch, not current HEAD
+    local default_branch
+    default_branch=$(git -C "$main_tree" symbolic-ref --short refs/remotes/origin/HEAD 2>/dev/null)
+    default_branch=${default_branch#origin/}
+    if [[ -z $default_branch ]]; then
+      for candidate in main master; do
+        if git -C "$main_tree" show-ref --verify --quiet "refs/remotes/origin/$candidate"; then
+          default_branch=$candidate
+          break
+        fi
+      done
+    fi
+    if [[ -n $default_branch ]]; then
+      git worktree add "$dir" -b "$branch" "origin/$default_branch"
+    else
+      git worktree add "$dir" -b "$branch"
+    fi
+  fi
+
+  echo "Worktree created at: $dir"
+}
+
+# List all worktrees
+gwtl() {
+  git worktree list
+}
+
+# Remove a worktree by branch name
+gwtrm() {
+  if ! git rev-parse --git-dir &>/dev/null; then
+    echo "Error: Not inside a git repository"
+    return 1
+  fi
+
+  local force=false
+  if [[ $1 == "-f" ]]; then
+    force=true
+    shift
+  fi
+
+  local arg=$1
+  if [[ -z $arg ]]; then
+    echo "Usage: gwtrm [-f] <path-or-branch>"
+    return 1
+  fi
+
+  # Capture main tree path now, before any removal — needed for git commands
+  # that run after the worktree directory is deleted (CWD may become invalid).
+  local main_tree=$(git worktree list | head -1 | awk '{print $1}')
+
+  local dir branch
+  if [[ -d $arg ]]; then
+    # Argument is a worktree path — use it directly and look up the branch
+    dir=$arg
+    branch=$(git -C "$dir" symbolic-ref --short HEAD 2>/dev/null)
+  else
+    # Argument is a branch name — reconstruct the path
+    branch=${${arg// /-}:l}
+    dir="$(dirname $main_tree)/$(basename $main_tree)-${branch//\//-}"
+  fi
+
+  if [[ -d $dir ]]; then
+    if [[ $force != true ]]; then
+      echo "This will remove worktree '$dir:t' and delete branch '$branch'."
+      read -q "reply?Are you sure? [y/N] "
+      echo
+      if [[ $reply != "y" ]]; then
+        echo "Aborted."
+        return 0
+      fi
+    fi
+    if [[ -n $(git -C "$dir" status --porcelain 2>/dev/null) ]]; then
+      echo "Warning: worktree has uncommitted changes:"
+      git -C "$dir" status --short
+      echo
+      read -q "force_reply?Remove anyway? [y/N] "
+      echo
+      if [[ $force_reply != "y" ]]; then
+        echo "Aborted."
+        return 0
+      fi
+      if ! git -C "$main_tree" worktree remove --force "$dir"; then
+        echo "Error: failed to remove worktree '$dir:t'."
+        return 1
+      fi
+    else
+      if ! git -C "$main_tree" worktree remove "$dir"; then
+        echo "Error: failed to remove worktree '$dir:t'."
+        return 1
+      fi
+    fi
+    echo "Worktree removed: $dir:t"
+  fi
+
+  git -C "$main_tree" worktree prune
+
+  # Determine the repo's main/default branch to avoid deleting it
+  local main_branch
+  main_branch=$(git -C "$main_tree" symbolic-ref --short HEAD 2>/dev/null)
+
+  if [[ -n $branch && $branch != "$main_branch" ]]; then
+    git -C "$main_tree" branch -D "$branch" && echo "Branch deleted: $branch"
+  elif [[ $branch == "$main_branch" ]]; then
+    echo "Note: worktree was on '$branch' (default branch), skipping branch deletion"
+  else
+    echo "Note: could not determine branch name, skipping branch deletion"
+  fi
+}
+
+# Prune stale worktree references
+gwtp() {
+  git worktree prune -v
+}
