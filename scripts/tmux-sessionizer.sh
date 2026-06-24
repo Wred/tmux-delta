@@ -39,7 +39,7 @@ else
 					fi
 				done
 			fi
-			{ find $directories -mindepth 2 -maxdepth 2 -type d; echo $extra_dirs; } \
+			{ find $directories -mindepth 2 -maxdepth 2 -type d; printf '%s\n' ${=extra_dirs}; } \
 				| while IFS= read -r dir; do
 					[[ -n $hist_paths ]] && echo "$hist_paths" | grep -qxF "$dir" && continue
 					name=$(basename "$dir" | tr . _)
