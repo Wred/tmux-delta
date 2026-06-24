@@ -52,7 +52,7 @@ _list_dirs() {
 	local directories=${TMUX_SESSIONIZER_SEARCH_DIRS:-"$HOME/work"}
 	local extra_dirs=${TMUX_SESSIONIZER_EXTRA_DIRS:-""}
 	local active_paths=$(tmux list-sessions -F '#{session_path}' 2>/dev/null || true)
-	{ find $directories -mindepth 2 -maxdepth 2 -type d; echo $extra_dirs; } \
+	{ find $directories -mindepth 2 -maxdepth 2 -type d; printf '%s\n' ${=extra_dirs}; } \
 		| while IFS= read -r dir; do
 			local label="${dir:h:t}/${dir:t}"
 			if echo "$active_paths" | grep -qxF "$dir" 2>/dev/null; then
