@@ -104,13 +104,30 @@ else
   repo=""
 fi
 
+# Determine session type: folder (no git), git-main (main worktree), or worktree (linked).
+if [[ -z "$branch" ]]; then
+  session_type="folder"
+else
+  actual_wt=$(cd "$pane_path" && git rev-parse --show-toplevel 2>/dev/null || true)
+  if [[ "$actual_wt" == "$main_wt_path" ]]; then
+    session_type="git-main"
+  else
+    session_type="worktree"
+  fi
+fi
+
+current_session=$(tmux display-message -p '#S' 2>/dev/null || true)
+prev_session_type=""
+[[ -n "$current_session" ]] && prev_session_type=$(tmux show-option -t "$current_session" -qv @session_type 2>/dev/null || true)
+
 prev_branch=$(tmux show-option -gqv @git_branch_cache)
 prev_icon=$(tmux show-option -gqv @git_icon_cache)
 prev_repo=$(tmux show-option -gqv @git_repo_cache)
 
-if [[ "$branch" != "$prev_branch" || "$icon" != "$prev_icon" || "$repo" != "$prev_repo" ]]; then
+if [[ "$branch" != "$prev_branch" || "$icon" != "$prev_icon" || "$repo" != "$prev_repo" || "$session_type" != "$prev_session_type" ]]; then
   tmux set-option -g @git_branch_cache "$branch"
   tmux set-option -g @git_icon_cache   "$icon"
   tmux set-option -g @git_repo_cache   "$repo"
+  [[ -n "$current_session" ]] && tmux set-option -t "$current_session" @session_type "$session_type" 2>/dev/null || true
   tmux refresh-client -S 2>/dev/null || true
 fi
