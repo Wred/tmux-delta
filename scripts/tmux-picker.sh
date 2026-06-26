@@ -285,13 +285,14 @@ _tab_header() {
 	fi
 	local hints
 	case $active in
-		sessions)  hints="ctrl-x: delete · ctrl-o: open browser (git repos) · ctrl-h/l: switch" ;;
-		worktrees) hints="ctrl-x: delete · ctrl-o: open browser · ctrl-h/l: switch" ;;
+		sessions)  hints="ctrl-x: delete · ctrl-e: open explorer · ctrl-o: open browser (git repos) · ctrl-h/l: switch" ;;
+		worktrees) hints="ctrl-x: delete · ctrl-e: open explorer · ctrl-o: open browser · ctrl-h/l: switch" ;;
 		issues)    hints="ctrl-a: autonomous · ctrl-o: open browser · ctrl-h/l: switch" ;;
 		prs)       hints="ctrl-o: open browser · ctrl-h/l: switch" ;;
 		closed)    hints="ctrl-o: open browser · ctrl-h/l: switch" ;;
 		ready)     hints="ctrl-a: review all · ctrl-o: open browser · ctrl-h/l: switch" ;;
 
+		dirs)      hints="ctrl-e: open explorer · ctrl-h/l: switch" ;;
 		*)         hints="ctrl-h/l: switch" ;;
 	esac
 	if [[ -n $repo_name ]]; then
@@ -389,6 +390,39 @@ _on_ctrl_x() {
 		"Sessions> ")  echo "execute($TMUX_PICKER --delete-session {1})+abort" ;;
 		"Worktrees> ") echo "execute($TMUX_PICKER --delete-wt {1})+abort" ;;
 	esac
+}
+
+_on_ctrl_e() {
+	case "$1" in
+		"Sessions> ")    echo "execute($TMUX_PICKER --open-finder {1})+abort" ;;
+		"Directories> ") echo "execute($TMUX_PICKER --open-finder {1})+abort" ;;
+		"Worktrees> ")   echo "execute($TMUX_PICKER --open-finder {1})+abort" ;;
+	esac
+}
+
+_open_finder() {
+	local selected="$1"
+	local path
+	case "$selected" in
+		session:*)
+			local rest="${selected#session:}"
+			path="${rest#*:}"
+			;;
+		dir:*)
+			path="${selected#dir:}"
+			;;
+		wt:*)
+			path="${selected#wt:}"
+			;;
+		*)
+			return 0
+			;;
+	esac
+	if [[ -d $path ]]; then
+		local opener
+		[[ -x /usr/bin/open ]] && opener=/usr/bin/open || opener=xdg-open
+		"$opener" "$path"
+	fi
 }
 
 _on_ctrl_o() {
@@ -881,6 +915,8 @@ case "${1:-}" in
 	--on-enter)       _on_enter "$2";              exit ;;
 	--on-ctrl-a)      _on_ctrl_a "$2";             exit ;;
 	--on-ctrl-x)      _on_ctrl_x "$2";             exit ;;
+	--on-ctrl-e)      _on_ctrl_e "$2";             exit ;;
+	--open-finder)    _open_finder "$2";           exit ;;
 	--on-ctrl-o)      _on_ctrl_o "$2";             exit ;;
 	--open-browser)   _open_browser "$2";          exit ;;
 esac
@@ -920,6 +956,7 @@ if git rev-parse --git-dir &>/dev/null; then
 		--bind 'ctrl-p:transform:$TMUX_PICKER --switch-tab prs' \
 		--bind 'ctrl-r:transform:$TMUX_PICKER --switch-tab ready' \
 		--bind 'ctrl-a:transform:$TMUX_PICKER --on-ctrl-a "$FZF_PROMPT"' \
+		--bind 'ctrl-e:transform:$TMUX_PICKER --on-ctrl-e "$FZF_PROMPT"' \
 		--bind 'ctrl-o:transform:$TMUX_PICKER --on-ctrl-o "$FZF_PROMPT"' \
 	)
 else
