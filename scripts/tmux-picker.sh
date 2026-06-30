@@ -932,8 +932,17 @@ _common_binds=(
 	--bind 'ctrl-x:transform:$TMUX_PICKER --on-ctrl-x "$FZF_PROMPT"'
 )
 
-# Pre-generate sessions list and find current session's position for initial cursor placement
+# Pre-generate sessions list and header in parallel to reduce fzf startup latency.
+# _tab_header is called as a function (not a subprocess) in the background to avoid
+# re-forking the whole script; _list_sessions runs concurrently in the foreground.
+_header_file=$(mktemp)
+_tab_header sessions >| "$_header_file" &
+_header_pid=$!
 _sessions_list=$("$SELF" --list-sessions)
+wait $_header_pid
+_header=$(cat "$_header_file")
+rm -f "$_header_file"
+
 _current_session_pos=1
 if [[ -n $TMUX ]]; then
 	_current=$(tmux display-message -p '#S' 2>/dev/null)
@@ -948,7 +957,7 @@ if git rev-parse --git-dir &>/dev/null; then
 	output=$(echo "$_sessions_list" | fzf --ansi \
 		--delimiter=$'\t' --with-nth=2 \
 		--prompt 'Sessions> ' \
-		--header "$("$SELF" --tab-header sessions)" \
+		--header "$_header" \
 		"${_common_binds[@]}" \
 		--bind "load:pos($_current_session_pos)+unbind(load)" \
 		--bind 'ctrl-w:transform:$TMUX_PICKER --switch-tab worktrees' \
@@ -963,7 +972,7 @@ else
 	output=$(echo "$_sessions_list" | fzf --ansi \
 		--delimiter=$'\t' --with-nth=2 \
 		--prompt 'Sessions> ' \
-		--header "$("$SELF" --tab-header sessions)" \
+		--header "$_header" \
 		"${_common_binds[@]}" \
 		--bind "load:pos($_current_session_pos)+unbind(load)" \
 	)
