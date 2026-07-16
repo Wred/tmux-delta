@@ -30,6 +30,34 @@ _record_dir_history() {
 	printf '%s\n' "${lines[@]}" >| "$_HIST_FILE"
 }
 
+# ─── GitHub auth helpers ─────────────────────────────────────────────
+
+_gh_repo_host() {
+	local remote_url
+	remote_url=$(git remote get-url origin 2>/dev/null) || return 1
+	# Extract hostname from SSH (git@host:...) or HTTPS (https://host/...) remotes
+	if [[ $remote_url =~ '^git@([^:]+):' ]]; then
+		echo "${match[1]}"
+	elif [[ $remote_url =~ '^https?://([^/]+)/' ]]; then
+		echo "${match[1]}"
+	fi
+}
+
+_gh_check_auth() {
+	local host
+	host=$(_gh_repo_host 2>/dev/null)
+	if [[ -n $host ]]; then
+		if ! gh auth status --hostname "$host" >/dev/null 2>&1; then
+			printf '\t\033[31mgh not authenticated for %s — run: gh auth login --hostname %s\033[0m\n' "$host" "$host"
+			return 1
+		fi
+	elif ! gh auth status >/dev/null 2>&1; then
+		printf '\t\033[31mgh not authenticated — run: gh auth login\033[0m\n'
+		return 1
+	fi
+	return 0
+}
+
 # ─── List generators (called by fzf reload) ─────────────────────────
 
 _list_sessions() {
@@ -89,10 +117,7 @@ _list_worktrees() {
 }
 
 _list_issues() {
-	if ! gh auth status >/dev/null 2>&1; then
-		printf '\t\033[31mgh not authenticated — run gh auth login\033[0m\n'
-		return
-	fi
+	_gh_check_auth || return
 	local issues_json
 	issues_json=$(gh issue list --state open --limit 1000 \
 		--json number,title,labels,assignees 2>/dev/null)
@@ -134,10 +159,7 @@ _list_issues() {
 }
 
 _list_prs_closed() {
-	if ! gh auth status >/dev/null 2>&1; then
-		printf '\t\033[31mgh not authenticated — run gh auth login\033[0m\n'
-		return
-	fi
+	_gh_check_auth || return
 	local prs_json
 	prs_json=$(gh pr list --state closed --limit 1000 \
 		--json number,title,headRefName,author,mergedAt 2>/dev/null)
@@ -156,10 +178,7 @@ _list_prs_closed() {
 }
 
 _list_prs_ready() {
-	if ! gh auth status >/dev/null 2>&1; then
-		printf '\t\033[31mgh not authenticated — run gh auth login\033[0m\n'
-		return
-	fi
+	_gh_check_auth || return
 	local prs_json
 	prs_json=$(gh pr list --state open --limit 1000 \
 		--json number,title,headRefName,author,isDraft,reviewDecision,statusCheckRollup 2>/dev/null)
@@ -218,10 +237,7 @@ _list_prs_ready() {
 }
 
 _list_prs() {
-	if ! gh auth status >/dev/null 2>&1; then
-		printf '\t\033[31mgh not authenticated — run gh auth login\033[0m\n'
-		return
-	fi
+	_gh_check_auth || return
 	local prs_json
 	prs_json=$(gh pr list --state open --limit 1000 \
 		--json number,title,headRefName,author,isDraft,reviewDecision 2>/dev/null)
