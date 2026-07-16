@@ -170,6 +170,18 @@ while IFS= read -r session; do
     continue
   fi
 
+  # Keep the session label in sync with the branch actually checked out.
+  # An agent may `git checkout -b` a new branch mid-session (e.g. opening a
+  # follow-up PR after the original merged) without the session ever being
+  # re-opened via the picker, which is the only other place @session_label
+  # gets set. Without this, the pill (and anything reading @session_label)
+  # keeps showing the branch/PR the session started from.
+  prev_label=$(tmux show-option -t "$session" -qv @session_label 2>/dev/null || true)
+  if [[ -n "$prev_label" && "$branch" != "$prev_label" ]]; then
+    tmux set-option -t "$session" @session_label "$branch" 2>/dev/null || true
+    needs_refresh=1
+  fi
+
   icons=$(compute_pr_icons "$pane_path" "$branch")
 
   prev=$(tmux show-option -t "$session" -qv @pr_icons 2>/dev/null || true)
