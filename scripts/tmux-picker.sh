@@ -466,14 +466,20 @@ _browse_repo() {
 	# Open PR if branch has one, otherwise open branch in browser
 	local repo_path="$1"
 	local branch="$2"
+	local session_name="${3:-}"
 	local url
 	local pr_number
 	pr_number=$(cd "$repo_path" && gh pr view --json number --jq '.number' 2>/dev/null)
 	if [[ -n $pr_number ]]; then
 		url=$(cd "$repo_path" && gh pr view --json url --jq '.url' 2>/dev/null)
-	else
-		url=$(cd "$repo_path" && gh browse --branch "$branch" --no-browser 2>/dev/null)
+	elif [[ -n $session_name ]]; then
+		local issue_number
+		issue_number=$(tmux show-environment -t "$session_name" CODING_AGENT_ISSUE 2>/dev/null | sed 's/CODING_AGENT_ISSUE=//')
+		if [[ -n $issue_number && $issue_number != -* ]]; then
+			url=$(cd "$repo_path" && gh issue view "$issue_number" --json url --jq '.url' 2>/dev/null)
+		fi
 	fi
+	[[ -z $url ]] && url=$(cd "$repo_path" && gh browse --branch "$branch" --no-browser 2>/dev/null)
 	_open_url "$url"
 }
 
@@ -484,9 +490,10 @@ _open_browser() {
 		pr:*)    _open_url "$(gh pr view "${selected#pr:}" --json url --jq '.url' 2>/dev/null)" ;;
 		session:*)
 			local rest="${selected#session:}"
+			local session_name="${rest%%:*}"
 			local repo_path="${rest#*:}"
 			local branch=$(git -C "$repo_path" branch --show-current 2>/dev/null)
-			[[ -n $branch ]] && _browse_repo "$repo_path" "$branch"
+			[[ -n $branch ]] && _browse_repo "$repo_path" "$branch" "$session_name"
 			;;
 		dir:*)
 			local repo_path="${selected#dir:}"
