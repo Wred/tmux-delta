@@ -617,13 +617,20 @@ _delete_wt() {
 # Falls back gracefully: non-git sessions or the main worktree keep their
 # full name so the status-format conditional stays correct.
 _set_session_label() {
-	local session_name="$1" session_path="$2"
+	local session_name="$1" session_path="$2" pr_number="${3:-}"
 	local main_tree
 	main_tree=$(git -C "$session_path" worktree list 2>/dev/null | awk 'NR==1{print $1}')
 	[[ -z $main_tree ]] && return
 	local repo_prefix short_label
 	repo_prefix=$(basename "$main_tree" | tr . _)
 	short_label=${session_name#${repo_prefix}-}
+	if [[ -n $pr_number ]]; then
+		local max_len=20
+		if (( ${#short_label} > max_len )); then
+			short_label="${short_label:0:$max_len}…"
+		fi
+		short_label="#${pr_number}: ${short_label}"
+	fi
 	tmux set-option -t "$session_name" @session_label "$short_label"
 }
 
@@ -779,7 +786,7 @@ _open_pr_review() {
 	if [[ -z $TMUX ]] && [[ -z $tmux_running ]]; then
 		tmux new-session -ds "$selected_name" -c "$selected"
 		_set_pr_env
-		_set_session_label "$selected_name" "$selected"
+		_set_session_label "$selected_name" "$selected" "$pr_number"
 		tmux attach-session -t "$selected_name"
 		tmux send-keys -t "$selected_name" "${SCRIPTS}/tmux-dev-layout.sh" Enter
 		exit 0
@@ -790,7 +797,7 @@ _open_pr_review() {
 		tmux new-session -ds "$selected_name" -c "$selected"
 		newly_created=true
 	fi
-	_set_session_label "$selected_name" "$selected"
+	_set_session_label "$selected_name" "$selected" "$pr_number"
 	[[ $do_switch == yes ]] && tmux switch-client -t "$selected_name"
 	[[ $do_switch == yes ]] && tmux run-shell -b -t "$selected_name" "$SCRIPTS/tmux-kube-status-refresh.sh"
 	[[ $do_switch == yes ]] && tmux run-shell -b -t "$selected_name" "$SCRIPTS/tmux-git-status-refresh.sh"
