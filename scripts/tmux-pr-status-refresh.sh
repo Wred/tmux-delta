@@ -80,7 +80,7 @@ compute_pr_icons() {
   # ── Fetch PR state from gh CLI (auto-detects the correct GitHub host) ──────
   local pr_json
   pr_json=$(cd "$pane_path" \
-    && gh pr view --json isDraft,reviewDecision 2>/dev/null \
+    && gh pr view --json isDraft,reviewDecision,number 2>/dev/null \
     || true)
 
   if [[ -z "$pr_json" ]]; then
@@ -88,9 +88,10 @@ compute_pr_icons() {
     return
   fi
 
-  local is_draft review_decision
+  local is_draft review_decision pr_number
   is_draft=$(printf '%s' "$pr_json"        | jq -r '.isDraft       // false')
   review_decision=$(printf '%s' "$pr_json" | jq -r '.reviewDecision // ""')
+  pr_number=$(printf '%s' "$pr_json"       | jq -r '.number        // ""')
 
   # ── CI status via gh pr checks ─────────────────────────────────────────────
   # gh pr checks covers both GitHub Actions check runs AND commit-status
@@ -137,8 +138,8 @@ compute_pr_icons() {
   # Trim trailing space (when a review icon was added but CI is none/unknown)
   icons="${icons% }"
 
-  printf '%s' "$icons" > "$cache_file"
-  printf '%s' "$icons"
+  printf '%s|%s' "$pr_number" "$icons" > "$cache_file"
+  printf '%s|%s' "$pr_number" "$icons"
 }
 
 # ── Main ────────────────────────────────────────────────────────────────────
@@ -170,12 +171,29 @@ while IFS= read -r session; do
     continue
   fi
 
-  icons=$(compute_pr_icons "$pane_path" "$branch")
+  result=$(compute_pr_icons "$pane_path" "$branch")
+  pr_number="${result%%|*}"
+  icons="${result#*|}"
+  # Handle old cache format (no pipe) or non-numeric prefix
+  [[ "$pr_number" =~ ^[0-9]+$ ]] || pr_number=""
 
   prev=$(tmux show-option -t "$session" -qv @pr_icons 2>/dev/null || true)
   if [[ "$icons" != "$prev" ]]; then
     tmux set-option -t "$session" @pr_icons "$icons" 2>/dev/null || true
     needs_refresh=1
+  fi
+
+  if [[ -n "$pr_number" ]]; then
+    expected_prefix="#${pr_number}: "
+    current_label=$(tmux show-option -t "$session" -qv @session_label 2>/dev/null || true)
+    if [[ "$current_label" != "${expected_prefix}"* ]]; then
+      base_label="$current_label"
+      [[ "$base_label" =~ ^#[0-9]+:\ (.*)$ ]] && base_label="${BASH_REMATCH[1]}"
+      [[ -z "$base_label" ]] && base_label="$session"
+      (( ${#base_label} > 20 )) && base_label="${base_label:0:20}…"
+      tmux set-option -t "$session" @session_label "${expected_prefix}${base_label}" 2>/dev/null || true
+      needs_refresh=1
+    fi
   fi
 done <<< "$sessions"
 
