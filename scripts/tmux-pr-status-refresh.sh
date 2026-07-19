@@ -184,12 +184,19 @@ while IFS= read -r session; do
   fi
 
   if [[ -n "$pr_number" ]]; then
-    expected_prefix="#${pr_number}: "
+    expected_prefix="${pr_number}: "
     current_label=$(tmux show-option -t "$session" -qv @session_label 2>/dev/null || true)
     if [[ "$current_label" != "${expected_prefix}"* ]]; then
       base_label="$current_label"
-      [[ "$base_label" =~ ^#[0-9]+:\ (.*)$ ]] && base_label="${BASH_REMATCH[1]}"
-      [[ -z "$base_label" ]] && base_label="$session"
+      [[ "$base_label" =~ ^[0-9]+:\ (.*)$ ]] && base_label="${BASH_REMATCH[1]}"
+      if [[ -z "$base_label" ]]; then
+        main_tree=$(git -C "$pane_path" worktree list 2>/dev/null | awk 'NR==1{print $1}')
+        if [[ -n "$main_tree" ]]; then
+          repo_prefix=$(basename "$main_tree" | tr . _)
+          base_label="${session#${repo_prefix}-}"
+        fi
+        [[ -z "$base_label" ]] && base_label="$session"
+      fi
       (( ${#base_label} > 20 )) && base_label="${base_label:0:20}…"
       tmux set-option -t "$session" @session_label "${expected_prefix}${base_label}" 2>/dev/null || true
       needs_refresh=1

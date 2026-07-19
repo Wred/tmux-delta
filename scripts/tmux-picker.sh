@@ -636,7 +636,7 @@ _set_session_label() {
 		if (( ${#short_label} > max_len )); then
 			short_label="${short_label:0:$max_len}…"
 		fi
-		short_label="#${pr_number}: ${short_label}"
+		short_label="${pr_number}: ${short_label}"
 	fi
 	tmux set-option -t "$session_name" @session_label "$short_label"
 }
