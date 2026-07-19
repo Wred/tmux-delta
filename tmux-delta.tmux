@@ -54,11 +54,13 @@ tmux set-option -agF @catppuccin_status_git '#[fg=#{@thm_surface_0}]#[bg=default
 
 # ─── Catppuccin repo name module ─────────────────────────────────────────────
 # Displays the main worktree name (repo root folder), hidden when not in a git
-# repo. Populated by tmux-git-status-refresh.sh into @git_repo_cache.
+# repo. Populated by tmux-git-status-refresh.sh into @git_repo_cache. The
+# second segment (after the colon) is the current branch's PR title when one
+# exists, falling back to the raw branch name — set into @git_repo_label_cache.
 tmux set-option -gF  @catppuccin_status_repo '#[fg=#{@thm_green}]#[bg=default]#{@catppuccin_status_left_separator}#[fg=#{@thm_crust},bg=#{@thm_green}]'
 tmux set-option -ag  @catppuccin_status_repo '#{@git_icon_cache} '
 tmux set-option -agF @catppuccin_status_repo '#[fg=#{@thm_fg},bg=#{@thm_surface_0}] '
-tmux set-option -ag  @catppuccin_status_repo '#{@git_repo_cache}'
+tmux set-option -ag  @catppuccin_status_repo '#{@git_repo_label_cache}'
 tmux set-option -agF @catppuccin_status_repo '#[fg=#{@thm_surface_0}]#[bg=default]#{@catppuccin_status_right_separator}'
 
 # ─── Status right ────────────────────────────────────────────────────────────
