@@ -9,6 +9,7 @@
 #
 # Requires: direnv, nvim
 # Optional: CODING_AGENT env var to override the agent command (default: claude)
+# Optional: DEV_EDITOR env var to override the left-pane editor command (default: nvim)
 
 # Must be in tmux
 [[ -z $TMUX ]] && exit 0
@@ -47,5 +48,8 @@ fi
 local project_dir=$PWD
 tmux split-window -h -p 50 -c "$project_dir" "direnv exec ${(q)project_dir} zsh -ic ${(q)inner}"
 
-# Start nvim in this pane (the left/original pane where the script is running)
-nvim
+# Start the editor in this pane (the left/original pane where the script is running).
+# This pane's own shell already ran direnv's precmd hook, so DEV_EDITOR from the
+# worktree's .envrc is already resolved in the environment — no deferred expansion needed.
+editor=${DEV_EDITOR:-nvim}
+eval "$editor"

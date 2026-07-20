@@ -102,6 +102,14 @@ The dev layout (`tmux-dev-layout.sh`) opens a coding agent on the right pane. Ov
 export CODING_AGENT=claude
 ```
 
+### Editor
+
+The dev layout opens `nvim` on the left pane by default. Override the command via `.envrc` in your project:
+
+```sh
+export DEV_EDITOR="hunk diff --watch"
+```
+
 ## Key bindings (picker)
 
 | Key | Action |
