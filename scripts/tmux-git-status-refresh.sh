@@ -13,6 +13,9 @@
 
 set -u
 
+SCRIPTS="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "${SCRIPTS}/lib/pr-cache.sh"
+
 ICON_GITHUB=$'\xef\x82\x9b'   # U+F09B  nf-fa-github
 ICON_GITLAB=$'\xef\x8a\x96'   # U+F296  nf-fa-gitlab
 ICON_BITBUCKET=$'\xef\x85\xb1' # U+F171  nf-fa-bitbucket
@@ -110,32 +113,29 @@ fi
 pr_number=""
 pr_title=""
 if [[ -n "$branch" ]] && command -v gh >/dev/null 2>&1 && command -v jq >/dev/null 2>&1; then
-  cache_dir="${HOME}/.cache/tmux-pr-title"
-  mkdir -p "$cache_dir"
-  key=$(printf '%s_%s' "$pane_path" "$branch" | tr -cs 'A-Za-z0-9_-' '_' | cut -c1-120)
-  cache_file="${cache_dir}/${key}"
-
-  age=999999
-  if [[ -f "$cache_file" ]]; then
-    now=$(date +%s)
-    mtime=$(stat -f %m "$cache_file" 2>/dev/null || stat -c %Y "$cache_file" 2>/dev/null || echo 0)
-    age=$(( now - mtime ))
-  fi
-
+  age=$(pr_cache_age "$pane_path" "$branch")
   if [[ $age -lt 60 ]]; then
-    pr_cached=$(cat "$cache_file")
+    cached=$(pr_cache_read "$pane_path" "$branch")
+    pr_number=$(printf '%s' "$cached" | jq -r '.pr_number // empty')
+    pr_title=$(printf '%s' "$cached" | jq -r '.title // empty')
   else
-    pr_json=$(cd "$pane_path" && gh pr view --json number,title 2>/dev/null || true)
+    # Cache miss/stale: tmux-pr-status-refresh.sh is the primary writer, but
+    # do a minimal one-off fetch so a brand-new session isn't left blank.
+    # It will normally be overwritten with the full record within the same
+    # refresh cycle (both scripts are triggered by the same hook).
+    pr_json=$(cd "$pane_path" && gh pr view --json number,title,url 2>/dev/null || true)
     if [[ -n "$pr_json" ]]; then
-      pr_cached=$(printf '%s' "$pr_json" | jq -r '"\(.number // "")|\(.title // "")"')
-    else
-      pr_cached="|"
+      pr_number=$(printf '%s' "$pr_json" | jq -r '.number // empty')
+      pr_title=$(printf '%s' "$pr_json" | jq -r '.title // empty')
+      pr_url=$(printf '%s' "$pr_json" | jq -r '.url // empty')
     fi
-    printf '%s' "$pr_cached" > "$cache_file"
+    pr_cache_write "$pane_path" "$branch" "$(jq -n \
+      --argjson pr_number "${pr_number:-null}" \
+      --arg title "${pr_title:-}" \
+      --arg url "${pr_url:-}" \
+      --argjson updated_at "$(date +%s)" \
+      '{pr_number: $pr_number, title: $title, url: $url, updated_at: $updated_at}')"
   fi
-
-  pr_number="${pr_cached%%|*}"
-  pr_title="${pr_cached#*|}"
 fi
 
 if [[ -z "$pr_title" ]]; then

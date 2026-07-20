@@ -11,6 +11,7 @@ SCRIPTS="${SELF:h}"
 export TMUX_PICKER="$SELF"
 
 source "${SCRIPTS}/gwt.zsh"
+source "${SCRIPTS}/lib/pr-cache.sh"
 
 # ─── Directory history ───────────────────────────────────────────────
 
@@ -469,10 +470,21 @@ _browse_repo() {
 	local session_name="${3:-}"
 	local url
 	local pr_number
-	pr_number=$(cd "$repo_path" && gh pr view --json number --jq '.number' 2>/dev/null)
-	if [[ -n $pr_number ]]; then
-		url=$(cd "$repo_path" && gh pr view --json url --jq '.url' 2>/dev/null)
-	elif [[ -n $session_name ]]; then
+	# A cached PR number+url is safe to reuse even if stale — a PR's number
+	# and url never change once assigned. Only fall back to a live `gh pr
+	# view` when the cache has no PR on record yet (e.g. just opened, no
+	# refresh cycle has run).
+	local cached
+	cached=$(pr_cache_read "$repo_path" "$branch")
+	if [[ -n $cached ]]; then
+		pr_number=$(printf '%s' "$cached" | jq -r '.pr_number // empty')
+		[[ -n $pr_number ]] && url=$(printf '%s' "$cached" | jq -r '.url // empty')
+	fi
+	if [[ -z $pr_number ]]; then
+		pr_number=$(cd "$repo_path" && gh pr view --json number --jq '.number' 2>/dev/null)
+		[[ -n $pr_number ]] && url=$(cd "$repo_path" && gh pr view --json url --jq '.url' 2>/dev/null)
+	fi
+	if [[ -z $pr_number && -n $session_name ]]; then
 		local issue_number
 		issue_number=$(tmux show-environment -t "$session_name" CODING_AGENT_ISSUE 2>/dev/null | sed 's/CODING_AGENT_ISSUE=//')
 		if [[ -n $issue_number && $issue_number != -* ]]; then

@@ -49,9 +49,10 @@ COLOR_SKY=$(tmux show-option -gqv @tmux_delta_color_pr_sky 2>/dev/null)       # 
 : "${COLOR_MUTED:=#6c7086}"
 : "${COLOR_SKY:=#89dceb}"
 
-CACHE_DIR="${HOME}/.cache/tmux-pr-status"
 CACHE_TTL=60   # seconds between GitHub API re-fetches per session+branch
-mkdir -p "$CACHE_DIR"
+
+SCRIPTS="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "${SCRIPTS}/lib/pr-cache.sh"
 
 # Bail early if required tools are absent
 command -v gh  >/dev/null 2>&1 || exit 0
@@ -63,23 +64,16 @@ command -v git >/dev/null 2>&1 || exit 0
 compute_pr_icons() {
   local pane_path="$1" branch="$2"
 
-  # Cache key: sanitise path+branch into a safe filename (max 120 chars)
-  local key
-  key=$(printf '%s_%s' "$pane_path" "$branch" \
-    | tr -cs 'A-Za-z0-9_-' '_' \
-    | cut -c1-120)
-  local cache_file="${CACHE_DIR}/${key}"
-
   # Return cached value if still fresh
-  if [[ -f "$cache_file" ]]; then
-    local now mtime age
-    now=$(date +%s)
-    mtime=$(stat -f %m "$cache_file" 2>/dev/null \
-         || stat -c %Y "$cache_file" 2>/dev/null \
-         || echo 0)
-    age=$(( now - mtime ))
-    if [[ $age -lt $CACHE_TTL ]]; then
-      cat "$cache_file"
+  local age
+  age=$(pr_cache_age "$pane_path" "$branch")
+  if [[ $age -lt $CACHE_TTL ]]; then
+    local cached
+    cached=$(pr_cache_read "$pane_path" "$branch")
+    if [[ -n "$cached" ]]; then
+      printf '%s|%s' \
+        "$(printf '%s' "$cached" | jq -r '.pr_number // ""')" \
+        "$(printf '%s' "$cached" | jq -r '.icons // ""')"
       return
     fi
   fi
@@ -87,7 +81,7 @@ compute_pr_icons() {
   # ── Fetch PR state + CI checks in parallel (two independent API calls) ─────
   local tmp_pr tmp_checks
   tmp_pr=$(mktemp) tmp_checks=$(mktemp)
-  ( cd "$pane_path" && gh pr view --json isDraft,reviewDecision,number,title 2>/dev/null > "$tmp_pr" ) &
+  ( cd "$pane_path" && gh pr view --json isDraft,reviewDecision,number,title,url 2>/dev/null > "$tmp_pr" ) &
   local pid_pr=$!
   ( cd "$pane_path" && gh pr checks --json bucket 2>/dev/null > "$tmp_checks" ) &
   local pid_checks=$!
@@ -99,23 +93,18 @@ compute_pr_icons() {
   rm -f "$tmp_pr" "$tmp_checks"
 
   if [[ -z "$pr_json" ]]; then
-    printf '' > "$cache_file"
+    pr_cache_write "$pane_path" "$branch" "$(jq -n --argjson updated_at "$(date +%s)" \
+      '{pr_number: null, title: "", url: "", is_draft: false,
+        review_decision: "", ci_status: "none", icons: "", updated_at: $updated_at}')"
     return
   fi
 
-  local is_draft review_decision pr_number title
+  local is_draft review_decision pr_number title url
   is_draft=$(printf '%s' "$pr_json"        | jq -r '.isDraft       // false')
   review_decision=$(printf '%s' "$pr_json" | jq -r '.reviewDecision // ""')
   pr_number=$(printf '%s' "$pr_json"       | jq -r '.number        // ""')
   title=$(printf '%s' "$pr_json"           | jq -r '.title        // ""')
-
-  # Share the title with tmux-git-status-refresh.sh's PR-title cache (same
-  # cache dir/key scheme) so it doesn't need its own redundant `gh pr view`.
-  if [[ -n "$pr_number" ]]; then
-    local title_cache_dir="${HOME}/.cache/tmux-pr-title"
-    mkdir -p "$title_cache_dir"
-    printf '%s|%s' "$pr_number" "$title" > "${title_cache_dir}/${key}"
-  fi
+  url=$(printf '%s' "$pr_json"             | jq -r '.url          // ""')
 
   # ── CI status via gh pr checks ─────────────────────────────────────────────
   # gh pr checks covers both GitHub Actions check runs AND commit-status
@@ -160,7 +149,21 @@ compute_pr_icons() {
   # Trim trailing space (when a review icon was added but CI is none/unknown)
   icons="${icons% }"
 
-  printf '%s|%s' "$pr_number" "$icons" > "$cache_file"
+  local json
+  json=$(jq -n \
+    --argjson pr_number "${pr_number:-null}" \
+    --arg title "$title" \
+    --arg url "$url" \
+    --argjson is_draft "$is_draft" \
+    --arg review_decision "$review_decision" \
+    --arg ci_status "$ci_status" \
+    --arg icons "$icons" \
+    --argjson updated_at "$(date +%s)" \
+    '{pr_number: $pr_number, title: $title, url: $url, is_draft: $is_draft,
+      review_decision: $review_decision, ci_status: $ci_status, icons: $icons,
+      updated_at: $updated_at}')
+  pr_cache_write "$pane_path" "$branch" "$json"
+
   printf '%s|%s' "$pr_number" "$icons"
 }
 
@@ -174,56 +177,53 @@ else
   sessions=$(tmux list-sessions -F '#{session_name}' 2>/dev/null || true)
 fi
 
-needs_refresh=0
-
+# Each session is refreshed in its own backgrounded subshell so a slow
+# `gh` round-trip for one session's PR (e.g. a slow GHE instance) doesn't
+# hold up every other session behind it in a serial loop.
 while IFS= read -r session; do
   [[ -z "$session" ]] && continue
 
-  pane_path=$(tmux display-message -t "${session}:" -p -F '#{pane_current_path}' \
-    2>/dev/null || true)
-  [[ -n "${pane_path:-}" && -d "$pane_path" ]] || continue
+  (
+    pane_path=$(tmux display-message -t "${session}:" -p -F '#{pane_current_path}' \
+      2>/dev/null || true)
+    [[ -n "${pane_path:-}" && -d "$pane_path" ]] || exit 0
 
-  branch=$(cd "$pane_path" && git rev-parse --abbrev-ref HEAD 2>/dev/null || true)
-  if [[ -z "$branch" || "$branch" == "HEAD" ]]; then
+    branch=$(cd "$pane_path" && git rev-parse --abbrev-ref HEAD 2>/dev/null || true)
+    if [[ -z "$branch" || "$branch" == "HEAD" ]]; then
+      prev=$(tmux show-option -t "$session" -qv @pr_icons 2>/dev/null || true)
+      [[ -n "$prev" ]] && tmux set-option -t "$session" @pr_icons "" 2>/dev/null || true
+      exit 0
+    fi
+
+    result=$(compute_pr_icons "$pane_path" "$branch")
+    pr_number="${result%%|*}"
+    icons="${result#*|}"
+    # Handle old cache format (no pipe) or non-numeric prefix
+    [[ "$pr_number" =~ ^[0-9]+$ ]] || pr_number=""
+
     prev=$(tmux show-option -t "$session" -qv @pr_icons 2>/dev/null || true)
-    if [[ -n "$prev" ]]; then
-      tmux set-option -t "$session" @pr_icons "" 2>/dev/null || true
-      needs_refresh=1
-    fi
-    continue
-  fi
+    [[ "$icons" != "$prev" ]] && tmux set-option -t "$session" @pr_icons "$icons" 2>/dev/null || true
 
-  result=$(compute_pr_icons "$pane_path" "$branch")
-  pr_number="${result%%|*}"
-  icons="${result#*|}"
-  # Handle old cache format (no pipe) or non-numeric prefix
-  [[ "$pr_number" =~ ^[0-9]+$ ]] || pr_number=""
-
-  prev=$(tmux show-option -t "$session" -qv @pr_icons 2>/dev/null || true)
-  if [[ "$icons" != "$prev" ]]; then
-    tmux set-option -t "$session" @pr_icons "$icons" 2>/dev/null || true
-    needs_refresh=1
-  fi
-
-  if [[ -n "$pr_number" ]]; then
-    expected_prefix="${pr_number}: "
-    current_label=$(tmux show-option -t "$session" -qv @session_label 2>/dev/null || true)
-    if [[ "$current_label" != "${expected_prefix}"* ]]; then
-      base_label="$current_label"
-      [[ "$base_label" =~ ^[0-9]+:\ (.*)$ ]] && base_label="${BASH_REMATCH[1]}"
-      if [[ -z "$base_label" ]]; then
-        main_tree=$(git -C "$pane_path" worktree list 2>/dev/null | awk 'NR==1{print $1}')
-        if [[ -n "$main_tree" ]]; then
-          repo_prefix=$(basename "$main_tree" | tr . _)
-          base_label="${session#${repo_prefix}-}"
+    if [[ -n "$pr_number" ]]; then
+      expected_prefix="${pr_number}: "
+      current_label=$(tmux show-option -t "$session" -qv @session_label 2>/dev/null || true)
+      if [[ "$current_label" != "${expected_prefix}"* ]]; then
+        base_label="$current_label"
+        [[ "$base_label" =~ ^[0-9]+:\ (.*)$ ]] && base_label="${BASH_REMATCH[1]}"
+        if [[ -z "$base_label" ]]; then
+          main_tree=$(git -C "$pane_path" worktree list 2>/dev/null | awk 'NR==1{print $1}')
+          if [[ -n "$main_tree" ]]; then
+            repo_prefix=$(basename "$main_tree" | tr . _)
+            base_label="${session#${repo_prefix}-}"
+          fi
+          [[ -z "$base_label" ]] && base_label="$session"
         fi
-        [[ -z "$base_label" ]] && base_label="$session"
+        (( ${#base_label} > 20 )) && base_label="${base_label:0:20}…"
+        tmux set-option -t "$session" @session_label "${expected_prefix}${base_label}" 2>/dev/null || true
       fi
-      (( ${#base_label} > 20 )) && base_label="${base_label:0:20}…"
-      tmux set-option -t "$session" @session_label "${expected_prefix}${base_label}" 2>/dev/null || true
-      needs_refresh=1
     fi
-  fi
+  ) &
 done <<< "$sessions"
 
-[[ $needs_refresh -eq 1 ]] && tmux refresh-client -S 2>/dev/null || true
+wait
+tmux refresh-client -S 2>/dev/null || true
