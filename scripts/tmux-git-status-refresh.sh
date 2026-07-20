@@ -104,9 +104,10 @@ else
   repo=""
 fi
 
-# Fetch the current branch's PR title (if any) for the repo pill's second
-# segment. Falls back to the raw branch name when there's no open PR, since
-# a real title is far more readable than a dash-separated branch slug.
+# Fetch the current branch's PR number + title (if any) for their own status
+# pills. Title falls back to the raw branch name when there's no open PR,
+# since a real title is far more readable than a dash-separated branch slug.
+pr_number=""
 pr_title=""
 if [[ -n "$branch" ]] && command -v gh >/dev/null 2>&1 && command -v jq >/dev/null 2>&1; then
   cache_dir="${HOME}/.cache/tmux-pr-title"
@@ -122,20 +123,25 @@ if [[ -n "$branch" ]] && command -v gh >/dev/null 2>&1 && command -v jq >/dev/nu
   fi
 
   if [[ $age -lt 60 ]]; then
-    pr_title=$(cat "$cache_file")
+    pr_cached=$(cat "$cache_file")
   else
-    pr_title=$(cd "$pane_path" && gh pr view --json title -q .title 2>/dev/null || true)
-    printf '%s' "$pr_title" > "$cache_file"
+    pr_json=$(cd "$pane_path" && gh pr view --json number,title 2>/dev/null || true)
+    if [[ -n "$pr_json" ]]; then
+      pr_cached=$(printf '%s' "$pr_json" | jq -r '"\(.number // "")|\(.title // "")"')
+    else
+      pr_cached="|"
+    fi
+    printf '%s' "$pr_cached" > "$cache_file"
   fi
+
+  pr_number="${pr_cached%%|*}"
+  pr_title="${pr_cached#*|}"
 fi
 
-if [[ -n "$pr_title" ]]; then
-  repo_label="${repo}: ${pr_title}"
-elif [[ -n "$branch" ]]; then
-  repo_label="${repo}: ${branch}"
-else
-  repo_label="$repo"
+if [[ -z "$pr_title" ]]; then
+  pr_title="$branch"
 fi
+
 
 # Determine session type: folder (no git), git-main (main worktree), or worktree (linked).
 if [[ -z "$branch" ]]; then
@@ -156,13 +162,15 @@ prev_session_type=""
 prev_branch=$(tmux show-option -gqv @git_branch_cache)
 prev_icon=$(tmux show-option -gqv @git_icon_cache)
 prev_repo=$(tmux show-option -gqv @git_repo_cache)
-prev_repo_label=$(tmux show-option -gqv @git_repo_label_cache)
+prev_pr_number=$(tmux show-option -gqv @git_pr_number_cache)
+prev_pr_title=$(tmux show-option -gqv @git_pr_title_cache)
 
-if [[ "$branch" != "$prev_branch" || "$icon" != "$prev_icon" || "$repo" != "$prev_repo" || "$repo_label" != "$prev_repo_label" || "$session_type" != "$prev_session_type" ]]; then
-  tmux set-option -g @git_branch_cache "$branch"
-  tmux set-option -g @git_icon_cache   "$icon"
-  tmux set-option -g @git_repo_cache   "$repo"
-  tmux set-option -g @git_repo_label_cache "$repo_label"
+if [[ "$branch" != "$prev_branch" || "$icon" != "$prev_icon" || "$repo" != "$prev_repo" || "$pr_number" != "$prev_pr_number" || "$pr_title" != "$prev_pr_title" || "$session_type" != "$prev_session_type" ]]; then
+  tmux set-option -g @git_branch_cache    "$branch"
+  tmux set-option -g @git_icon_cache      "$icon"
+  tmux set-option -g @git_repo_cache      "$repo"
+  tmux set-option -g @git_pr_number_cache "$pr_number"
+  tmux set-option -g @git_pr_title_cache  "$pr_title"
   [[ -n "$current_session" ]] && tmux set-option -t "$current_session" @session_type "$session_type" 2>/dev/null || true
   tmux refresh-client -S 2>/dev/null || true
 fi

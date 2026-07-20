@@ -35,12 +35,19 @@ ICON_CI_PASS=$'\xef\x81\x98'   # U+F058  nf-fa-check-circle
 ICON_CI_FAIL=$'\xef\x81\x97'   # U+F057  nf-fa-times-circle
 ICON_CI_PEND=$'\xef\x80\x97'   # U+F017  nf-fa-clock-o
 
-# Catppuccin Mocha palette (must match @catppuccin_flavor 'mocha' in tmux.conf)
-COLOR_GREEN="#a6e3a1"
-COLOR_RED="#f38ba8"
-COLOR_PEACH="#fab387"
-COLOR_MUTED="#6c7086"   # overlay0 — visually muted for draft
-COLOR_SKY="#89dceb"     # sky — ready for review, awaiting decision
+# PR status colors — configurable via @tmux_delta_color_pr_* tmux options.
+# tmux-delta.tmux seeds these (matching catppuccin's active flavor when
+# catppuccin/tmux is loaded, else Catppuccin Mocha defaults) on plugin load.
+COLOR_GREEN=$(tmux show-option -gqv @tmux_delta_color_pr_green 2>/dev/null)
+COLOR_RED=$(tmux show-option -gqv @tmux_delta_color_pr_red 2>/dev/null)
+COLOR_PEACH=$(tmux show-option -gqv @tmux_delta_color_pr_peach 2>/dev/null)
+COLOR_MUTED=$(tmux show-option -gqv @tmux_delta_color_pr_muted 2>/dev/null)   # overlay0 — visually muted for draft
+COLOR_SKY=$(tmux show-option -gqv @tmux_delta_color_pr_sky 2>/dev/null)       # sky — ready for review, awaiting decision
+: "${COLOR_GREEN:=#a6e3a1}"
+: "${COLOR_RED:=#f38ba8}"
+: "${COLOR_PEACH:=#fab387}"
+: "${COLOR_MUTED:=#6c7086}"
+: "${COLOR_SKY:=#89dceb}"
 
 CACHE_DIR="${HOME}/.cache/tmux-pr-status"
 CACHE_TTL=60   # seconds between GitHub API re-fetches per session+branch
@@ -77,29 +84,44 @@ compute_pr_icons() {
     fi
   fi
 
-  # ── Fetch PR state from gh CLI (auto-detects the correct GitHub host) ──────
-  local pr_json
-  pr_json=$(cd "$pane_path" \
-    && gh pr view --json isDraft,reviewDecision,number 2>/dev/null \
-    || true)
+  # ── Fetch PR state + CI checks in parallel (two independent API calls) ─────
+  local tmp_pr tmp_checks
+  tmp_pr=$(mktemp) tmp_checks=$(mktemp)
+  ( cd "$pane_path" && gh pr view --json isDraft,reviewDecision,number,title 2>/dev/null > "$tmp_pr" ) &
+  local pid_pr=$!
+  ( cd "$pane_path" && gh pr checks --json bucket 2>/dev/null > "$tmp_checks" ) &
+  local pid_checks=$!
+  wait "$pid_pr" "$pid_checks" 2>/dev/null
+
+  local pr_json checks_json
+  pr_json=$(cat "$tmp_pr" 2>/dev/null || true)
+  checks_json=$(cat "$tmp_checks" 2>/dev/null || true)
+  rm -f "$tmp_pr" "$tmp_checks"
 
   if [[ -z "$pr_json" ]]; then
     printf '' > "$cache_file"
     return
   fi
 
-  local is_draft review_decision pr_number
+  local is_draft review_decision pr_number title
   is_draft=$(printf '%s' "$pr_json"        | jq -r '.isDraft       // false')
   review_decision=$(printf '%s' "$pr_json" | jq -r '.reviewDecision // ""')
   pr_number=$(printf '%s' "$pr_json"       | jq -r '.number        // ""')
+  title=$(printf '%s' "$pr_json"           | jq -r '.title        // ""')
+
+  # Share the title with tmux-git-status-refresh.sh's PR-title cache (same
+  # cache dir/key scheme) so it doesn't need its own redundant `gh pr view`.
+  if [[ -n "$pr_number" ]]; then
+    local title_cache_dir="${HOME}/.cache/tmux-pr-title"
+    mkdir -p "$title_cache_dir"
+    printf '%s|%s' "$pr_number" "$title" > "${title_cache_dir}/${key}"
+  fi
 
   # ── CI status via gh pr checks ─────────────────────────────────────────────
   # gh pr checks covers both GitHub Actions check runs AND commit-status
   # checks (e.g. Argo ci/* jobs). The `bucket` field is gh's own rollup:
   # pass | fail | pending | skipping
   local ci_status="none"
-  local checks_json
-  checks_json=$(cd "$pane_path" && gh pr checks --json bucket 2>/dev/null || true)
 
   if [[ -n "$checks_json" ]]; then
     ci_status=$(printf '%s' "$checks_json" | jq -r '
