@@ -24,8 +24,9 @@ _record_dir_history() {
 	if [[ -f $_HIST_FILE ]]; then
 		while IFS= read -r line; do
 			[[ $line == $path ]] && continue
+			[[ -d $line ]] || continue
 			lines+=("$line")
-			(( ${#lines} >= 25 )) && break
+			(( ${#lines} >= 50 )) && break
 		done < "$_HIST_FILE"
 	fi
 	printf '%s\n' "${lines[@]}" >| "$_HIST_FILE"
