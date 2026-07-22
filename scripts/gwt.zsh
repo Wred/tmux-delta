@@ -44,6 +44,7 @@ gwta() {
 
   if [[ -f "$main_tree/.envrc" && ! -f "$dir/.envrc" ]]; then
     cp "$main_tree/.envrc" "$dir/.envrc"
+    command -v direnv &>/dev/null && direnv allow "$dir/.envrc"
   fi
 
   echo "Worktree created at: $dir"
