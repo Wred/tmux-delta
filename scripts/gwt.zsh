@@ -42,6 +42,10 @@ gwta() {
     fi
   fi
 
+  if [[ -f "$main_tree/.envrc" && ! -f "$dir/.envrc" ]]; then
+    cp "$main_tree/.envrc" "$dir/.envrc"
+  fi
+
   echo "Worktree created at: $dir"
 }
 
