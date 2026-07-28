@@ -84,7 +84,7 @@ compute_pr_icons() {
   # ── Fetch PR state + CI checks in parallel (two independent API calls) ─────
   local tmp_pr tmp_checks
   tmp_pr=$(mktemp) tmp_checks=$(mktemp)
-  ( cd "$pane_path" && gh pr view --json isDraft,reviewDecision,number,title,url,state 2>/dev/null > "$tmp_pr" ) &
+  ( cd "$pane_path" && gh pr view --json isDraft,reviewDecision,number,title,url,state,author 2>/dev/null > "$tmp_pr" ) &
   local pid_pr=$!
   ( cd "$pane_path" && gh pr checks --json bucket 2>/dev/null > "$tmp_checks" ) &
   local pid_checks=$!
@@ -97,18 +97,19 @@ compute_pr_icons() {
 
   if [[ -z "$pr_json" ]]; then
     pr_cache_write "$pane_path" "$branch" "$(jq -n --argjson updated_at "$(date +%s)" \
-      '{pr_number: null, title: "", url: "", is_draft: false,
+      '{pr_number: null, title: "", url: "", is_draft: false, author: "",
         review_decision: "", ci_status: "none", icons: "", updated_at: $updated_at}')"
     return
   fi
 
-  local is_draft review_decision pr_number title url state
+  local is_draft review_decision pr_number title url state author
   is_draft=$(printf '%s' "$pr_json"        | jq -r '.isDraft       // false')
   review_decision=$(printf '%s' "$pr_json" | jq -r '.reviewDecision // ""')
   pr_number=$(printf '%s' "$pr_json"       | jq -r '.number        // ""')
   title=$(printf '%s' "$pr_json"           | jq -r '.title        // ""')
   url=$(printf '%s' "$pr_json"             | jq -r '.url          // ""')
   state=$(printf '%s' "$pr_json"           | jq -r '.state        // ""')
+  author=$(printf '%s' "$pr_json"          | jq -r '.author.login // ""')
 
   # ── CI status via gh pr checks ─────────────────────────────────────────────
   # gh pr checks covers both GitHub Actions check runs AND commit-status
@@ -165,10 +166,11 @@ compute_pr_icons() {
     --arg ci_status "$ci_status" \
     --arg state "$state" \
     --arg icons "$icons" \
+    --arg author "$author" \
     --argjson updated_at "$(date +%s)" \
     '{pr_number: $pr_number, title: $title, url: $url, is_draft: $is_draft,
       review_decision: $review_decision, ci_status: $ci_status, state: $state,
-      icons: $icons, updated_at: $updated_at}')
+      icons: $icons, author: $author, updated_at: $updated_at}')
   pr_cache_write "$pane_path" "$branch" "$json"
 
   printf '%s|%s' "$pr_number" "$icons"

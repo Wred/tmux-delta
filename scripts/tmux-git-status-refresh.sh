@@ -112,29 +112,33 @@ fi
 # since a real title is far more readable than a dash-separated branch slug.
 pr_number=""
 pr_title=""
+pr_author=""
 if [[ -n "$branch" ]] && command -v gh >/dev/null 2>&1 && command -v jq >/dev/null 2>&1; then
   age=$(pr_cache_age "$pane_path" "$branch")
   if [[ $age -lt 60 ]]; then
     cached=$(pr_cache_read "$pane_path" "$branch")
     pr_number=$(printf '%s' "$cached" | jq -r '.pr_number // empty')
     pr_title=$(printf '%s' "$cached" | jq -r '.title // empty')
+    pr_author=$(printf '%s' "$cached" | jq -r '.author // empty')
   else
     # Cache miss/stale: tmux-pr-status-refresh.sh is the primary writer, but
     # do a minimal one-off fetch so a brand-new session isn't left blank.
     # It will normally be overwritten with the full record within the same
     # refresh cycle (both scripts are triggered by the same hook).
-    pr_json=$(cd "$pane_path" && gh pr view --json number,title,url 2>/dev/null || true)
+    pr_json=$(cd "$pane_path" && gh pr view --json number,title,url,author 2>/dev/null || true)
     if [[ -n "$pr_json" ]]; then
       pr_number=$(printf '%s' "$pr_json" | jq -r '.number // empty')
       pr_title=$(printf '%s' "$pr_json" | jq -r '.title // empty')
       pr_url=$(printf '%s' "$pr_json" | jq -r '.url // empty')
+      pr_author=$(printf '%s' "$pr_json" | jq -r '.author.login // empty')
     fi
     pr_cache_write "$pane_path" "$branch" "$(jq -n \
       --argjson pr_number "${pr_number:-null}" \
       --arg title "${pr_title:-}" \
       --arg url "${pr_url:-}" \
+      --arg author "${pr_author:-}" \
       --argjson updated_at "$(date +%s)" \
-      '{pr_number: $pr_number, title: $title, url: $url, updated_at: $updated_at}')"
+      '{pr_number: $pr_number, title: $title, url: $url, author: $author, updated_at: $updated_at}')"
   fi
 fi
 
@@ -164,13 +168,15 @@ prev_icon=$(tmux show-option -gqv @git_icon_cache)
 prev_repo=$(tmux show-option -gqv @git_repo_cache)
 prev_pr_number=$(tmux show-option -gqv @git_pr_number_cache)
 prev_pr_title=$(tmux show-option -gqv @git_pr_title_cache)
+prev_pr_author=$(tmux show-option -gqv @git_pr_author_cache)
 
-if [[ "$branch" != "$prev_branch" || "$icon" != "$prev_icon" || "$repo" != "$prev_repo" || "$pr_number" != "$prev_pr_number" || "$pr_title" != "$prev_pr_title" || "$session_type" != "$prev_session_type" ]]; then
+if [[ "$branch" != "$prev_branch" || "$icon" != "$prev_icon" || "$repo" != "$prev_repo" || "$pr_number" != "$prev_pr_number" || "$pr_title" != "$prev_pr_title" || "$pr_author" != "$prev_pr_author" || "$session_type" != "$prev_session_type" ]]; then
   tmux set-option -g @git_branch_cache    "$branch"
   tmux set-option -g @git_icon_cache      "$icon"
   tmux set-option -g @git_repo_cache      "$repo"
   tmux set-option -g @git_pr_number_cache "$pr_number"
   tmux set-option -g @git_pr_title_cache  "$pr_title"
+  tmux set-option -g @git_pr_author_cache "$pr_author"
   [[ -n "$current_session" ]] && tmux set-option -t "$current_session" @session_type "$session_type" 2>/dev/null || true
   tmux refresh-client -S 2>/dev/null || true
 fi
