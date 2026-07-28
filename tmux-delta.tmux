@@ -47,7 +47,7 @@ for _delta_default in \
     green:'#a6e3a1' crust:'#11111b' fg:'#cdd6f4' surface_0:'#313244' \
     mauve:'#cba6f7' peach:'#fab387' pink:'#f5c2e7' \
     pr_green:'#a6e3a1' pr_red:'#f38ba8' pr_peach:'#fab387' \
-    pr_muted:'#6c7086' pr_sky:'#89dceb'; do
+    pr_muted:'#6c7086' pr_sky:'#89dceb' pr_lavender:'#b4befe'; do
   _delta_key="${_delta_default%%:*}"
   _delta_val="${_delta_default#*:}"
   _delta_existing=$(tmux show-option -gqv "@tmux_delta_color_${_delta_key}" 2>/dev/null)
@@ -68,7 +68,7 @@ unset _delta_existing
 # PR icon colors until the next reload.
 if [[ -n "$(tmux show-option -gqv @catppuccin_flavor 2>/dev/null)" ]]; then
   for _delta_pr_pair in green:pr_green red:pr_red peach:pr_peach \
-      overlay0:pr_muted sky:pr_sky; do
+      overlay0:pr_muted sky:pr_sky lavender:pr_lavender; do
     _delta_thm="${_delta_pr_pair%%:*}"
     _delta_dst="${_delta_pr_pair##*:}"
     _delta_val=$(tmux show-option -gqv "@thm_${_delta_thm}" 2>/dev/null)

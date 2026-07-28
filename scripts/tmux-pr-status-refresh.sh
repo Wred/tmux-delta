@@ -34,6 +34,7 @@ ICON_CHANGES=$'\xef\x80\xa1'   # U+F021  nf-fa-refresh
 ICON_CI_PASS=$'\xef\x81\x98'   # U+F058  nf-fa-check-circle
 ICON_CI_FAIL=$'\xef\x81\x97'   # U+F057  nf-fa-times-circle
 ICON_CI_PEND=$'\xef\x80\x97'   # U+F017  nf-fa-clock-o
+ICON_MERGED=$'\xef\x90\x99'    # U+F419  nf-oct-git-merge
 
 # PR status colors — configurable via @tmux_delta_color_pr_* tmux options.
 # tmux-delta.tmux seeds these (matching catppuccin's active flavor when
@@ -43,11 +44,13 @@ COLOR_RED=$(tmux show-option -gqv @tmux_delta_color_pr_red 2>/dev/null)
 COLOR_PEACH=$(tmux show-option -gqv @tmux_delta_color_pr_peach 2>/dev/null)
 COLOR_MUTED=$(tmux show-option -gqv @tmux_delta_color_pr_muted 2>/dev/null)   # overlay0 — visually muted for draft
 COLOR_SKY=$(tmux show-option -gqv @tmux_delta_color_pr_sky 2>/dev/null)       # sky — ready for review, awaiting decision
+COLOR_LAVENDER=$(tmux show-option -gqv @tmux_delta_color_pr_lavender 2>/dev/null) # lavender — PR merged
 : "${COLOR_GREEN:=#a6e3a1}"
 : "${COLOR_RED:=#f38ba8}"
 : "${COLOR_PEACH:=#fab387}"
 : "${COLOR_MUTED:=#6c7086}"
 : "${COLOR_SKY:=#89dceb}"
+: "${COLOR_LAVENDER:=#b4befe}"
 
 CACHE_TTL=60   # seconds between GitHub API re-fetches per session+branch
 
@@ -81,7 +84,7 @@ compute_pr_icons() {
   # ── Fetch PR state + CI checks in parallel (two independent API calls) ─────
   local tmp_pr tmp_checks
   tmp_pr=$(mktemp) tmp_checks=$(mktemp)
-  ( cd "$pane_path" && gh pr view --json isDraft,reviewDecision,number,title,url 2>/dev/null > "$tmp_pr" ) &
+  ( cd "$pane_path" && gh pr view --json isDraft,reviewDecision,number,title,url,state 2>/dev/null > "$tmp_pr" ) &
   local pid_pr=$!
   ( cd "$pane_path" && gh pr checks --json bucket 2>/dev/null > "$tmp_checks" ) &
   local pid_checks=$!
@@ -99,12 +102,13 @@ compute_pr_icons() {
     return
   fi
 
-  local is_draft review_decision pr_number title url
+  local is_draft review_decision pr_number title url state
   is_draft=$(printf '%s' "$pr_json"        | jq -r '.isDraft       // false')
   review_decision=$(printf '%s' "$pr_json" | jq -r '.reviewDecision // ""')
   pr_number=$(printf '%s' "$pr_json"       | jq -r '.number        // ""')
   title=$(printf '%s' "$pr_json"           | jq -r '.title        // ""')
   url=$(printf '%s' "$pr_json"             | jq -r '.url          // ""')
+  state=$(printf '%s' "$pr_json"           | jq -r '.state        // ""')
 
   # ── CI status via gh pr checks ─────────────────────────────────────────────
   # gh pr checks covers both GitHub Actions check runs AND commit-status
@@ -127,7 +131,9 @@ compute_pr_icons() {
   # ── Build icon string ───────────────────────────────────────────────────────
   local icons=""
 
-  if [[ "$is_draft" == "true" ]]; then
+  if [[ "$state" == "MERGED" ]]; then
+    icons+="#[fg=${COLOR_LAVENDER}]${ICON_MERGED}#[fg=default] "
+  elif [[ "$is_draft" == "true" ]]; then
     icons+="#[fg=${COLOR_MUTED}]${ICON_DRAFT}#[fg=default] "
   else
     case "$review_decision" in
@@ -157,11 +163,12 @@ compute_pr_icons() {
     --argjson is_draft "$is_draft" \
     --arg review_decision "$review_decision" \
     --arg ci_status "$ci_status" \
+    --arg state "$state" \
     --arg icons "$icons" \
     --argjson updated_at "$(date +%s)" \
     '{pr_number: $pr_number, title: $title, url: $url, is_draft: $is_draft,
-      review_decision: $review_decision, ci_status: $ci_status, icons: $icons,
-      updated_at: $updated_at}')
+      review_decision: $review_decision, ci_status: $ci_status, state: $state,
+      icons: $icons, updated_at: $updated_at}')
   pr_cache_write "$pane_path" "$branch" "$json"
 
   printf '%s|%s' "$pr_number" "$icons"
