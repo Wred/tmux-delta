@@ -27,7 +27,8 @@ run-shell -b '${SCRIPTS}/tmux-git-status-refresh.sh'; \
 run-shell -b '${SCRIPTS}/tmux-pr-status-refresh.sh --current'"
 tmux set-hook -g after-select-pane      "$hook_cmd"
 tmux set-hook -g after-select-window    "$hook_cmd"
-tmux set-hook -g client-session-changed "$hook_cmd"
+# Acknowledge the notification highlight when the user actually switches into the session.
+tmux set-hook -g client-session-changed "run-shell -b 'tmux set-option -u -t \"#{session_name}\" @agent_needs_attention'; $hook_cmd"
 
 # ─── Picker keybind ──────────────────────────────────────────────────────────
 is_ssh="ps -o comm= -t '#{pane_tty}' | grep -iqE '^ssh$'"
@@ -159,7 +160,10 @@ tmux set-option -g status-right "#(${SCRIPTS}/tmux-kube-status-refresh.sh >/dev/
 # Top bar  (format[0]): session pills on left, right-side modules on right.
 # Bottom bar (format[1]): repo pill + window list on left, kube context on right.
 tmux set-option -g status 2
-status_fmt0="#{S/n:#[range=session|#{session_id}]#[fg=${C_SURFACE0}]#[bg=default]${SEP_L}#[fg=${C_FG} bg=${C_SURFACE0}]#{?#{==:#{@session_type},folder},󰉋,#{?#{==:#{@session_type},worktree},󰘬,󰊢}} #{?#{@session_label},#{@session_label},#{session_name}}#{?#{@pr_icons}, #{@pr_icons},}#{?#{@agent_working}, #[fg=${C_PEACH}]󰚩#[fg=${C_FG}],} #[fg=${C_SURFACE0}]#[bg=default]${SEP_R}#[fg=default bg=default]#[norange] ,#[range=session|#{session_id}]#[fg=${C_MAUVE}]#[bg=default]${SEP_L}#[fg=${C_CRUST} bg=${C_MAUVE}]#{?#{==:#{@session_type},folder},󰉋,#{?#{==:#{@session_type},worktree},󰘬,󰊢}} #{?#{@session_label},#{@session_label},#{session_name}}#{?#{@pr_icons}, #{@pr_icons},}#{?#{@agent_working}, #[fg=${C_PEACH}]󰚩#[fg=${C_CRUST}],} #[fg=${C_MAUVE}]#[bg=default]${SEP_R}#[fg=default bg=default]#[norange] }#[align=right]#{E:status-right}"
+PILL_BG_INACTIVE="#{?#{@agent_needs_attention},${C_PEACH},${C_SURFACE0}}"
+PILL_FG_INACTIVE="#{?#{@agent_needs_attention},${C_CRUST},${C_FG}}"
+PILL_BG_ACTIVE="${C_MAUVE}"
+status_fmt0="#{S/n:#[range=session|#{session_id}]#[fg=${PILL_BG_INACTIVE}]#[bg=default]${SEP_L}#[fg=${PILL_FG_INACTIVE} bg=${PILL_BG_INACTIVE}]#{?#{==:#{@session_type},folder},󰉋,#{?#{==:#{@session_type},worktree},󰘬,󰊢}} #{?#{@session_label},#{@session_label},#{session_name}}#{?#{@pr_icons}, #{@pr_icons},}#{?#{@agent_working}, #[fg=${C_PEACH}]󰚩#[fg=${PILL_FG_INACTIVE}],} #[fg=${PILL_BG_INACTIVE}]#[bg=default]${SEP_R}#[fg=default bg=default]#[norange] ,#[range=session|#{session_id}]#[fg=${PILL_BG_ACTIVE}]#[bg=default]${SEP_L}#[fg=${C_CRUST} bg=${PILL_BG_ACTIVE}]#{?#{==:#{@session_type},folder},󰉋,#{?#{==:#{@session_type},worktree},󰘬,󰊢}} #{?#{@session_label},#{@session_label},#{session_name}}#{?#{@pr_icons}, #{@pr_icons},}#{?#{@agent_working}, #[fg=${C_PEACH}]󰚩#[fg=${C_CRUST}],} #[fg=${PILL_BG_ACTIVE}]#[bg=default]${SEP_R}#[fg=default bg=default]#[norange] }#[align=right]#{E:status-right}"
 tmux set-option -g 'status-format[0]' "$status_fmt0"
 tmux set-option -g 'status-format[1]' '#{?#{!=:#{@git_repo_cache},},#{E:@catppuccin_status_repo} ,}#{?#{!=:#{@git_pr_number_cache},},#{E:@catppuccin_status_pr_number} ,}#{?#{!=:#{@git_pr_author_cache},},#{E:@catppuccin_status_pr_author} ,}#{?#{!=:#{@git_pr_title_cache},},#{E:@catppuccin_status_pr_title},} #{W:#[range=window|#{window_index}]#{E:window-status-format}#[norange default] ,#[range=window|#{window_index}]#{E:window-status-current-format}#[norange default] }#[align=right]#{?#{!=:#{@kube_context_cache},},#{E:@catppuccin_status_kube},}'
 
