@@ -120,11 +120,17 @@ _list_worktrees() {
 
 _list_issues() {
 	_gh_check_auth || return
+	local mine_only="$1"
+	local -a gh_args=(--state open --limit 1000 --json number,title,labels,assignees)
+	[[ $mine_only == mine ]] && gh_args+=(--author "@me")
 	local issues_json
-	issues_json=$(gh issue list --state open --limit 1000 \
-		--json number,title,labels,assignees 2>/dev/null)
+	issues_json=$(gh issue list "${gh_args[@]}" 2>/dev/null)
 	if [[ -z $issues_json || $issues_json == "[]" ]]; then
-		printf '\t\033[2mNo open issues\033[0m\n'
+		if [[ $mine_only == mine ]]; then
+			printf '\t\033[2mNo open issues authored by you\033[0m\n'
+		else
+			printf '\t\033[2mNo open issues\033[0m\n'
+		fi
 		return
 	fi
 
@@ -305,7 +311,7 @@ _tab_header() {
 	case $active in
 		sessions)  hints="ctrl-x: delete · ctrl-e: open explorer · ctrl-o: open browser (git repos) · ctrl-h/l: switch" ;;
 		worktrees) hints="ctrl-x: delete · ctrl-e: open explorer · ctrl-o: open browser · ctrl-h/l: switch" ;;
-		issues)    hints="ctrl-a: autonomous · ctrl-o: open browser · ctrl-h/l: switch" ;;
+		issues)    hints="ctrl-a: autonomous · ctrl-y: toggle mine · ctrl-o: open browser · ctrl-h/l: switch" ;;
 		prs)       hints="ctrl-o: open browser · ctrl-h/l: switch" ;;
 		closed)    hints="ctrl-o: open browser · ctrl-h/l: switch" ;;
 		ready)     hints="ctrl-a: review all · ctrl-o: open browser · ctrl-h/l: switch" ;;
@@ -340,6 +346,7 @@ _switch_tab() {
 			echo "change-prompt(Worktrees> )+reload-sync($TMUX_PICKER --list-worktrees)+transform-header($TMUX_PICKER --tab-header worktrees)+clear-query+pos($pos)"
 			;;
 		issues)    echo "change-prompt(Issues> )+reload-sync($TMUX_PICKER --list-issues)+transform-header($TMUX_PICKER --tab-header issues)+clear-query" ;;
+		"issues-mine") echo "change-prompt(Issues (mine)> )+reload-sync($TMUX_PICKER --list-issues mine)+transform-header($TMUX_PICKER --tab-header issues)+clear-query" ;;
 		prs)       echo "change-prompt(PRs> )+reload-sync($TMUX_PICKER --list-prs)+transform-header($TMUX_PICKER --tab-header prs)+clear-query" ;;
 		closed)    echo "change-prompt(Closed PRs> )+reload-sync($TMUX_PICKER --list-prs-closed)+transform-header($TMUX_PICKER --tab-header closed)+clear-query" ;;
 		ready)     echo "change-prompt(Ready> )+reload-sync($TMUX_PICKER --list-prs-ready)+transform-header($TMUX_PICKER --tab-header ready)+clear-query" ;;
@@ -352,6 +359,7 @@ _cycle_left() {
 			"Sessions> ")    _switch_tab prs ;;
 			"Directories> ") _switch_tab sessions ;;
 			"Issues> ")      _switch_tab dirs ;;
+			"Issues (mine)> ") _switch_tab dirs ;;
 			"Worktrees> ")   _switch_tab issues ;;
 			"PRs> ")         _switch_tab worktrees ;;
 			"Closed PRs> ")  _switch_tab prs ;;
@@ -371,6 +379,7 @@ _cycle_right() {
 			"Sessions> ")    _switch_tab dirs ;;
 			"Directories> ") _switch_tab issues ;;
 			"Issues> ")      _switch_tab worktrees ;;
+			"Issues (mine)> ") _switch_tab worktrees ;;
 			"Worktrees> ")   _switch_tab prs ;;
 			"PRs> ")         _switch_tab closed ;;
 			"Closed PRs> ")  _switch_tab ready ;;
@@ -390,6 +399,7 @@ _on_enter() {
 		"Directories> ") echo "become(printf '%s\n%s' select {1})" ;;
 		"Worktrees> ")   echo "become(printf '%s\n%s\n%s' select {1} {q})" ;;
 		"Issues> ")      echo "become(printf '%s\n%s' interactive {1})" ;;
+		"Issues (mine)> ") echo "become(printf '%s\n%s' interactive {1})" ;;
 		"PRs> ")         echo "become(printf '%s\n%s' select {1})" ;;
 		"Closed PRs> ")  echo "become(printf '%s\n%s' select {1})" ;;
 		"Ready> ")       echo "become(printf '%s\n%s' select {1})" ;;
@@ -399,8 +409,16 @@ _on_enter() {
 _on_ctrl_a() {
 	case "$1" in
 	"Issues> ") echo "become(printf '%s\n%s' autonomous {1})" ;;
+	"Issues (mine)> ") echo "become(printf '%s\n%s' autonomous {1})" ;;
 	"Ready> ")  echo "become(printf 'review-all\n')" ;;
 esac
+}
+
+_on_ctrl_y() {
+	case "$1" in
+		"Issues> ")        _switch_tab issues-mine ;;
+		"Issues (mine)> ") _switch_tab issues ;;
+	esac
 }
 
 _on_ctrl_x() {
@@ -447,6 +465,7 @@ _on_ctrl_o() {
 	case "$1" in
 		"Sessions> ")  echo "execute($TMUX_PICKER --open-browser {1})+abort" ;;
 		"Issues> ")    echo "execute($TMUX_PICKER --open-browser {1})+abort" ;;
+		"Issues (mine)> ") echo "execute($TMUX_PICKER --open-browser {1})+abort" ;;
 		"PRs> ")         echo "execute($TMUX_PICKER --open-browser {1})+abort" ;;
 		"Closed PRs> ")  echo "execute($TMUX_PICKER --open-browser {1})+abort" ;;
 		"Ready> ")       echo "execute($TMUX_PICKER --open-browser {1})+abort" ;;
@@ -945,7 +964,7 @@ case "${1:-}" in
 	--list-sessions)  _list_sessions;              exit ;;
 	--list-dirs)      _list_dirs;                  exit ;;
 	--list-worktrees) _list_worktrees;             exit ;;
-	--list-issues)    _list_issues;                exit ;;
+	--list-issues)    _list_issues "$2";           exit ;;
 	--list-prs)        _list_prs;                  exit ;;
 	--list-prs-closed) _list_prs_closed;           exit ;;
 	--list-prs-ready)  _list_prs_ready;            exit ;;
@@ -961,6 +980,7 @@ case "${1:-}" in
 	--on-ctrl-e)      _on_ctrl_e "$2";             exit ;;
 	--open-finder)    _open_finder "$2";           exit ;;
 	--on-ctrl-o)      _on_ctrl_o "$2";             exit ;;
+	--on-ctrl-y)      _on_ctrl_y "$2";             exit ;;
 	--open-browser)   _open_browser "$2";          exit ;;
 esac
 
@@ -1010,6 +1030,7 @@ if git rev-parse --git-dir &>/dev/null; then
 		--bind 'ctrl-a:transform:$TMUX_PICKER --on-ctrl-a "$FZF_PROMPT"' \
 		--bind 'ctrl-e:transform:$TMUX_PICKER --on-ctrl-e "$FZF_PROMPT"' \
 		--bind 'ctrl-o:transform:$TMUX_PICKER --on-ctrl-o "$FZF_PROMPT"' \
+		--bind 'ctrl-y:transform:$TMUX_PICKER --on-ctrl-y "$FZF_PROMPT"' \
 	)
 else
 	output=$(echo "$_sessions_list" | fzf --ansi \
