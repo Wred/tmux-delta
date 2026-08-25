@@ -10,6 +10,10 @@ SELF="${0:A}"
 SCRIPTS="${SELF:h}"
 export TMUX_PICKER="$SELF"
 
+# Extra KEY=VALUE session env passed by non-interactive --spawn-* callers.
+typeset -ga _spawn_env=()
+_APEX_SPAWN=""
+
 source "${SCRIPTS}/gwt.zsh"
 source "${SCRIPTS}/lib/pr-cache.sh"
 
@@ -553,8 +557,35 @@ _open_browser() {
 
 # ─── Shared confirm helper ──────────────────────────────────────────
 
+# Applies extra KEY=VALUE session environment supplied by a non-interactive
+# caller (tmux-apex.sh), so tmux-dev-layout.sh sees it before it launches the
+# coding agent. Reads the _spawn_env array set by the --spawn-* subcommands.
+_apply_spawn_env() {
+	local session_name="$1" kv
+	for kv in "${_spawn_env[@]}"; do
+		[[ $kv == *=* ]] || continue
+		tmux set-environment -t "$session_name" "${kv%%=*}" "${kv#*=}"
+	done
+}
+
+# Machine-readable handoff line so tmux-apex.sh learns the created session
+# without having to re-derive the branch slug.
+_report_spawn() {
+	[[ -n $_APEX_SPAWN ]] || return 0
+	printf 'apex-session\t%s\t%s\n' "$1" "$2"
+}
+
 _confirm() {
 	local prompt="$1"
+	# Non-interactive callers (tmux-apex.sh) have no tty: decline by default so
+	# nothing ever blocks on stdin, unless they explicitly opted in.
+	if [[ -n $TMUX_DELTA_ASSUME_YES ]]; then
+		return 0
+	fi
+	if [[ ! -t 0 ]]; then
+		echo "${prompt} [y/N] n  (non-interactive)"
+		return 1
+	fi
 	read -q "reply?${prompt} [y/N] "
 	echo
 	[[ $reply == "y" ]]
@@ -820,6 +851,7 @@ _open_pr_review() {
 	_set_pr_env() {
 		tmux set-environment -t "$selected_name" CODING_AGENT_PR "$pr_number"
 		tmux set-environment -t "$selected_name" CODING_AGENT_MODE "review"
+		_apply_spawn_env "$selected_name"
 	}
 
 	if [[ -z $TMUX ]] && [[ -z $tmux_running ]]; then
@@ -845,6 +877,7 @@ _open_pr_review() {
 		sleep 0.5
 		tmux send-keys -t "$selected_name" "${SCRIPTS}/tmux-dev-layout.sh" Enter
 	fi
+	_report_spawn "$selected_name" "$selected"
 }
 
 _open_all_pr_reviews() {
@@ -866,6 +899,8 @@ _open_all_pr_reviews() {
 
 _open_issue() {
 	local issue_number="$1" mode="$2"
+	local do_switch="${3:-switch}"
+	[[ $do_switch == yes ]] && do_switch=switch
 	[[ ! $issue_number =~ ^[0-9]+$ ]] && exit 0
 
 	local issue_json=$(gh issue view "$issue_number" --json title 2>/dev/null)
@@ -931,6 +966,7 @@ _open_issue() {
 	_set_issue_env() {
 		tmux set-environment -t "$selected_name" CODING_AGENT_ISSUE "$issue_number"
 		tmux set-environment -t "$selected_name" CODING_AGENT_MODE "$mode"
+		_apply_spawn_env "$selected_name"
 	}
 
 	if [[ -z $TMUX ]] && [[ -z $tmux_running ]]; then
@@ -939,6 +975,7 @@ _open_issue() {
 		_set_session_label "$selected_name" "$selected"
 		tmux attach-session -t "$selected_name"
 		tmux send-keys -t "$selected_name" "${SCRIPTS}/tmux-dev-layout.sh" Enter
+		_report_spawn "$selected_name" "$selected"
 		exit 0
 	fi
 
@@ -947,15 +984,18 @@ _open_issue() {
 		tmux new-session -ds "$selected_name" -c "$selected"
 		newly_created=true
 	fi
-	tmux switch-client -t "$selected_name"
 	_set_session_label "$selected_name" "$selected"
-	tmux run-shell -b -t "$selected_name" "$SCRIPTS/tmux-kube-status-refresh.sh"
-	tmux run-shell -b -t "$selected_name" "$SCRIPTS/tmux-git-status-refresh.sh"
+	if [[ $do_switch == switch ]]; then
+		tmux switch-client -t "$selected_name"
+		tmux run-shell -b -t "$selected_name" "$SCRIPTS/tmux-kube-status-refresh.sh"
+		tmux run-shell -b -t "$selected_name" "$SCRIPTS/tmux-git-status-refresh.sh"
+	fi
 	if $newly_created; then
 		_set_issue_env
 		sleep 0.5
 		tmux send-keys -t "$selected_name" "${SCRIPTS}/tmux-dev-layout.sh" Enter
 	fi
+	_report_spawn "$selected_name" "$selected"
 }
 
 # ─── Subcommand dispatch ────────────────────────────────────────────
@@ -969,6 +1009,22 @@ case "${1:-}" in
 	--list-prs-closed) _list_prs_closed;           exit ;;
 	--list-prs-ready)  _list_prs_ready;            exit ;;
 	--tab-header)     _tab_header "$2";            exit ;;
+	--spawn-issue)
+		_APEX_SPAWN=1
+		shift
+		_fl_issue="$1"; _fl_mode="${2:-autonomous}"; _fl_switch="${3:-no-switch}"
+		(( $# > 3 )) && shift 3 || shift $#
+		_spawn_env=("$@")
+		_open_issue "$_fl_issue" "$_fl_mode" "$_fl_switch"
+		exit ;;
+	--spawn-pr-review)
+		_APEX_SPAWN=1
+		shift
+		_fl_branch="$1"; _fl_switch="${2:-no-switch}"
+		(( $# > 2 )) && shift 2 || shift $#
+		_spawn_env=("$@")
+		_open_pr_review "$_fl_branch" "$_fl_switch"
+		exit ;;
 	--delete-session) _delete_session "$2";        exit ;;
 	--delete-wt)      _delete_wt "$2";             exit ;;
 	--switch-tab)     _switch_tab "$2";            exit ;;

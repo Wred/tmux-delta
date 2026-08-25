@@ -10,6 +10,7 @@ A tmux plugin providing a unified session/worktree/issue/PR picker and a dynamic
 - **Git worktree helpers**: `gwta`, `gwtrm`, `gwtl`, `gwtp` shell functions
 - **Dev layout**: auto-opens nvim + coding agent split on new sessions
 - **PR status daemon**: background refresh of CI/review state every 60 s
+- **Apex mode**: one agent session plans work, spawns worker agents in their own worktrees, and tracks who is blocked and what is ready to merge
 
 ## Requirements
 
@@ -26,6 +27,7 @@ A tmux plugin providing a unified session/worktree/issue/PR picker and a dynamic
 - `kubectl` — Kubernetes context pill
 - `direnv` — per-directory KUBECONFIG support (kube pill falls back to global config)
 - `nvim` — dev layout left pane
+- a coding agent — `claude`, `pi`, `codex`, or `opencode` (see Coding agent below; others work via the fallback adapter)
 - Nerd Fonts — icons in status bar
 
 ## Installation
@@ -53,6 +55,88 @@ Add to your `.zshrc`:
 export PATH="$HOME/.tmux/plugins/tmux-delta/scripts:$PATH"
 [[ -f "$HOME/.tmux/plugins/tmux-delta/scripts/gwt.zsh" ]] && \
   source "$HOME/.tmux/plugins/tmux-delta/scripts/gwt.zsh"
+```
+
+### 3. Coding-agent hooks (optional — activity pills and apex-mode reporting)
+
+`scripts/agent-tmux-status.sh` drives the per-session activity indicators and,
+in apex mode, forwards worker transitions to the manager. It takes one of three
+verbs, and the semantics matter — `notify` pings the apex manager *immediately*
+with no debounce, so it must mean "blocked on a human", never "turn ended":
+
+| Verb | Meaning | Pill | Apex ping |
+|------|---------|------|-----------|
+| `set` | agent is working | peach robot | none |
+| `notify` | agent is blocked on you | pill turns orange | immediate |
+| `clear` | agent is idle | reset | after `APEX_QUIET_SECS` |
+
+**Claude Code** — `~/.claude/settings.json`:
+
+```json
+{
+  "hooks": {
+    "PreToolUse": [
+      { "matcher": "", "hooks": [{ "type": "command", "command": "~/.tmux/plugins/tmux-delta/scripts/agent-tmux-status.sh set" }] }
+    ],
+    "Notification": [
+      { "matcher": "", "hooks": [{ "type": "command", "command": "~/.tmux/plugins/tmux-delta/scripts/agent-tmux-status.sh notify" }] }
+    ],
+    "Stop": [
+      { "matcher": "", "hooks": [{ "type": "command", "command": "~/.tmux/plugins/tmux-delta/scripts/agent-tmux-status.sh clear" }] }
+    ]
+  }
+}
+```
+
+**pi** — symlink the shipped extension, which wires `agent_start` → `set` and
+`agent_settled` → `clear`:
+
+```zsh
+ln -s ~/.tmux/plugins/tmux-delta/extensions/pi/tmux-status.ts \
+      ~/.pi/agent/extensions/tmux-status.ts
+```
+
+It deliberately does not fire `notify`, because pi has no single "blocked" event
+— the blocking moments are the confirm prompts your own extensions raise. The
+extension exports `tmuxStatus` so you can wrap them:
+
+```ts
+import { tmuxStatus } from "./tmux-status.ts";
+
+tmuxStatus("notify");
+try { choice = await ctx.ui.select(…); } finally { tmuxStatus("set"); }
+```
+
+**opencode** — symlink the shipped plugin:
+
+```zsh
+mkdir -p ~/.config/opencode/plugin
+ln -s ~/.tmux/plugins/tmux-delta/extensions/opencode/tmux-status.js \
+      ~/.config/opencode/plugin/tmux-status.js
+```
+
+It maps `tool.execute.before` → `set`, `permission.asked` → `notify`,
+`permission.replied` → `set`, and `session.idle`/`session.error` → `clear`, so
+opencode reports all three states. If a build does not deliver the permission
+events to plugins the mapping quietly degrades to working/idle.
+
+**codex** — `~/.codex/config.toml`:
+
+```toml
+notify = ["/home/you/.tmux/plugins/tmux-delta/scripts/agent-tmux-status.sh", "clear"]
+```
+
+Codex appends a JSON argument, which the script ignores. This is codex's only
+hook and it fires on turn completion, so codex gets the idle ping but neither
+the working robot nor the orange pill. *(Untested — written from the codex docs,
+not verified against an install.)*
+
+### 4. Apex mode skill (optional)
+
+Symlink the shipped skill so Claude Code can find it:
+
+```zsh
+ln -s ~/.tmux/plugins/tmux-delta/skills/delta-apex ~/.claude/skills/delta-apex
 ```
 
 ## Configuration
@@ -102,6 +186,49 @@ The dev layout (`tmux-dev-layout.sh`) opens a coding agent on the right pane. Ov
 export CODING_AGENT=claude
 ```
 
+Agents spell the same concepts differently, so the dev layout emits no flags of
+its own. It exports neutral inputs and calls an **adapter** —
+`scripts/lib/agents/<command>.sh` — chosen by the agent command's basename.
+Adapters ship for `claude`, `pi`, `codex`, and `opencode`; anything else falls
+back to the claude adapter. Adding one is a single file defining
+`delta_agent_argv()`.
+
+| Neutral input | claude | pi | codex | opencode |
+|---|---|---|---|---|
+| model | `--model` | `--model` (accepts `provider/id`, `:thinking`) | `--model` | `--model` (wants `provider/model`) |
+| prompt | positional | positional | positional | `--prompt` |
+| system prompt | `--append-system-prompt` | `--append-system-prompt` | *none* — prepended to the prompt | *none* — injected as `instructions` via `OPENCODE_CONFIG_CONTENT` |
+| agent flags | `--permission-mode <token>`, or verbatim if it starts with `-` | verbatim (`--approve`, `--tools …`) | verbatim (`--full-auto`, `--sandbox …`) | verbatim (`--auto`) |
+| resume | `--continue` | `--continue` | `resume --last` | `--continue` |
+
+Resume is attempted first and falls back to a fresh session when there is
+nothing to resume.
+
+Neither codex nor opencode has an `--append-system-prompt`, so the
+managed-worker instructions apex mode adds need a workaround. opencode gets a
+real one: `OPENCODE_CONFIG_CONTENT` *merges* into the resolved config rather
+than replacing it, so the instructions go in as a genuine `instructions` entry
+pointing at a file under `~/.cache/tmux-delta/agent-prompts/`. codex has no
+equivalent and falls back to prepending them to the prompt, which is weaker —
+the model can be talked out of a user message. In both cases the file is kept
+out of the worktree deliberately: an `AGENTS.md` written there would land in the
+diff the worker commits.
+
+### Apex mode options
+
+```tmux
+# Glyph marking the manager session in its pill (default: robot)
+set -g @tmux_delta_apex_icon '󰚩'
+
+# Pane commands tmux-apex.sh is allowed to send-keys into. Allowlist, not
+# denylist — a shell pane must never receive a message, it would execute it.
+# Both Claude Code and pi present as `node`.
+set -g @tmux_delta_apex_agent_cmds 'node bun claude codex gemini pi opencode'
+```
+
+`APEX_QUIET_SECS` (env, default `30`) is how long a worker must be idle before
+its "turn finished" ping reaches the manager.
+
 ### Editor
 
 The dev layout opens `nvim` on the left pane by default. Override the command via `.envrc` in your project:
@@ -125,6 +252,96 @@ export DEV_EDITOR="hunk diff --watch"
 | `ctrl-a` | Autonomous agent (Issues tab) / review all (Ready tab) |
 | `ctrl-o` | Open in browser |
 | `ctrl-x` | Delete session / worktree |
+
+## Apex mode
+
+Normally each picker-spawned session is independent, so supervising several
+parallel agents means cycling through pills by hand. Apex mode designates one
+session as the **manager**: it plans work into GitHub issues, spawns worker
+sessions through the same picker machinery, tracks their state, and gets pinged
+when one finishes a turn or gets blocked.
+
+There is no MCP server and no daemon. tmux is the registry (per-session
+`@apex_*` options), and a small JSON tree under
+`${XDG_CACHE_HOME:-~/.cache}/tmux-delta/apex/<manager-session>/` is the durable
+state that survives the manager's context being compacted.
+
+Ask your agent to "turn on apex mode" (it loads the `delta-apex` skill), or
+drive it yourself:
+
+```zsh
+tmux-apex.sh init                    # this session is now the manager
+tmux-apex.sh spawn --issue 42 --model sonnet --agent-flags acceptEdits
+tmux-apex.sh spawn --issue 43 --agent pi --model sonnet:high --agent-flags '--approve'
+tmux-apex.sh spawn --issue 44 --agent opencode --model anthropic/claude-sonnet-4-6 --agent-flags '--auto'
+tmux-apex.sh spawn --review-pr 17 --model opus
+tmux-apex.sh send <session> "rebase on main, CI is red"
+tmux-apex.sh status                  # or --json
+tmux-apex.sh reap --yes              # remove finished/dead members
+tmux-apex.sh stop
+```
+
+A team can be mixed: `--agent` picks the coding agent per spawn, so a cheap
+`pi` worker and an `opus` reviewer can run side by side. `--agent-flags` is
+passed to that agent's adapter verbatim (`--permission-mode` is accepted as an
+alias, since only claude calls it that). A bare claude token like
+`bypassPermissions` combined with a non-claude `--agent` is refused rather than
+being handed over as a stray positional.
+
+`spawn` delegates to the picker's existing issue/PR handlers, so worktree
+naming, the already-has-an-open-PR check, session labelling and the dev layout
+are exactly the same as a manual `C-g` spawn. It defaults to not switching
+clients, so the manager keeps focus; pass `--switch` to jump to the new session.
+
+**The manager may not merge or close anything.** It spawns, instructs, kills and
+reaps; when work is done it reports "ready to merge" and stops. That boundary
+lives in the skill.
+
+### How reporting works
+
+The worker's Claude Code hooks call `agent-tmux-status.sh`, which updates the
+pill *and*, for apex-mode members, records the transition and pings the manager's
+agent pane with `send-keys`:
+
+| Hook | State | Ping |
+|------|-------|------|
+| `PreToolUse` → `set` | `working` | none |
+| `Notification` → `notify` | `attention` | immediate — the worker is blocked |
+| `Stop` → `clear` | `idle` | after `APEX_QUIET_SECS` of quiet |
+
+`Stop` fires at the end of every assistant turn, so the idle ping is debounced
+via a sequence counter and `tmux run-shell -d`: several quick turns produce one
+ping, not one per turn. Pings are best-effort UX; `tmux-apex.sh status --json`
+and `events.jsonl` are the source of truth.
+
+How much of that an agent reports depends on what it exposes (see Installation
+step 3): claude, pi, and opencode cover all three transitions, codex only the
+idle one.
+A worker that reports nothing still shows up in `status` — the manager just has
+to poll it rather than being woken.
+
+Manager designation is a tmux *session* option, so it does not survive a tmux
+server restart. The on-disk state does; re-run `init` to re-adopt it.
+
+### Per-spawn agent configuration
+
+`spawn` sets these in the new session's environment; `tmux-dev-layout.sh` reads
+them when launching the agent:
+
+| Variable | Effect |
+|----------|--------|
+| `CODING_AGENT_MODEL` | `--model` |
+| `CODING_AGENT_PERMISSION_MODE` | `--permission-mode` |
+| `CODING_AGENT_ROLE` / `CODING_AGENT_APEX_SESSION` | appends a system prompt telling the agent it is managed: report blockers instead of waiting on a human, expect follow-ups, never merge or close |
+
+### Session options
+
+| Option | Set on | Value |
+|--------|--------|-------|
+| `@apex_role` | manager + members | `manager` \| `worker` \| `monitor` |
+| `@apex_session` | members | manager's session name |
+| `@apex_task` | members | `issue:42` or `pr:17` |
+| `@agent_pane` | any dev-layout session | pane id of the coding-agent split |
 
 ## Shell functions (gwt.zsh)
 
