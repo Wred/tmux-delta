@@ -19,6 +19,19 @@ SCRIPTS="${CURRENT_DIR}/scripts"
 tmux set-environment -g TMUX_DELTA_SCRIPTS "$SCRIPTS"
 tmux set-option -g @tmux_delta_scripts "$SCRIPTS"
 
+# Put scripts/ on PATH for new panes/sessions so tools like tmux-apex.sh can
+# be invoked by name (agents follow SKILL.md instructions that assume this).
+# Only new shells pick this up — existing panes keep whatever PATH they
+# already inherited, so a `tmux source` alone won't retroactively fix them.
+# Query tmux's own global environment (not this script's process PATH) so
+# repeated reloads don't keep re-deriving from a stale value.
+TMUX_GLOBAL_PATH="$(tmux show-environment -g PATH 2>/dev/null | sed -n 's/^PATH=//p')"
+[[ -z "$TMUX_GLOBAL_PATH" ]] && TMUX_GLOBAL_PATH="$PATH"
+case ":${TMUX_GLOBAL_PATH}:" in
+  *":${SCRIPTS}:"*) ;;
+  *) tmux set-environment -g PATH "${SCRIPTS}:${TMUX_GLOBAL_PATH}" ;;
+esac
+
 # ─── Hooks ───────────────────────────────────────────────────────────────────
 # Refresh git, kube, and PR caches on every focus change.
 # run-shell -b spawns in the background so hooks never block input.
