@@ -29,9 +29,15 @@ tmux-apex.sh init          # marks this session as the manager
 tmux-apex.sh status        # what's already running
 ```
 
-`init` records this pane as the delivery address for status pings, so run it
-from the session you intend to work in. The manager's session pill gains a pink
-robot marker. `tmux-apex.sh stop` leaves manager mode; members keep running.
+`init` marks this session as the manager. The manager's session pill gains a
+pink robot marker. `tmux-apex.sh stop` leaves manager mode; members keep
+running.
+
+Session options don't survive a killed-and-recreated session, but a hook on
+every session start re-derives them from durable state (`tmux-apex.sh
+relink`) — so `--continue` in the same directory picks back up as manager or
+worker without re-running `init`/`spawn`, and a manager you `stop`'d stays
+stopped rather than silently coming back.
 
 Report state to the human after `init`, then wait for direction.
 
@@ -54,6 +60,7 @@ tmux-apex.sh spawn --issue 42 --model sonnet --agent-flags acceptEdits
 tmux-apex.sh spawn --issue 43 --model opus --agent-flags bypassPermissions
 tmux-apex.sh spawn --issue 44 --agent pi --model sonnet:high --agent-flags '--approve'
 tmux-apex.sh spawn --issue 45 --agent opencode --model anthropic/claude-sonnet-4-6 --agent-flags '--auto'
+tmux-apex.sh spawn --issue 46 --agent codex --agent-flags '--sandbox workspace-write --ask-for-approval on-request'
 tmux-apex.sh spawn --review-pr 17 --role monitor --model opus
 ```
 
@@ -74,9 +81,21 @@ Choose per task, and say out loud why you chose it:
 
 If you do pass `--agent`, `--agent-flags` becomes that agent's own argv, not a
 claude permission mode — `--approve` or `--tools read,bash,edit` for pi,
-`--full-auto` or `--sandbox …` for codex, `--auto` for opencode. opencode also
-wants its model as `provider/model`. Passing a claude token to a non-claude
-agent is refused, so a mistake here is an error, not a silently broken worker.
+`--sandbox {read-only|workspace-write|danger-full-access}` plus
+`--ask-for-approval {on-request|never}` for codex, `--auto` for opencode.
+(Older docs/examples may say `--full-auto` for codex — that flag doesn't exist
+in current codex-cli; use the sandbox/approval pair above instead.) opencode
+also wants its model as `provider/model`. Passing a claude token to a
+non-claude agent is refused, so a mistake here is an error, not a silently
+broken worker.
+
+Codex's `workspace-write` sandbox combined with `--ask-for-approval never` (or
+`--dangerously-bypass-approvals-and-sandbox`) reads as unattended full-write
+access, and Claude Code's own permission classifier can block the spawn itself
+over that combination — treat it like any other outward-facing action and
+expect to ask the human before using it, or default to `on-request`/
+`read-only` for spawns you want to go through unattended.
+
 Codex reports only "idle", never "working" or "blocked", so a codex worker needs
 polling rather than waiting for its ping; claude, pi, and opencode report all
 three.
@@ -87,7 +106,14 @@ completion, state blockers instead of waiting, never merge or close.
 
 ## Reacting to pings
 
-A worker's hooks report every transition. You will receive lines like:
+A worker's hooks report every transition, but nothing is ever typed into this
+pane for it — that used to happen and it collided with whatever you were
+typing (or, at least once, with a shell autosuggestion that was never your
+typing at all). Delivery is pull-based instead: a hook on your own session
+checks for anything undelivered before each of your turns, and again if this
+session restarts (`--continue` in the same directory picks up what it
+missed). When there's something new, it shows up as context ahead of your
+next reply — you didn't type it and neither did the human — looking like:
 
 ```
 [apex] session=tmux-delta-fix-pills-issue-42 role=worker task=issue:42 status=idle — branch=fix-pills-issue-42 pr=#17(draft) commits_ahead=3. Full state: …/tmux-apex.sh status --json
@@ -96,7 +122,14 @@ A worker's hooks report every transition. You will receive lines like:
 `status=idle` means the worker finished a turn and stayed quiet — usually done,
 sometimes stuck. `status=attention` means it is blocked right now.
 
-Do not trust the ping alone. Read the real state first:
+You can check the same thing by hand at any time, e.g. if you want to look
+before the human sends you another message:
+
+```bash
+tmux-apex.sh pending          # undelivered idle/attention members, if any
+```
+
+Do not trust a ping alone, delivered or hand-checked. Read the real state first:
 
 ```bash
 tmux-apex.sh status --json
@@ -140,11 +173,13 @@ tell the human what it found.
 
 ## If pings stop
 
-Pings are pushed by the workers' hooks, so a worker that crashes outright cannot
-tell you. If your workers have gone quiet longer than the work should have taken,
-check `tmux-apex.sh status` — dead sessions show as `dead`. For long unattended
-runs you can ask the human to start `/loop 20m` over a status check as a
-fallback heartbeat; it is not needed in normal operation.
+A worker's hooks are what generates a ping in the first place, so a worker that
+crashes outright never records one — there is nothing to pull, and you won't
+hear about it until you go looking. If your workers have gone quiet longer than
+the work should have taken, check `tmux-apex.sh status` — dead sessions show
+as `dead`. For long unattended runs you can `/loop 20m` over a status check
+yourself as a fallback heartbeat between deliveries; it is not needed in
+normal operation.
 
 ## Reporting to the human
 
