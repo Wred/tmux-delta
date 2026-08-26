@@ -336,13 +336,16 @@ _cmd_spawn() {
 	tmux set-option -t "$session" @apex_session "$manager"
 	tmux set-option -t "$session" @apex_task "${issue:+issue:$issue}${review_pr:+pr:$review_pr}"
 
+	# Recorded durably (not just as the transient CODING_AGENT env var used to
+	# pick an adapter at layout time) so `send` can later tell which agents
+	# have a native session-message API — see _send_native.
 	apex_member_merge "$manager" "$session" "$(jq -nc \
 		--arg role "$role" --arg wt "$worktree" --arg model "$model" \
-		--arg perm "$perm" --arg mode "$mode" \
+		--arg perm "$perm" --arg mode "$mode" --arg agent "${agent:-claude}" \
 		--arg issue "$issue" --arg pr "$review_pr" \
 		--argjson t "$(date +%s)" \
 		'{role:$role, worktree:$wt, model:$model, permission_mode:$perm,
-		  mode:$mode, issue:$issue, review_pr:$pr,
+		  mode:$mode, agent:$agent, issue:$issue, review_pr:$pr,
 		  status:"starting", seq:0, pinged_seq:-1,
 		  spawned_at:$t, updated_at:$t}')"
 
@@ -356,6 +359,86 @@ _cmd_spawn() {
 	print "  model    : ${model:-<default>}   permission-mode: ${perm:-<default>}"
 }
 
+# ─── native message delivery (codex/opencode) ─────────────────────────
+
+# _codex_thread_for <worktree> — newest codex session id whose recorded cwd
+# matches <worktree>, or nothing if none found. Codex writes a session_meta
+# record as the first line of every rollout file under
+# $CODEX_HOME/sessions/**, including the cwd it started in — durable state
+# that already exists for free, no capture-at-spawn plumbing needed.
+_codex_thread_for() {
+	local wt="$1" home f
+	[[ -z $wt ]] && return 1
+	home="${CODEX_HOME:-$HOME/.codex}"
+	for f in "$home"/sessions/*/*/*/rollout-*.jsonl(Nom); do
+		jq -e --arg wt "$wt" \
+			'select(.type=="session_meta" and .payload.cwd==$wt)' \
+			<(head -n1 "$f") >/dev/null 2>&1 || continue
+		jq -r '.payload.session_id' <(head -n1 "$f")
+		return 0
+	done
+	return 1
+}
+
+# _opencode_session_for <worktree> — most recently updated opencode session
+# whose exact starting directory is <worktree>. `opencode session list`
+# looked like the obvious way to ask this, but it groups by git project
+# (repo root) rather than exact directory — every worktree of the same repo
+# gets the identical list back, which is useless here since apex's whole
+# model is sibling worktrees of one repo (verified against two real
+# worktrees: `session list` was byte-identical from both). opencode's own
+# sqlite store does record the exact directory a session was started in
+# (the `session.directory` column), so read that directly instead.
+_opencode_session_for() {
+	local wt="$1" db esc id
+	[[ -d $wt ]] || return 1
+	db="${XDG_DATA_HOME:-$HOME/.local/share}/opencode/opencode.db"
+	[[ -f $db ]] || return 1
+	esc=${wt//\'/\'\'}
+	id=$(sqlite3 -readonly "$db" \
+		"select id from session where directory = '${esc}' order by time_updated desc limit 1;" 2>/dev/null)
+	[[ -n $id ]] || return 1
+	printf '%s' "$id"
+}
+
+# _send_native <agent> <worktree> <text> — deliver via the agent's own
+# out-of-band session-message API instead of tmux keystrokes, for the two
+# agents that have one. Returns 1 (caller falls back to send-keys) for any
+# other agent, or when no session id can be resolved for <worktree>.
+#
+# codex: `queue` hands the message to the shared app-server daemon and
+# returns immediately — verified live against a running interactive codex
+# session: a queued message showed up as a new turn in the same pane and
+# was acted on, no keystrokes involved. Runs synchronously with a short
+# timeout and reports failure honestly on a non-zero exit.
+#
+# opencode: `run -s ID -c` was verified live the same way, with one real
+# caveat — it does append to the *same* session (confirmed via opencode's
+# own sqlite store: one session, messages in order) and the agent does act
+# on it (asked to recall its reply, it could), but the already-running
+# interactive TUI in the worker's pane never visually refreshes to render
+# that exchange — a human tmux-attaching to the pane right after a `send`
+# will not see it there, only in `status --json`'s events, until they
+# interact with that TUI again themselves. Also, unlike codex's queue,
+# `run` most likely blocks for the full agent turn rather than just
+# enqueuing, so it's backgrounded rather than run synchronously — this can
+# only confirm the message was handed off, not that it was acted on, same
+# as the send-keys path it replaces.
+_send_native() {
+	local agent="$1" wt="$2" text="$3" id
+	case "$agent" in
+		codex)
+			id=$(_codex_thread_for "$wt") || return 1
+			timeout 8 codex queue --thread "$id" --message "$text" >/dev/null 2>&1
+			;;
+		opencode)
+			id=$(_opencode_session_for "$wt") || return 1
+			( cd "$wt" && opencode run -s "$id" -c "$text" >/dev/null 2>&1 &! )
+			;;
+		*) return 1 ;;
+	esac
+}
+
 # ─── send ────────────────────────────────────────────────────────────
 
 _cmd_send() {
@@ -366,23 +449,38 @@ _cmd_send() {
 
 	_session_alive "$target" || _die "send: session '$target' is not running"
 
-	local pane
-	pane=$(_agent_pane "$target")
-	[[ -n $pane ]] || _die "send: session '$target' has no @agent_pane (no coding agent split?)"
-	_pane_is_agent "$pane" || _die "send: pane $pane of '$target' is not running a coding agent — refusing to send"
-
-	local from
+	local from full
 	from=$(_cur_session 2>/dev/null)
-	_send_to_pane "$pane" "[apex from:${from:-manager}] ${text}" \
-		|| _die "send: delivery failed"
+	full="[apex from:${from:-manager}] ${text}"
 
-	local manager
-	manager=$(_resolve_manager "$target" 2>/dev/null) || manager="$from"
+	# Native delivery only applies to a tracked apex member — anything else
+	# (a hand-run session, or an agent with no native API) falls straight
+	# through to the tmux send-keys path exactly as before.
+	local manager agent wt pane delivered=false
+	manager=$(_resolve_manager "$target" 2>/dev/null)
+	if [[ -n $manager ]]; then
+		agent=$(apex_member_get "$manager" "$target" agent)
+		wt=$(apex_member_get "$manager" "$target" worktree)
+		_send_native "$agent" "$wt" "$full" && delivered=true
+	fi
+
+	if ! $delivered; then
+		pane=$(_agent_pane "$target")
+		[[ -n $pane ]] || _die "send: session '$target' has no @agent_pane (no coding agent split?)"
+		_pane_is_agent "$pane" || _die "send: pane $pane of '$target' is not running a coding agent — refusing to send"
+		_send_to_pane "$pane" "$full" || _die "send: delivery failed"
+	fi
+
+	[[ -z $manager ]] && manager="$from"
 	[[ -n $manager ]] && apex_event "$manager" "$(jq -nc \
 		--arg s "$target" --arg from "$from" --arg text "$text" \
 		'{event:"send", session:$s, from:$from, text:$text}')"
 
-	print "Delivered to $target ($pane)."
+	if $delivered; then
+		print "Delivered to $target (native: $agent)."
+	else
+		print "Delivered to $target ($pane)."
+	fi
 }
 
 # ─── event reporting (called from agent-tmux-status.sh hooks) ────────
