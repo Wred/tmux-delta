@@ -6,11 +6,15 @@
 # instructs "worker"/"monitor" agent sessions created through the normal
 # tmux-delta picker machinery (worktree + session + dev layout).
 #
-# Transport is tmux itself: per-session @-options carry role metadata,
-# send-keys carries messages, and a JSON state tree under
-# $XDG_CACHE_HOME/tmux-delta/apex survives agent context compaction.
+# Transport: per-session @-options carry role metadata, and a JSON state
+# tree under $XDG_CACHE_HOME/tmux-delta/apex survives agent context
+# compaction. send-keys carries worker-directed messages (`send`), but
+# status pings to the manager are pull-based, not pushed: the manager's own
+# Claude Code hooks (scripts/apex-manager-notify.sh) call `pending` on its
+# behalf on every turn and on resume, so nothing ever writes into the
+# manager's own pane — see `pending` below for why that matters.
 #
-# Subcommands: init stop spawn send event status reap
+# Subcommands: init stop relink spawn send event status pending reap
 
 SELF="${0:A}"
 SCRIPTS="${SELF:h}"
@@ -59,6 +63,11 @@ _send_to_pane() {
 	text=${text//$'\r'/ }
 	[[ -z $text ]] && return 1
 	tmux send-keys -t "$pane" -l -- "$text" || return 1
+	# tmux wraps a literal send in bracketed-paste; firing Enter in the same
+	# instant lands mid-paste and gets dropped by some agent TUIs (observed
+	# with codex — the message sits unsubmitted until a later, separate
+	# Enter arrives). Give the pane a tick to finish processing the paste.
+	sleep 0.2
 	tmux send-keys -t "$pane" Enter
 }
 
@@ -199,6 +208,69 @@ _cmd_stop() {
 	print "Apex mode off. Member sessions keep running; state kept at $(apex_dir "$session")"
 }
 
+# ─── relink (session-restart recovery) ───────────────────────────────
+
+# relink — re-derive @apex_role/@apex_session/@apex_task/@apex_repo for the
+# CURRENT session from durable state.
+#
+# @-options are tmux session options: they never survive a killed-and-
+# recreated session (a crash, `claude --continue` picking the session back
+# up, the picker reusing a session name). Durable state under $APEX_ROOT
+# does survive, but nothing used to re-attach the two — a resumed manager
+# lost its pink robot pill and its ability to resolve itself via
+# `_require_manager`, and a resumed worker stopped reporting status at all
+# (agent-tmux-status.sh gates on @apex_session being set). Same fragility
+# class as the manager-ping bug above, one layer down.
+#
+# Called unconditionally, for every session, at the top of
+# scripts/apex-manager-notify.sh (itself wired to every session's own
+# UserPromptSubmit/SessionStart hooks) — ahead of that script's `pending`
+# call, since determining whether this session is even a manager is the
+# whole point. No-op for a session that already has a role, or that matches
+# no durable state at all.
+_cmd_relink() {
+	local session
+	session=$(_cur_session) || return 0
+	[[ -n $(_sopt "$session" @apex_role) ]] && return 0   # already linked
+
+	# Manager? Only if the most recent manager-init/manager-stop event for
+	# this session's own state directory is an init — otherwise the human
+	# deliberately ran `stop` on it, and resuming the session (e.g.
+	# `--continue`) must not silently undo that. Also cross-check the repo
+	# a reused session name could otherwise resurrect the wrong manager.
+	if [[ -d "$(apex_dir "$session")" ]]; then
+		local repo last
+		repo=$(jq -r '.repo // empty' "$(apex_file "$session")" 2>/dev/null)
+		last=$(jq -rs '[.[] | select(.event=="manager-init" or .event=="manager-stop")] | last | .event // empty' \
+			"$(apex_events_file "$session")" 2>/dev/null)
+		if [[ $last == manager-init && ( -z $repo || $repo == "$(_main_tree "$PWD")" ) ]]; then
+			tmux set-option -t "$session" @apex_role manager
+			[[ -n $repo ]] && tmux set-option -t "$session" @apex_repo "$repo"
+			tmux refresh-client -S 2>/dev/null
+			return 0
+		fi
+	fi
+
+	# Worker (or reviewer)? At most one manager's member directory can have a
+	# record for this exact session name, since tmux session names are unique.
+	# Cross-check the worktree for the same reason as above.
+	local f manager role issue review_pr wt task
+	for f in "$APEX_ROOT"/*/members/"${session}".json(N); do
+		wt=$(jq -r '.worktree // empty' "$f" 2>/dev/null)
+		[[ -n $wt && $wt != "$PWD" ]] && continue
+		manager="${f:h:h:t}"
+		role=$(jq -r '.role // "worker"' "$f" 2>/dev/null)
+		issue=$(jq -r '.issue // empty' "$f" 2>/dev/null)
+		review_pr=$(jq -r '.review_pr // empty' "$f" 2>/dev/null)
+		task="${issue:+issue:$issue}${review_pr:+pr:$review_pr}"
+		tmux set-option -t "$session" @apex_session "$manager"
+		tmux set-option -t "$session" @apex_role "$role"
+		[[ -n $task ]] && tmux set-option -t "$session" @apex_task "$task"
+		tmux refresh-client -S 2>/dev/null
+		return 0
+	done
+}
+
 # ─── spawn ───────────────────────────────────────────────────────────
 
 _cmd_spawn() {
@@ -315,34 +387,26 @@ _cmd_send() {
 
 # ─── event reporting (called from agent-tmux-status.sh hooks) ────────
 
-# _ping_manager <manager> <session> <status>
-_ping_manager() {
+# _record_status <manager> <session> <status>
+#
+# Durable log entry only — this never touches the manager's pane. Delivery
+# into the manager's own context is pull-based: see `pending` below and
+# scripts/apex-manager-notify.sh, wired to the manager's own
+# UserPromptSubmit/SessionStart hooks. That split is the fix for the
+# manager-pane collision bug (issue #5) — a keystroke injected here could
+# splice into a human's in-flight input (or ghost autosuggestion text) with
+# no way to tell the two apart from outside the pane, so nothing here ever
+# writes to one.
+_record_status() {
 	local manager="$1" session="$2" st="$3"
-	APEX_SESSION="$manager"
-
-	local pane
-	pane=$(_agent_pane "$manager")
-	if ! _pane_is_agent "$pane"; then
-		apex_event "$manager" "$(jq -nc --arg s "$session" --arg p "${pane:-}" \
-			'{event:"ping-skipped", session:$s, pane:$p, reason:"manager pane is not an agent"}')"
-		return 1
-	fi
-
-	local role task facts summary line
+	local role task facts summary
 	role=$(_sopt "$session" @apex_role); [[ -z $role ]] && role=worker
 	task=$(_sopt "$session" @apex_task)
 	facts=$(_member_facts "$session")
 	summary=$(_facts_line "$facts")
 
-	line="[apex] session=${session} role=${role} ${task:+task=${task} }status=${st} — ${summary}. Full state: ${SELF} status --json"
-
-	if _send_to_pane "$pane" "$line"; then
-		apex_event "$manager" "$(jq -nc --arg s "$session" --arg st "$st" --arg l "$line" \
-			'{event:"ping", session:$s, status:$st, message:$l}')"
-	else
-		apex_event "$manager" "$(jq -nc --arg s "$session" \
-			'{event:"ping-failed", session:$s}')"
-	fi
+	apex_event "$manager" "$(jq -nc --arg s "$session" --arg st "$st" --arg sum "$summary" \
+		'{event:"status", session:$s, status:$st, summary:$sum}')"
 }
 
 # event <set|notify|clear> — invoked in the member session's own context.
@@ -370,11 +434,13 @@ _cmd_event() {
 
 	case "$verb" in
 		notify)
-			# Blocked and waiting on input — tell the manager straight away.
-			_ping_manager "$manager" "$session" attention
+			# Blocked and waiting on input — record it now. The manager isn't
+			# pushed this; it picks it up via `pending` on its next turn or on
+			# resume (see scripts/apex-manager-notify.sh).
+			_record_status "$manager" "$session" attention
 			;;
 		clear)
-			# Stop fires at the end of EVERY assistant turn. Only ping once the
+			# Stop fires at the end of EVERY assistant turn. Only record once the
 			# session has actually settled: re-check the sequence number after a
 			# quiet window. run-shell -d defers inside the tmux server, so this
 			# outlives the short-lived hook process without a sleeping watcher.
@@ -385,13 +451,19 @@ _cmd_event() {
 }
 
 # _settle <session> <manager> <seq> — internal, fired by run-shell -d.
+#
+# settled_seq dedupes this specific durable write (avoids one events.jsonl
+# entry per settle callback if several were scheduled back to back). It is
+# deliberately a separate field from pinged_seq: pinged_seq now tracks what
+# the manager has actually pulled via `pending`, not what this function has
+# attempted to record.
 _cmd_settle() {
 	local session="$1" manager="$2" seq="$3"
 	APEX_SESSION="$manager"
 	[[ $(apex_member_get "$manager" "$session" seq) == "$seq" ]] || return 0
-	[[ $(apex_member_get "$manager" "$session" pinged_seq) == "$seq" ]] && return 0
-	apex_member_merge "$manager" "$session" "$(jq -nc --argjson seq "$seq" '{pinged_seq:$seq}')"
-	_ping_manager "$manager" "$session" idle
+	[[ $(apex_member_get "$manager" "$session" settled_seq) == "$seq" ]] && return 0
+	apex_member_merge "$manager" "$session" "$(jq -nc --argjson seq "$seq" '{settled_seq:$seq}')"
+	_record_status "$manager" "$session" idle
 }
 
 # ─── status ──────────────────────────────────────────────────────────
@@ -459,6 +531,52 @@ _cmd_status() {
 		| jq -r '"  " + (.at|todate) + "  " + .event + "  " + (.session // "")' 2>/dev/null
 }
 
+# ─── pending ─────────────────────────────────────────────────────────
+
+# pending [--mark-delivered] — one summary line per member whose current
+# idle/attention status hasn't been delivered to the manager yet.
+#
+# This is the entire delivery mechanism for manager pings (see `_record_status`
+# above): scripts/apex-manager-notify.sh calls this from the manager's own
+# UserPromptSubmit/SessionStart hooks and hands the output to Claude as
+# context, so a human can run it by hand for the same view the manager gets.
+# Read-only unless --mark-delivered is passed, in which case each reported
+# member's pinged_seq is advanced to its current seq so it isn't reported
+# again next time.
+#
+# Only idle/attention are ever reported — a member mid-turn ("working" or
+# "starting") has nothing actionable to say yet, and reporting on every seq
+# bump would spam every intermediate transition instead of just the state
+# that matters when the manager actually looks.
+_cmd_pending() {
+	local mark=false a
+	for a in "$@"; do [[ $a == --mark-delivered ]] && mark=true; done
+
+	local manager
+	manager=$(_require_manager)
+	APEX_SESSION="$manager"
+
+	local s st seq pinged role task facts summary
+	for s in ${(f)"$(apex_members "$manager")"}; do
+		[[ -z $s ]] && continue
+		st=$(apex_member_get "$manager" "$s" status)
+		[[ $st == idle || $st == attention ]] || continue
+
+		seq=$(apex_member_get "$manager" "$s" seq); [[ -z $seq ]] && seq=0
+		pinged=$(apex_member_get "$manager" "$s" pinged_seq); [[ -z $pinged ]] && pinged=-1
+		(( seq == pinged )) && continue
+
+		role=$(_sopt "$s" @apex_role); [[ -z $role ]] && role=worker
+		task=$(_sopt "$s" @apex_task)
+		facts=$(_member_facts "$s")
+		summary=$(_facts_line "$facts")
+
+		print "[apex] session=${s} role=${role} ${task:+task=${task} }status=${st} — ${summary}. Full state: ${SELF} status --json"
+
+		$mark && apex_member_merge "$manager" "$s" "$(jq -nc --argjson seq "$seq" '{pinged_seq:$seq}')"
+	done
+}
+
 # ─── reap ────────────────────────────────────────────────────────────
 
 _cmd_reap() {
@@ -511,10 +629,12 @@ _cmd_reap() {
 case "${1:-}" in
 	init)     shift; _cmd_init "$@" ;;
 	stop)     shift; _cmd_stop "$@" ;;
+	relink)   shift; _cmd_relink "$@" ;;
 	spawn)    shift; _cmd_spawn "$@" ;;
 	send)     shift; _cmd_send "$@" ;;
 	event)    shift; _cmd_event "$@" ;;
 	status)   shift; _cmd_status "$@" ;;
+	pending)  shift; _cmd_pending "$@" ;;
 	reap)     shift; _cmd_reap "$@" ;;
 	_settle)  shift; _cmd_settle "$@" ;;
 	*)
@@ -522,6 +642,7 @@ case "${1:-}" in
 		print ""
 		print "  init [--force]                 mark this session as the apex manager"
 		print "  stop                           leave manager mode (members keep running)"
+		print "  relink                         re-derive role/linkage after a session restart"
 		print "  spawn --issue N [opts]         spawn a worker on a GitHub issue"
 		print "  spawn --review-pr N [opts]     spawn a reviewer on a pull request"
 		print "      opts: --role worker|monitor --agent claude|pi|codex|opencode"
@@ -529,6 +650,7 @@ case "${1:-}" in
 		print "            --agent-flags ARGV --mode autonomous|interactive --switch"
 		print "  send <session> <text>          message a session's coding agent"
 		print "  status [--json]                state of every member"
+		print "  pending [--mark-delivered]     members not yet delivered to the manager"
 		print "  reap [--yes]                   clean up finished/dead members"
 		[[ -n ${1:-} ]] && exit 1
 		;;
