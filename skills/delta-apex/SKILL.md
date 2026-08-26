@@ -55,16 +55,40 @@ spawn fewer workers and sequence them.
 
 ## Spawning
 
+Start from a named profile — `tmux-apex.sh profiles` lists what's defined
+(repo defaults, plus whatever the human has added or overridden locally).
+Profiles are edited outside this skill, so don't assume the tier names below
+still exist or mean what they used to; check before guessing.
+
 ```bash
-tmux-apex.sh spawn --issue 42 --model sonnet --agent-flags acceptEdits
-tmux-apex.sh spawn --issue 43 --model opus --agent-flags bypassPermissions
+tmux-apex.sh profiles
+
+tmux-apex.sh spawn --issue 42 --profile standard
+tmux-apex.sh spawn --issue 43 --profile hard
+tmux-apex.sh spawn --issue 44 --profile hard --agent-flags bypassPermissions
+tmux-apex.sh spawn --review-pr 17 --role monitor --profile hard
+```
+
+Choose a tier per task and say out loud why you chose it — trivial/easy for
+mechanical, well-specified work; standard (sonnet) for most everyday issue
+work; hard (opus) for design work, tricky refactors, and reviews; extreme
+(fable) for the hardest problems, where the strongest available model earns
+its cost. Reach for a different harness (`--agent codex`/`pi`/`opencode`)
+only when you specifically want a second opinion alongside claude, not as
+part of the default escalation. Override individual fields when the task's
+specifics warrant it — any explicit `--agent`,
+`--model`, or `--agent-flags` you pass alongside `--profile` wins over that
+profile's value for just that field, as in the `--profile hard
+--agent-flags bypassPermissions` example above. Still narrate the tier plus
+whatever you overrode and why.
+
+When no profile fits, fall back to the raw flags directly:
+
+```bash
 tmux-apex.sh spawn --issue 44 --agent pi --model sonnet:high --agent-flags '--approve'
 tmux-apex.sh spawn --issue 45 --agent opencode --model anthropic/claude-sonnet-4-6 --agent-flags '--auto'
 tmux-apex.sh spawn --issue 46 --agent codex --agent-flags '--sandbox workspace-write --ask-for-approval on-request'
-tmux-apex.sh spawn --review-pr 17 --role monitor --model opus
 ```
-
-Choose per task, and say out loud why you chose it:
 
 - `--model` — `sonnet` for mechanical, well-specified work; `opus` for design
   work, tricky refactors, and reviews.
@@ -76,8 +100,8 @@ Choose per task, and say out loud why you chose it:
 - `--role monitor` for agents that review or verify rather than implement.
 - `--agent` — which coding agent to run: `claude` (default), `pi`, `codex`, or
   `opencode`.
-  Only pass it when the human has said to; otherwise inherit the default.
-  A team can be mixed.
+  Only pass it when the human has said to, or a profile already names it;
+  otherwise inherit the default. A team can be mixed.
 
 If you do pass `--agent`, `--agent-flags` becomes that agent's own argv, not a
 claude permission mode — `--approve` or `--tools read,bash,edit` for pi,

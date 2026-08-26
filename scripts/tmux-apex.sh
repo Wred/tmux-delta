@@ -14,12 +14,13 @@
 # behalf on every turn and on resume, so nothing ever writes into the
 # manager's own pane — see `pending` below for why that matters.
 #
-# Subcommands: init stop relink spawn send event status pending reap
+# Subcommands: init stop relink spawn send event status pending reap profiles
 
 SELF="${0:A}"
 SCRIPTS="${SELF:h}"
 
 source "${SCRIPTS}/lib/apex-state.sh"
+source "${SCRIPTS}/lib/apex-profiles.sh"
 source "${SCRIPTS}/lib/pr-cache.sh"
 
 APEX_QUIET_SECS=${APEX_QUIET_SECS:-30}
@@ -275,7 +276,7 @@ _cmd_relink() {
 
 _cmd_spawn() {
 	local issue="" review_pr="" role="worker" model="" perm="" mode="autonomous"
-	local switch="no-switch" agent=""
+	local switch="no-switch" agent="" profile=""
 
 	while (( $# )); do
 		case "$1" in
@@ -284,6 +285,7 @@ _cmd_spawn() {
 			--role)             role="$2"; shift 2 ;;
 			--agent)            agent="$2"; shift 2 ;;
 			--model)            model="$2"; shift 2 ;;
+			--profile)          profile="$2"; shift 2 ;;
 			# --agent-flags is the accurate name: only claude calls this a
 			# "permission mode". Both spellings feed the same slot.
 			--permission-mode|--agent-flags) perm="$2"; shift 2 ;;
@@ -295,6 +297,25 @@ _cmd_spawn() {
 
 	[[ -n $issue || -n $review_pr ]] || _die "spawn: need --issue N or --review-pr N"
 	[[ -n $issue && -n $review_pr ]] && _die "spawn: --issue and --review-pr are mutually exclusive"
+
+	# A named profile fills in whichever of agent/model/agent-flags the caller
+	# didn't already set explicitly — explicit flags always win field-by-field.
+	# Must run before the bare-token-vs-non-claude-agent guard below, since a
+	# profile can supply the very agent/perm values that guard inspects.
+	if [[ -n $profile ]]; then
+		local pjson rc
+		pjson=$(apex_profile_resolve "$profile"); rc=$?
+		case $rc in
+			0) ;;
+			1) _die "spawn: profile file missing: $(apex_profiles_repo_file)" ;;
+			2) _die "spawn: malformed JSON in $(apex_profiles_repo_file)" ;;
+			3) _die "spawn: malformed JSON in $(apex_profiles_user_file)" ;;
+			*) _die "spawn: unknown profile '$profile' (see 'tmux-apex.sh profiles')" ;;
+		esac
+		[[ -z $agent ]] && agent=$(jq -r '.agent // empty' <<< "$pjson")
+		[[ -z $model ]] && model=$(jq -r '.model // empty' <<< "$pjson")
+		[[ -z $perm  ]] && perm=$(jq -r '.agent_flags // empty' <<< "$pjson")
+	fi
 
 	# Only the claude adapter accepts a bare token here (it prepends
 	# --permission-mode). Every other agent gets the value as verbatim argv, so a
@@ -342,10 +363,10 @@ _cmd_spawn() {
 	apex_member_merge "$manager" "$session" "$(jq -nc \
 		--arg role "$role" --arg wt "$worktree" --arg model "$model" \
 		--arg perm "$perm" --arg mode "$mode" --arg agent "${agent:-claude}" \
-		--arg issue "$issue" --arg pr "$review_pr" \
+		--arg profile "$profile" --arg issue "$issue" --arg pr "$review_pr" \
 		--argjson t "$(date +%s)" \
 		'{role:$role, worktree:$wt, model:$model, permission_mode:$perm,
-		  mode:$mode, agent:$agent, issue:$issue, review_pr:$pr,
+		  mode:$mode, agent:$agent, profile:$profile, issue:$issue, review_pr:$pr,
 		  status:"starting", seq:0, pinged_seq:-1,
 		  spawned_at:$t, updated_at:$t}')"
 
@@ -356,6 +377,7 @@ _cmd_spawn() {
 	print "Spawned ${role}: $session"
 	print "  worktree : $worktree"
 	print "  task     : ${issue:+issue #$issue}${review_pr:+PR #$review_pr}"
+	print "  profile  : ${profile:-<none>}"
 	print "  model    : ${model:-<default>}   permission-mode: ${perm:-<default>}"
 }
 
@@ -722,6 +744,19 @@ _cmd_reap() {
 	done
 }
 
+_cmd_profiles() {
+	local rows rc
+	rows=$(apex_profiles_list); rc=$?
+	case $rc in
+		0) ;;
+		1) _die "profiles: missing $(apex_profiles_repo_file)" ;;
+		2) _die "profiles: malformed JSON in $(apex_profiles_repo_file)" ;;
+		3) _die "profiles: malformed JSON in $(apex_profiles_user_file)" ;;
+	esac
+	[[ -z $rows ]] && { print "No profiles defined."; return; }
+	print -r -- "$rows" | awk -F'\t' '{printf "  %-10s agent=%-9s model=%-16s flags=%-20s %s\n", $1, $2, $3, $4, $5}'
+}
+
 # ─── dispatch ────────────────────────────────────────────────────────
 
 case "${1:-}" in
@@ -734,6 +769,7 @@ case "${1:-}" in
 	status)   shift; _cmd_status "$@" ;;
 	pending)  shift; _cmd_pending "$@" ;;
 	reap)     shift; _cmd_reap "$@" ;;
+	profiles) shift; _cmd_profiles "$@" ;;
 	_settle)  shift; _cmd_settle "$@" ;;
 	*)
 		print "tmux-apex.sh — apex mode for tmux-delta"
@@ -743,13 +779,15 @@ case "${1:-}" in
 		print "  relink                         re-derive role/linkage after a session restart"
 		print "  spawn --issue N [opts]         spawn a worker on a GitHub issue"
 		print "  spawn --review-pr N [opts]     spawn a reviewer on a pull request"
-		print "      opts: --role worker|monitor --agent claude|pi|codex|opencode"
+		print "      opts: --profile NAME       named {agent,model,agent-flags} preset (see 'profiles')"
+		print "            --role worker|monitor --agent claude|pi|codex|opencode"
 		print "            --model M"
 		print "            --agent-flags ARGV --mode autonomous|interactive --switch"
 		print "  send <session> <text>          message a session's coding agent"
 		print "  status [--json]                state of every member"
 		print "  pending [--mark-delivered]     members not yet delivered to the manager"
 		print "  reap [--yes]                   clean up finished/dead members"
+		print "  profiles                       list available spawn profiles"
 		[[ -n ${1:-} ]] && exit 1
 		;;
 esac

@@ -1,0 +1,32 @@
+{
+  "trivial": {
+    "agent": "claude",
+    "model": "haiku",
+    "agent_flags": "bypassPermissions",
+    "description": "Cheapest/fastest model, fully autonomous. Typos, lint fixes, single-file mechanical changes."
+  },
+  "easy": {
+    "agent": "claude",
+    "model": "sonnet",
+    "agent_flags": "bypassPermissions",
+    "description": "Small, well-specified bugfixes or features. Fully autonomous."
+  },
+  "standard": {
+    "agent": "claude",
+    "model": "sonnet",
+    "agent_flags": "acceptEdits",
+    "description": "Default tier for most issue work. Edits apply automatically; shell commands still pause for approval."
+  },
+  "hard": {
+    "agent": "claude",
+    "model": "opus",
+    "agent_flags": "acceptEdits",
+    "description": "Tricky refactors, ambiguous specs, anything touching shared/critical code."
+  },
+  "extreme": {
+    "agent": "claude",
+    "model": "fable",
+    "agent_flags": "acceptEdits",
+    "description": "Hardest problems, strongest available model. For a second harness's judgment alongside claude, override with e.g. --agent codex or --agent pi — verify their exact model ids yourself, this repo doesn't validate them."
+  }
+}

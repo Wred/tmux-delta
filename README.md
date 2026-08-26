@@ -271,10 +271,11 @@ drive it yourself:
 
 ```zsh
 tmux-apex.sh init                    # this session is now the manager
-tmux-apex.sh spawn --issue 42 --model sonnet --agent-flags acceptEdits
-tmux-apex.sh spawn --issue 43 --agent pi --model sonnet:high --agent-flags '--approve'
+tmux-apex.sh profiles                # list available {agent,model,agent-flags} presets
+tmux-apex.sh spawn --issue 42 --profile standard
+tmux-apex.sh spawn --issue 43 --profile hard
 tmux-apex.sh spawn --issue 44 --agent opencode --model anthropic/claude-sonnet-4-6 --agent-flags '--auto'
-tmux-apex.sh spawn --review-pr 17 --model opus
+tmux-apex.sh spawn --review-pr 17 --profile hard --role monitor
 tmux-apex.sh send <session> "rebase on main, CI is red"
 tmux-apex.sh status                  # or --json
 tmux-apex.sh reap --yes              # remove finished/dead members
@@ -322,6 +323,46 @@ to poll it rather than being woken.
 
 Manager designation is a tmux *session* option, so it does not survive a tmux
 server restart. The on-disk state does; re-run `init` to re-adopt it.
+
+### Spawn profiles
+
+`--profile NAME` is shorthand for a named `{agent, model, agent_flags}`
+bundle, so the manager doesn't have to reassemble raw flags for every spawn.
+Definitions are layered from two JSON files, merged shallowly by profile name
+(a user profile fully replaces the repo one of the same name — no
+field-by-field splicing between files):
+
+| File | Role |
+|------|------|
+| `scripts/lib/apex-profiles.json` | repo defaults, checked in |
+| `${XDG_CONFIG_HOME:-~/.config}/tmux-delta/apex-profiles.json` | optional user overrides/additions |
+
+Each entry:
+
+```json
+"hard": {
+  "agent": "claude",
+  "model": "opus",
+  "agent_flags": "acceptEdits",
+  "description": "Tricky refactors, ambiguous specs, anything touching shared/critical code."
+}
+```
+
+Default tiers ship as `trivial` (haiku) → `easy`/`standard` (sonnet) →
+`hard` (opus) → `extreme` (fable), Anthropic's model tiers cheapest/fastest
+to most capable/expensive, all on the claude agent. Run `tmux-apex.sh
+profiles` to see the current merged set, since these are meant to be edited
+freely and the shipped names/models are starting points, not fixed policy —
+in particular, model aliases and pricing drift over time and across
+providers, so re-verify them periodically rather than trusting this table
+indefinitely.
+
+`--profile` only fills the `--agent`/`--model`/`--agent-flags` fields the
+`spawn` call didn't already set explicitly — pass any of those three
+alongside `--profile` to override just that field for one spawn, e.g.
+`spawn --issue 42 --profile hard --agent-flags bypassPermissions`. Omitting
+`--profile` entirely is unchanged from before this feature existed — raw
+`--agent`/`--model`/`--agent-flags` still work with no profile involved.
 
 ### Per-spawn agent configuration
 
