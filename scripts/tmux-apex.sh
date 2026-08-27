@@ -908,11 +908,32 @@ _cmd_profiles() {
 # last two are what make an unattended manager notice anything.
 _apex_hook_events() { print -r -- "UserPromptSubmit SessionStart PostToolBatch Stop"; }
 
-# _apex_hook_wired <event> — is apex-manager-notify.sh wired to <event> in any
-# settings file Claude Code reads? Deliberately loose about the command string
-# (path spelling varies: ~, $HOME, the ~/.tmux symlink, a worktree checkout).
+# Event → the argument apex-manager-notify.sh must be invoked with there.
+typeset -gA APEX_HOOK_VERB=(
+	UserPromptSubmit prompt
+	SessionStart     session-start
+	PostToolBatch    post-tools
+	Stop             stop
+)
+
+# _apex_hook_wired <event> — is apex-manager-notify.sh wired to <event>, *with
+# the right argument*, in any settings file Claude Code reads?
+#
+# The argument is part of what makes the wiring correct, not a detail: the
+# script picks its output channel from it, and the channels aren't
+# interchangeable (plain stdout only reaches the agent on UserPromptSubmit and
+# SessionStart). A command wired without its verb, or with another event's
+# verb, therefore delivers nothing on two of the four events — so this check
+# would be worse than useless if it certified that as healthy.
+#
+# Deliberately loose about the path (spelling varies: ~, $HOME, the ~/.tmux
+# symlink, a worktree checkout) and about what follows on the command line
+# (redirections, a wrapper's trailing arguments), but strict about the verb
+# appearing as its own whitespace-delimited word.
 _apex_hook_wired() {
 	local event="$1" f
+	local verb="${APEX_HOOK_VERB[$event]}"
+	[[ -n $verb ]] || return 1
 	for f in \
 		"$HOME/.claude/settings.json" \
 		"$HOME/.claude/settings.local.json" \
@@ -920,15 +941,36 @@ _apex_hook_wired() {
 		"${APEX_REPO:-$PWD}/.claude/settings.local.json"
 	do
 		[[ -f $f ]] || continue
-		jq -e --arg e "$event" '
+		jq -e --arg e "$event" --arg verb "$verb" '
 			(.hooks[$e] // [])
 			| map(.hooks // [])
 			| flatten
 			| map(.command // "")
-			| any(test("apex-manager-notify"))
+			| any(test("apex-manager-notify[^[:space:]]*[[:space:]]+" + $verb + "([[:space:]]|$)"))
 		' "$f" >/dev/null 2>&1 && return 0
 	done
 	return 1
+}
+
+# _apex_notify_path — the path to suggest in the fix hint.
+#
+# Not necessarily this script's own path: `doctor` often runs from a worktree
+# (that is how work on this repo happens), and hooks live in global config, so
+# a worktree path pasted into ~/.claude/settings.json outlives the worktree and
+# breaks silently once it is removed. Prefer a stable install location that
+# actually exists, and print it unexpanded so it stays stable.
+_apex_notify_path() {
+	local rel="scripts/apex-manager-notify.sh" p
+	for p in \
+		"$HOME/.tmux/plugins/tmux-delta" \
+		"${XDG_CONFIG_HOME:-$HOME/.config}/tmux/plugins/tmux-delta"
+	do
+		if [[ -e $p/$rel ]]; then
+			print -r -- "${p/#$HOME/~}/$rel"
+			return
+		fi
+	done
+	print -r -- "${SCRIPTS}/apex-manager-notify.sh"
 }
 
 # _cmd_doctor [--quiet] — report which delivery hooks are missing.
@@ -949,20 +991,16 @@ _cmd_doctor() {
 		return 0
 	fi
 
-	local notify="${SCRIPTS}/apex-manager-notify.sh"
+	local notify="$(_apex_notify_path)"
 	print -u2 "tmux-apex: WARNING — apex pings will not reach this agent's context."
 	print -u2 "  missing Claude Code hooks: ${(j:, :)missing}"
 	(( ${#present} )) && print -u2 "  wired already            : ${(j:, :)present}"
+	print -u2 "  (an entry wired without its argument counts as missing — the argument"
+	print -u2 "   is what selects the output channel, and the channels differ by event)"
 	print -u2 "  fix: add to ~/.claude/settings.json (see README, \"Apex mode\"):"
 	print -u2 ""
-	local -A verb=(
-		UserPromptSubmit prompt
-		SessionStart     session-start
-		PostToolBatch    post-tools
-		Stop             stop
-	)
 	for e in "${missing[@]}"; do
-		print -u2 "    \"$e\": [{ \"matcher\": \"\", \"hooks\": [{ \"type\": \"command\", \"command\": \"$notify ${verb[$e]}\" }] }]"
+		print -u2 "    \"$e\": [{ \"matcher\": \"\", \"hooks\": [{ \"type\": \"command\", \"command\": \"$notify ${APEX_HOOK_VERB[$e]}\" }] }]"
 	done
 	print -u2 ""
 	print -u2 "  until then, run '${SELF} pending' by hand — it reports the same events."

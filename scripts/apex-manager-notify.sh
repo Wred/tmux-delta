@@ -2,8 +2,8 @@
 # Pull-based delivery of apex pings into the manager's own context.
 #
 # Wired from ~/.claude/settings.json hooks. The script takes the delivery
-# point as its one argument, because each hook event needs a different
-# output channel (see below) and a different amount of setup work:
+# point as its one required argument, because each hook event needs a
+# different output channel (see below) and a different amount of setup work:
 #
 #   prompt        UserPromptSubmit — before every human message
 #   session-start SessionStart      — startup/resume, so a killed-and-reopened
@@ -13,9 +13,6 @@
 #   post-tools    PostToolBatch     — once after each tool batch resolves,
 #                                     before the next model call
 #   stop          Stop              — at the end of an assistant turn
-#
-# Argument-less invocation means `prompt`, which is what the original
-# single-event wiring did.
 #
 # Why four events and not just the first two: UserPromptSubmit only fires on
 # a *human* message. A manager doing a long autonomous stretch — spawn, poll,
@@ -32,21 +29,30 @@
 # else plain stdout goes to the debug log only, and context has to be returned
 # as JSON `hookSpecificOutput.additionalContext`.
 #
+# The argument is required, with no default, precisely because the two
+# channels aren't interchangeable. An earlier revision defaulted to `prompt`
+# for compatibility with the original single-event wiring; that turned a
+# plausible copy-paste — the old argument-less command duplicated under
+# PostToolBatch or Stop — into silent, permanent ping loss, since the plain
+# text it printed on those events goes only to the debug log. Now an
+# unrecognized argument delivers nothing and consumes nothing: the events stay
+# pending, and `tmux-apex.sh doctor` names the wiring that needs fixing.
+#
 # No-op, and fast, for the overwhelming majority of invocations: every Claude
 # Code session on the machine fires these hooks, so this exits before doing
 # any work unless the current session is actually an apex manager.
 
-event="${1:-prompt}"
+event="${1:-}"
 
+# channel: text = Claude Code reads plain stdout as context on this event
+#          json = context has to come back as hookSpecificOutput JSON
+#          ""   = argument missing or unrecognized; no safe way to deliver
 case "$event" in
-	prompt)        hook_name=UserPromptSubmit ;;
-	session-start) hook_name=SessionStart ;;
-	post-tools)    hook_name=PostToolBatch ;;
-	stop)          hook_name=Stop ;;
-	*)
-		printf 'apex-manager-notify: unknown event %s\n' "$event" >&2
-		exit 0
-		;;
+	prompt)        hook_name=UserPromptSubmit; channel=text ;;
+	session-start) hook_name=SessionStart;     channel=text ;;
+	post-tools)    hook_name=PostToolBatch;    channel=json ;;
+	stop)          hook_name=Stop;             channel=json ;;
+	*)             hook_name=;                 channel= ;;
 esac
 
 [ -z "$TMUX" ] && exit 0
@@ -63,29 +69,55 @@ self_dir=$(dirname "$(readlink -f "$0")")
 # whether this session even is one is the point of calling it here, before
 # the role check below.
 #
-# Only on the two once-per-turn-at-most events: `post-tools` fires after
-# every tool batch, and by then the session-level options have already been
-# resolved by whichever event started the turn.
+# Only on the two events that can open a turn. `post-tools` and `stop` both
+# fire strictly inside a turn something else already opened, so the
+# session-level options they would look at have been resolved already — and
+# `post-tools` fires after every tool batch, where the cost would repeat.
 case "$event" in
 	prompt | session-start) "$self_dir/tmux-apex.sh" relink 2>/dev/null ;;
 esac
 
 [ "$(tmux show-option -t "$session" -qv @apex_role 2>/dev/null)" = manager ] || exit 0
 
+# From here on this session is a manager, so a misconfiguration is worth
+# saying out loud. Print to stdout as well as stderr: an exit-0 hook's stderr
+# reaches the debug log only, whereas stdout at least reaches the agent on the
+# two text-channel events — which are exactly the events where the argument-less
+# wiring this catches used to be correct.
+if [ -z "$channel" ]; then
+	msg="[apex] apex-manager-notify.sh was invoked as '${event:-<no argument>}', which is not a delivery point.
+[apex] Worker pings are NOT being delivered to this session. Run 'tmux-apex.sh doctor' for the wiring to fix."
+	printf '%s\n' "$msg"
+	printf '%s\n' "$msg" >&2
+	exit 0
+fi
+
+# Pre-flight the JSON channel's dependency *before* consuming anything.
+# `pending --mark-delivered` advances each reported member's pinged_seq in the
+# same pass that prints it, so anything that can fail after that call loses
+# events outright rather than delaying them — and this script runs with
+# whatever PATH Claude Code hands the hook, which need not have jq on it even
+# though tmux-apex.sh itself requires it. Checking here rather than reordering
+# to emit-then-mark is deliberate: a separate marking pass would have to
+# re-read state that a worker may have bumped in between, which loses the newer
+# event instead. Failing before the read leaves everything pending for the
+# next delivery point, a few seconds later.
+if [ "$channel" = json ] && ! command -v jq >/dev/null 2>&1; then
+	printf 'apex-manager-notify: jq not found on PATH; leaving pings pending\n' >&2
+	exit 0
+fi
+
 pending=$("$self_dir/tmux-apex.sh" pending --mark-delivered 2>/dev/null)
 [ -z "$pending" ] && exit 0
 
 text=$(printf '%s\n%s' "[apex] pending events since you last checked:" "$pending")
 
-case "$event" in
-	prompt | session-start)
-		printf '%s\n' "$text"
-		;;
-	*)
-		# `pending --mark-delivered` above already advanced pinged_seq, so this
-		# text is delivered exactly once no matter how many times the hook
-		# fires — which is what keeps a Stop-event injection from looping.
-		jq -nc --arg h "$hook_name" --arg c "$text" \
-			'{hookSpecificOutput: {hookEventName: $h, additionalContext: $c}}'
-		;;
-esac
+# Delivered exactly once either way: the `--mark-delivered` above advanced
+# pinged_seq past what it printed, which is also what keeps the Stop-event
+# injection from looping.
+if [ "$channel" = text ]; then
+	printf '%s\n' "$text"
+else
+	jq -nc --arg h "$hook_name" --arg c "$text" \
+		'{hookSpecificOutput: {hookEventName: $h, additionalContext: $c}}'
+fi

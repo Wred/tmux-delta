@@ -157,6 +157,14 @@ covers, and run `tmux-apex.sh doctor` to check the wiring:
 pill and idle record, `apex-manager-notify.sh stop` for pings from members it
 manages. A session can be both a manager and somebody's worker.
 
+The argument is required and must match the event: it picks the output channel,
+and the channels are not interchangeable (plain stdout only reaches the agent on
+`UserPromptSubmit` and `SessionStart`). Wired with the wrong argument, or none,
+the script delivers nothing — deliberately, rather than writing to a channel
+nobody reads — and `doctor` reports that event as missing. Use a path that will
+outlive the moment, too: hooks are global config, so a worktree path here breaks
+silently once the worktree is gone.
+
 **pi** — symlink the shipped extension, which wires `agent_start` → `set` and
 `agent_settled` → `clear`:
 
@@ -410,8 +418,8 @@ The script exits immediately in any session that isn't an apex manager, so it is
 safe to install globally — which it must be, since the manager can be any
 session.
 
-`tmux-apex.sh doctor` reports which of the four are wired; `init` runs the same
-check and warns if any are missing. A manager with no wiring looks perfectly
+`tmux-apex.sh doctor` reports which of the four are wired, argument included;
+`init` runs the same check and warns if any are missing. A manager with no wiring looks perfectly
 healthy from the inside — `pending` keeps answering correctly for anyone who
 asks by hand — so the check is the only thing that makes the failure visible.
 Records on disk are the source of truth either way: `tmux-apex.sh status --json`
@@ -485,6 +493,19 @@ them when launching the agent:
 | `@apex_session` | members | manager's session name |
 | `@apex_task` | members | `issue:42` or `pr:17` |
 | `@agent_pane` | any dev-layout session | pane id of the coding-agent split |
+
+## Tests
+
+```bash
+tests/apex-delivery.test.sh
+```
+
+Covers apex ping delivery: which output channel `apex-manager-notify.sh` picks
+per event, that an invocation which cannot deliver also does not *consume*
+(pings stay pending), and `doctor`'s wiring detection against fixture settings
+files — correctly wired, unwired, wired without the argument, wired with another
+event's argument, and malformed JSON. `tmux` and `tmux-apex.sh` are stubbed, so
+it needs neither a live agent nor a tmux server.
 
 ## Shell functions (gwt.zsh)
 
