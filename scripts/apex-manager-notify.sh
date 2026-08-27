@@ -1,25 +1,53 @@
 #!/usr/bin/env bash
 # Pull-based delivery of apex pings into the manager's own context.
 #
-# Wired from ~/.claude/settings.json hooks:
-#   UserPromptSubmit -> runs before every human message reaches the manager
-#   SessionStart      -> runs on startup/resume, so a killed-and-reopened
-#                         manager (e.g. `claude --continue` in the same
-#                         directory) catches up on what it missed
+# Wired from ~/.claude/settings.json hooks. The script takes the delivery
+# point as its one argument, because each hook event needs a different
+# output channel (see below) and a different amount of setup work:
 #
-# For both events, Claude Code adds this script's stdout to Claude's context
-# as plain text when it exits 0 — it never touches the visible prompt or the
-# pane's input line. That's the point: the old mechanism (`_ping_manager` in
-# tmux-apex.sh) wrote status lines directly into the manager's own tmux pane
-# via send-keys, which could splice into a human's in-flight input (or, as
-# observed, ghost text from a shell/TUI autosuggestion that was never human
-# input at all). A pane has no reliable way to tell those apart from the
-# outside, so the fix is to stop writing to it, not to guard the write more
-# carefully. See github issue #5.
+#   prompt        UserPromptSubmit — before every human message
+#   session-start SessionStart      — startup/resume, so a killed-and-reopened
+#                                     manager (e.g. `claude --continue` in the
+#                                     same directory) catches up on what it
+#                                     missed
+#   post-tools    PostToolBatch     — once after each tool batch resolves,
+#                                     before the next model call
+#   stop          Stop              — at the end of an assistant turn
 #
-# No-op, fast, for the overwhelming majority of invocations: every Claude
-# Code session on the machine fires UserPromptSubmit, so this exits before
-# doing any work unless the current session is actually an apex manager.
+# Argument-less invocation means `prompt`, which is what the original
+# single-event wiring did.
+#
+# Why four events and not just the first two: UserPromptSubmit only fires on
+# a *human* message. A manager doing a long autonomous stretch — spawn, poll,
+# report — takes many model turns without one, so a worker that settled during
+# that stretch stayed invisible until the human typed again. The manager then
+# answered from a status check it had made before the worker went idle. See
+# github issue #7. PostToolBatch closes the mid-turn gap (pings land before
+# the next model call), and Stop closes the end-of-turn gap: a ping that
+# arrives as the manager is wrapping up keeps the loop alive for one more turn
+# instead of waiting for the human.
+#
+# Channels differ by event: UserPromptSubmit and SessionStart are the only
+# events where Claude Code reads a hook's plain stdout as context. Everywhere
+# else plain stdout goes to the debug log only, and context has to be returned
+# as JSON `hookSpecificOutput.additionalContext`.
+#
+# No-op, and fast, for the overwhelming majority of invocations: every Claude
+# Code session on the machine fires these hooks, so this exits before doing
+# any work unless the current session is actually an apex manager.
+
+event="${1:-prompt}"
+
+case "$event" in
+	prompt)        hook_name=UserPromptSubmit ;;
+	session-start) hook_name=SessionStart ;;
+	post-tools)    hook_name=PostToolBatch ;;
+	stop)          hook_name=Stop ;;
+	*)
+		printf 'apex-manager-notify: unknown event %s\n' "$event" >&2
+		exit 0
+		;;
+esac
 
 [ -z "$TMUX" ] && exit 0
 session=$(tmux display-message -p '#S' 2>/dev/null) || exit 0
@@ -34,11 +62,30 @@ self_dir=$(dirname "$(readlink -f "$0")")
 # session (this hook fires globally), not just managers — determining
 # whether this session even is one is the point of calling it here, before
 # the role check below.
-"$self_dir/tmux-apex.sh" relink 2>/dev/null
+#
+# Only on the two once-per-turn-at-most events: `post-tools` fires after
+# every tool batch, and by then the session-level options have already been
+# resolved by whichever event started the turn.
+case "$event" in
+	prompt | session-start) "$self_dir/tmux-apex.sh" relink 2>/dev/null ;;
+esac
 
 [ "$(tmux show-option -t "$session" -qv @apex_role 2>/dev/null)" = manager ] || exit 0
 
 pending=$("$self_dir/tmux-apex.sh" pending --mark-delivered 2>/dev/null)
 [ -z "$pending" ] && exit 0
 
-printf '%s\n%s\n' "[apex] pending events since you last checked:" "$pending"
+text=$(printf '%s\n%s' "[apex] pending events since you last checked:" "$pending")
+
+case "$event" in
+	prompt | session-start)
+		printf '%s\n' "$text"
+		;;
+	*)
+		# `pending --mark-delivered` above already advanced pinged_seq, so this
+		# text is delivered exactly once no matter how many times the hook
+		# fires — which is what keeps a Stop-event injection from looping.
+		jq -nc --arg h "$hook_name" --arg c "$text" \
+			'{hookSpecificOutput: {hookEventName: $h, additionalContext: $c}}'
+		;;
+esac

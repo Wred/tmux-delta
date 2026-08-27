@@ -15,6 +15,7 @@
 # manager's own pane — see `pending` below for why that matters.
 #
 # Subcommands: init stop relink spawn send event status pending reap profiles
+#              doctor
 
 SELF="${0:A}"
 SCRIPTS="${SELF:h}"
@@ -260,6 +261,10 @@ _cmd_init() {
 	print "  repo    : $main"
 	print "  pane    : ${TMUX_PANE:-<unknown>}"
 	print "  state   : $(apex_dir "$session")"
+
+	# Loud on stderr if ping delivery isn't wired — a manager with no hooks
+	# installed is silently blind to every worker transition. See `doctor`.
+	APEX_REPO="$main" _cmd_doctor --quiet || true
 }
 
 _cmd_stop() {
@@ -881,10 +886,94 @@ _cmd_profiles() {
 	print -r -- "$rows" | awk -F'\t' '{printf "  %-10s agent=%-9s model=%-16s flags=%-20s %s\n", $1, $2, $3, $4, $5}'
 }
 
+# ─── doctor (ping-delivery self-check) ───────────────────────────────
+
+# The manager's pings are delivered by Claude Code hooks calling
+# scripts/apex-manager-notify.sh (see `pending`). Nothing inside tmux can
+# install those hooks, and a manager with none installed looks completely
+# healthy — `pending` keeps returning the right answer to anyone who asks by
+# hand, so the manager only ever finds out that nothing is being delivered
+# when the human tells it a worker has been done for a while. That was the
+# reported failure in github issue #7: no wiring at all in settings.json.
+#
+# So `init` checks, and says so. `doctor` runs the same check on demand.
+#
+# Which events matter, and why each one:
+#   UserPromptSubmit  before every human message
+#   SessionStart      on startup/resume, to catch up after a restart
+#   PostToolBatch     mid-turn, so a long autonomous stretch still sees pings
+#   Stop              end-of-turn, so a ping arriving as the manager wraps up
+#                     gets one more turn instead of waiting for the human
+# The first two are enough for a manager driven turn-by-turn by a human; the
+# last two are what make an unattended manager notice anything.
+_apex_hook_events() { print -r -- "UserPromptSubmit SessionStart PostToolBatch Stop"; }
+
+# _apex_hook_wired <event> — is apex-manager-notify.sh wired to <event> in any
+# settings file Claude Code reads? Deliberately loose about the command string
+# (path spelling varies: ~, $HOME, the ~/.tmux symlink, a worktree checkout).
+_apex_hook_wired() {
+	local event="$1" f
+	for f in \
+		"$HOME/.claude/settings.json" \
+		"$HOME/.claude/settings.local.json" \
+		"${APEX_REPO:-$PWD}/.claude/settings.json" \
+		"${APEX_REPO:-$PWD}/.claude/settings.local.json"
+	do
+		[[ -f $f ]] || continue
+		jq -e --arg e "$event" '
+			(.hooks[$e] // [])
+			| map(.hooks // [])
+			| flatten
+			| map(.command // "")
+			| any(test("apex-manager-notify"))
+		' "$f" >/dev/null 2>&1 && return 0
+	done
+	return 1
+}
+
+# _cmd_doctor [--quiet] — report which delivery hooks are missing.
+# Exits 0 when all four are wired, 1 otherwise. --quiet prints nothing when
+# everything is wired, which is how `init` uses it.
+_cmd_doctor() {
+	local quiet=false a
+	for a in "$@"; do [[ $a == --quiet ]] && quiet=true; done
+
+	local -a missing=() present=()
+	local e
+	for e in ${=$(_apex_hook_events)}; do
+		if _apex_hook_wired "$e"; then present+=("$e"); else missing+=("$e"); fi
+	done
+
+	if (( ${#missing} == 0 )); then
+		$quiet || print "Ping delivery: all hooks wired (${(j:, :)present})."
+		return 0
+	fi
+
+	local notify="${SCRIPTS}/apex-manager-notify.sh"
+	print -u2 "tmux-apex: WARNING — apex pings will not reach this agent's context."
+	print -u2 "  missing Claude Code hooks: ${(j:, :)missing}"
+	(( ${#present} )) && print -u2 "  wired already            : ${(j:, :)present}"
+	print -u2 "  fix: add to ~/.claude/settings.json (see README, \"Apex mode\"):"
+	print -u2 ""
+	local -A verb=(
+		UserPromptSubmit prompt
+		SessionStart     session-start
+		PostToolBatch    post-tools
+		Stop             stop
+	)
+	for e in "${missing[@]}"; do
+		print -u2 "    \"$e\": [{ \"matcher\": \"\", \"hooks\": [{ \"type\": \"command\", \"command\": \"$notify ${verb[$e]}\" }] }]"
+	done
+	print -u2 ""
+	print -u2 "  until then, run '${SELF} pending' by hand — it reports the same events."
+	return 1
+}
+
 # ─── dispatch ────────────────────────────────────────────────────────
 
 case "${1:-}" in
 	init)     shift; _cmd_init "$@" ;;
+	doctor)   shift; _cmd_doctor "$@" ;;
 	stop)     shift; _cmd_stop "$@" ;;
 	relink)   shift; _cmd_relink "$@" ;;
 	spawn)    shift; _cmd_spawn "$@" ;;
@@ -913,6 +1002,7 @@ case "${1:-}" in
 		print "  pending [--mark-delivered]     members not yet delivered to the manager"
 		print "  reap [--yes]                   clean up finished/dead members"
 		print "  profiles                       list available spawn profiles"
+		print "  doctor                         check that ping-delivery hooks are wired"
 		[[ -n ${1:-} ]] && exit 1
 		;;
 esac
