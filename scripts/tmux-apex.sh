@@ -33,16 +33,65 @@ _cur_session() {
 	tmux display-message -p '#S' 2>/dev/null
 }
 
-_sopt() { tmux show-option -t "$1" -qv "$2" 2>/dev/null; }
+# Member identity is "<session>:<pane_id>" (e.g. "myworktree:%57"); a manager
+# is identified by its bare session name. Tmux session names can't contain
+# "%", so "contains :%" reliably distinguishes the two shapes.
+_is_member() { [[ $1 == *:%* ]]; }
+_member_session() { print -r -- "${1%%:*}"; }
+_member_pane() { print -r -- "${1#*:}"; }
+
+# _sopt/_sset resolve to pane-scoped options for a member id, session-scoped
+# options for a bare session (manager) name.
+_sopt() {
+	if _is_member "$1"; then
+		tmux show-option -p -t "$(_member_pane "$1")" -qv "$2" 2>/dev/null
+	else
+		tmux show-option -t "$1" -qv "$2" 2>/dev/null
+	fi
+}
+
+_sset() {
+	local target="$1" key="$2" val="$3"
+	if _is_member "$target"; then
+		tmux set-option -p -t "$(_member_pane "$target")" "$key" "$val"
+	else
+		tmux set-option -t "$target" "$key" "$val"
+	fi
+}
 
 _session_alive() { tmux has-session -t="$1" 2>/dev/null; }
+
+# A member is alive as long as its pane still exists — the session it lives
+# in may host other members too, so session liveness alone isn't enough.
+_member_alive() {
+	if _is_member "$1"; then
+		tmux list-panes -a -F '#{pane_id}' 2>/dev/null | grep -qxF "$(_member_pane "$1")"
+	else
+		_session_alive "$1"
+	fi
+}
+
+# Does any pane in <session> already have a registered apex member on it?
+_session_has_apex_member() {
+	local p
+	for p in ${(f)"$(tmux list-panes -t "$1" -F '#{pane_id}' 2>/dev/null)"}; do
+		[[ -n $(tmux show-option -p -t "$p" -qv @apex_role 2>/dev/null) ]] && return 0
+	done
+	return 1
+}
 
 _main_tree() {
 	git -C "${1:-$PWD}" worktree list 2>/dev/null | awk 'NR==1{print $1}'
 }
 
-# The pane running the coding agent for a session (published by tmux-dev-layout.sh).
-_agent_pane() { _sopt "$1" @agent_pane; }
+# For a member id the pane IS the identity — no indirection needed.
+_agent_pane() {
+	if _is_member "$1"; then
+		_member_pane "$1"
+	else
+		_sopt "$1" @agent_pane
+	fi
+}
 
 # Only ever send keys into a pane that is actually running an interactive agent —
 # sending into a shell would execute the message as a command.
@@ -95,13 +144,28 @@ _require_manager() {
 	printf '%s' "$m"
 }
 
+# _cur_member — identity of whichever pane/session a hook or command is
+# currently running in: the bare session name for a manager or an untracked
+# pane, or "session:pane" for a pane registered as an apex member.
+_cur_member() {
+	local session pane
+	session=$(_cur_session) || return 1
+	[[ $(_sopt "$session" @apex_role) == manager ]] && { print -r -- "$session"; return 0; }
+	pane="$TMUX_PANE"
+	if [[ -n $pane ]] && [[ -n $(tmux show-option -p -t "$pane" -qv @apex_role 2>/dev/null) ]]; then
+		print -r -- "${session}:${pane}"
+		return 0
+	fi
+	print -r -- "$session"
+}
+
 # ─── facts about a member session ────────────────────────────────────
 
 # _member_facts <session> — emits a JSON object of live, derived state.
 _member_facts() {
 	local session="$1" wt branch pr_number pr_state pr_draft icons ahead dirty alive
 	alive=false
-	_session_alive "$session" && alive=true
+	_member_alive "$session" && alive=true
 
 	wt=$(apex_member_get "$APEX_SESSION" "$session" worktree 2>/dev/null)
 	[[ -z $wt || ! -d $wt ]] && wt=""
@@ -230,9 +294,12 @@ _cmd_stop() {
 # whole point. No-op for a session that already has a role, or that matches
 # no durable state at all.
 _cmd_relink() {
-	local session
+	local session pane
 	session=$(_cur_session) || return 0
-	[[ -n $(_sopt "$session" @apex_role) ]] && return 0   # already linked
+	pane="$TMUX_PANE"
+
+	[[ $(_sopt "$session" @apex_role) == manager ]] && return 0   # manager already linked
+	[[ -n $pane ]] && [[ -n $(tmux show-option -p -t "$pane" -qv @apex_role 2>/dev/null) ]] && return 0   # member already linked
 
 	# Manager? Only if the most recent manager-init/manager-stop event for
 	# this session's own state directory is an init — otherwise the human
@@ -252,24 +319,41 @@ _cmd_relink() {
 		fi
 	fi
 
-	# Worker (or reviewer)? At most one manager's member directory can have a
-	# record for this exact session name, since tmux session names are unique.
-	# Cross-check the worktree for the same reason as above.
-	local f manager role issue review_pr wt task
-	for f in "$APEX_ROOT"/*/members/"${session}".json(N); do
+	# Worker/reviewer/monitor? Relink runs inside the member's own pane
+	# (triggered by that pane's own hooks), so $TMUX_PANE is exactly the pane
+	# needing to be re-linked — but after a session is destroyed and
+	# recreated, old pane ids are gone, so a durable record's old
+	# "session:oldpane" key can't be found by exact match. Match by
+	# session-name prefix instead, and only act when unambiguous: more than
+	# one member previously registered for this session can't be
+	# disambiguated from here, and is left for manual recovery (respawn).
+	[[ -z $pane ]] && return 0
+	local f wt
+	local -a matches=()
+	for f in "$APEX_ROOT"/*/members/"${session}:"*.json(N); do
 		wt=$(jq -r '.worktree // empty' "$f" 2>/dev/null)
 		[[ -n $wt && $wt != "$PWD" ]] && continue
-		manager="${f:h:h:t}"
-		role=$(jq -r '.role // "worker"' "$f" 2>/dev/null)
-		issue=$(jq -r '.issue // empty' "$f" 2>/dev/null)
-		review_pr=$(jq -r '.review_pr // empty' "$f" 2>/dev/null)
-		task="${issue:+issue:$issue}${review_pr:+pr:$review_pr}"
-		tmux set-option -t "$session" @apex_session "$manager"
-		tmux set-option -t "$session" @apex_role "$role"
-		[[ -n $task ]] && tmux set-option -t "$session" @apex_task "$task"
-		tmux refresh-client -S 2>/dev/null
-		return 0
+		matches+=("$f")
 	done
+	(( ${#matches} == 1 )) || return 0
+
+	f="${matches[1]}"
+	local manager role issue review_pr task old_key new_key
+	manager="${f:h:h:t}"
+	role=$(jq -r '.role // "worker"' "$f" 2>/dev/null)
+	issue=$(jq -r '.issue // empty' "$f" 2>/dev/null)
+	review_pr=$(jq -r '.review_pr // empty' "$f" 2>/dev/null)
+	task="${issue:+issue:$issue}${review_pr:+pr:$review_pr}"
+
+	tmux set-option -p -t "$pane" @apex_session "$manager"
+	tmux set-option -p -t "$pane" @apex_role "$role"
+	[[ -n $task ]] && tmux set-option -p -t "$pane" @apex_task "$task"
+
+	old_key="${f:t:r}"
+	new_key="${session}:${pane}"
+	[[ $old_key != $new_key ]] && mv -f "$f" "$(apex_member_file "$manager" "$new_key")" 2>/dev/null
+
+	tmux refresh-client -S 2>/dev/null
 }
 
 # ─── spawn ───────────────────────────────────────────────────────────
@@ -353,23 +437,16 @@ _cmd_spawn() {
 	session=$(printf '%s' "$line" | cut -f2)
 	worktree=$(printf '%s' "$line" | cut -f3)
 
-	tmux set-option -t "$session" @apex_role "$role"
-	tmux set-option -t "$session" @apex_session "$manager"
-	tmux set-option -t "$session" @apex_task "${issue:+issue:$issue}${review_pr:+pr:$review_pr}"
-
-	# Recorded durably (not just as the transient CODING_AGENT env var used to
-	# pick an adapter at layout time) so `send` can later tell which agents
-	# have a native session-message API — see _send_native.
-	apex_member_merge "$manager" "$session" "$(jq -nc \
-		--arg role "$role" --arg wt "$worktree" --arg model "$model" \
-		--arg perm "$perm" --arg mode "$mode" --arg agent "${agent:-claude}" \
-		--arg profile "$profile" --arg issue "$issue" --arg pr "$review_pr" \
-		--argjson t "$(date +%s)" \
-		'{role:$role, worktree:$wt, model:$model, permission_mode:$perm,
-		  mode:$mode, agent:$agent, profile:$profile, issue:$issue, review_pr:$pr,
-		  status:"starting", seq:0, pinged_seq:-1,
-		  spawned_at:$t, updated_at:$t}')"
-
+	# Member registration (pane-scoped @apex_role/@apex_task/@apex_session +
+	# apex_member_merge) is no longer done here: the picker only knows a
+	# session name at this point, not the agent's actual pane id (the first
+	# agent pane in a fresh session is created asynchronously, inside that
+	# session, by tmux-dev-layout.sh). Registration happens wherever the
+	# pane is actually created — see tmux-apex.sh's `_register-member` and
+	# its callers (tmux-dev-layout.sh for a fresh session, tmux-picker.sh's
+	# _add_agent_pane for an extra pane in an already apex-tracked session,
+	# which registers synchronously and so already reports a full
+	# "session:pane" member id in $session here).
 	apex_event "$manager" "$(jq -nc --arg s "$session" --arg role "$role" \
 		--arg issue "$issue" --arg pr "$review_pr" \
 		'{event:"spawn", session:$s, role:$role, issue:$issue, review_pr:$pr}')"
@@ -379,6 +456,46 @@ _cmd_spawn() {
 	print "  task     : ${issue:+issue #$issue}${review_pr:+PR #$review_pr}"
 	print "  profile  : ${profile:-<none>}"
 	print "  model    : ${model:-<default>}   permission-mode: ${perm:-<default>}"
+}
+
+# ─── register-member (called from wherever an agent pane is actually
+#     created — tmux-dev-layout.sh for the first pane in a fresh session,
+#     tmux-picker.sh's _add_agent_pane for an extra pane in an existing one)
+#
+# _register-member <pane_id> <manager> <role> <task> <worktree> [model] [perm] [mode] [agent] [profile] [issue] [pr]
+_cmd_register_member() {
+	local pane_id="$1" manager="$2" role="$3" task="$4" worktree="$5"
+	local model="$6" perm="$7" mode="$8" agent="${9:-claude}" profile="${10}"
+	local issue="${11}" pr="${12}"
+	[[ -z $pane_id || -z $manager ]] && _die "_register-member: need <pane_id> <manager>"
+
+	local session member
+	session=$(tmux display-message -p -t "$pane_id" '#S' 2>/dev/null)
+	[[ -z $session ]] && _die "_register-member: pane '$pane_id' not found"
+	member="${session}:${pane_id}"
+
+	tmux set-option -p -t "$pane_id" @apex_role "${role:-worker}"
+	tmux set-option -p -t "$pane_id" @apex_session "$manager"
+	[[ -n $task ]] && tmux set-option -p -t "$pane_id" @apex_task "$task"
+
+	# Recorded durably (not just as the transient CODING_AGENT env var used to
+	# pick an adapter at layout time) so `send` can later tell which agents
+	# have a native session-message API — see _send_native.
+	apex_member_merge "$manager" "$member" "$(jq -nc \
+		--arg role "${role:-worker}" --arg wt "$worktree" --arg model "$model" \
+		--arg perm "$perm" --arg mode "$mode" --arg agent "$agent" \
+		--arg profile "$profile" --arg issue "$issue" --arg pr "$pr" \
+		--argjson t "$(date +%s)" \
+		'{role:$role, worktree:$wt, model:$model, permission_mode:$perm,
+		  mode:$mode, agent:$agent, profile:$profile, issue:$issue, review_pr:$pr,
+		  status:"starting", seq:0, pinged_seq:-1,
+		  spawned_at:$t, updated_at:$t}')"
+
+	apex_event "$manager" "$(jq -nc --arg s "$member" --arg role "${role:-worker}" \
+		--arg issue "$issue" --arg pr "$pr" \
+		'{event:"register", session:$s, role:$role, issue:$issue, review_pr:$pr}')"
+
+	tmux refresh-client -S 2>/dev/null
 }
 
 # ─── native message delivery (codex/opencode) ─────────────────────────
@@ -469,7 +586,7 @@ _cmd_send() {
 	local text="$*"
 	[[ -z $text ]] && _die "send: empty message"
 
-	_session_alive "$target" || _die "send: session '$target' is not running"
+	_member_alive "$target" || _die "send: session '$target' is not running"
 
 	local from full
 	from=$(_cur_session 2>/dev/null)
@@ -533,7 +650,7 @@ _record_status() {
 _cmd_event() {
 	local verb="$1"
 	local session manager
-	session=$(_cur_session) || return 0
+	session=$(_cur_member) || return 0
 	manager=$(_sopt "$session" @apex_session)
 	[[ -n $manager ]] || return 0            # not an apex member; nothing to do
 	APEX_SESSION="$manager"
@@ -730,17 +847,24 @@ _cmd_reap() {
 		return
 	fi
 
-	local wt
+	local wt session
 	for s in "${done_members[@]}"; do
 		wt=$(apex_member_get "$manager" "$s" worktree)
-		if [[ -n $wt && -d $wt ]]; then
-			TMUX_DELTA_ASSUME_YES=1 "${SCRIPTS}/tmux-picker.sh" --delete-wt "wt:${wt}" >/dev/null 2>&1
-		else
-			tmux kill-session -t "$s" 2>/dev/null
-		fi
+		session=$(_member_session "$s")
+
+		tmux kill-pane -t "$(_member_pane "$s")" 2>/dev/null
 		rm -f "$(apex_member_file "$manager" "$s")"
 		apex_event "$manager" "$(jq -nc --arg s "$s" '{event:"reap", session:$s}')"
 		print "Reaped $s"
+
+		# Only clean up the shared worktree/session once no other apex member
+		# (e.g. a worker, if we just reaped a reviewer) still owns a pane there.
+		_session_has_apex_member "$session" && continue
+		if [[ -n $wt && -d $wt ]]; then
+			TMUX_DELTA_ASSUME_YES=1 "${SCRIPTS}/tmux-picker.sh" --delete-wt "wt:${wt}" >/dev/null 2>&1
+		else
+			tmux kill-session -t "$session" 2>/dev/null
+		fi
 	done
 }
 
@@ -771,6 +895,7 @@ case "${1:-}" in
 	reap)     shift; _cmd_reap "$@" ;;
 	profiles) shift; _cmd_profiles "$@" ;;
 	_settle)  shift; _cmd_settle "$@" ;;
+	_register-member) shift; _cmd_register_member "$@" ;;
 	*)
 		print "tmux-apex.sh — apex mode for tmux-delta"
 		print ""

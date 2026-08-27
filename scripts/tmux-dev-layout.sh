@@ -30,6 +30,7 @@ agent_model=$(tmux show-environment -t "$session" CODING_AGENT_MODEL 2>/dev/null
 agent_perm=$(tmux show-environment -t "$session" CODING_AGENT_PERMISSION_MODE 2>/dev/null | cut -d= -f2-)
 agent_role=$(tmux show-environment -t "$session" CODING_AGENT_ROLE 2>/dev/null | cut -d= -f2-)
 apex_session=$(tmux show-environment -t "$session" CODING_AGENT_APEX_SESSION 2>/dev/null | cut -d= -f2-)
+coding_agent=$(tmux show-environment -t "$session" CODING_AGENT 2>/dev/null | cut -d= -f2-)
 
 # Managed-worker instructions, when this session was spawned by an apex manager.
 local managed_prompt=""
@@ -67,14 +68,9 @@ local project_dir=$PWD
 # shell's direnv precmd hook. That means the agent's identity is only known
 # inside the pane, so adapter selection has to happen there too.
 local adapter="${SELF:h}/lib/agent-adapter.sh"
-local -a agent_env=(
-	"DELTA_AGENT_MODEL=${(q)agent_model}"
-	"DELTA_AGENT_FLAGS=${(q)agent_perm}"
-	"DELTA_AGENT_SYSTEM=${(q)managed_prompt}"
-	"DELTA_AGENT_PROMPT=${(q)prompt}"
-	"DELTA_AGENT_DIR=${(q)project_dir}"
-)
-inner='agent=${CODING_AGENT:-claude}; '${(j:; :)agent_env}'; source '${(q)adapter}'; delta_agent_exec "$agent"'
+source "${SELF:h}/lib/agent-launch.sh"
+local inner
+inner=$(delta_agent_launch_cmd '${CODING_AGENT:-claude}' "$agent_model" "$agent_perm" "$managed_prompt" "$prompt" "$project_dir" "$adapter")
 
 # -P -F publishes the agent pane id so other sessions (and tmux-apex.sh) can
 # address this agent with send-keys.
@@ -82,6 +78,17 @@ local agent_pane
 agent_pane=$(tmux split-window -h -p 50 -c "$project_dir" -P -F '#{pane_id}' \
 	"direnv exec ${(q)project_dir} zsh -ic ${(q)inner}")
 [[ -n $agent_pane ]] && tmux set-option -t "$session" @agent_pane "$agent_pane"
+
+# Register this pane with apex (member identity is session:pane_id) if this
+# spawn came from tmux-apex.sh, not a plain human `o`pen. A member's own task
+# is issue:N or pr:N depending on which env var apex populated.
+if [[ -n $agent_pane && -n $apex_session ]]; then
+	task="${issue:+issue:$issue}${pr:+pr:$pr}"
+	"${SELF:h}/tmux-apex.sh" _register-member "$agent_pane" "$apex_session" "$agent_role" \
+		"$task" "$project_dir" "$agent_model" "$agent_perm" "$mode" "${coding_agent:-claude}" \
+		"" "$issue" "$pr" \
+		>/dev/null 2>&1
+fi
 
 # Start the editor in this pane (the left/original pane where the script is running).
 # This pane's own shell already ran direnv's precmd hook, so DEV_EDITOR from the

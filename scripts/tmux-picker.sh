@@ -575,6 +575,60 @@ _report_spawn() {
 	printf 'apex-session\t%s\t%s\n' "$1" "$2"
 }
 
+# Does any pane in <session> already have a registered apex member on it?
+# Used to tell "this session already belongs to some other apex member" (the
+# collision from github issue #8) apart from a plain, apex-untracked session.
+_session_has_apex_member() {
+	local p
+	for p in ${(f)"$(tmux list-panes -t "$1" -F '#{pane_id}' 2>/dev/null)"}; do
+		[[ -n $(tmux show-option -p -t "$p" -qv @apex_role 2>/dev/null) ]] && return 0
+	done
+	return 1
+}
+
+# _add_agent_pane <session> <worktree> <role> <task> <manager> <model> <perm> <mode> <agent> <prompt> <issue> <pr>
+#
+# Adds an EXTRA agent pane to a session some other apex member already owns,
+# instead of colliding with it. Unlike the first agent pane (created
+# asynchronously inside a fresh session by tmux-dev-layout.sh, well after
+# this process has already returned), this one is created right here,
+# synchronously, so its pane id is known immediately and it can register
+# itself with apex without any env-var round-trip.
+_add_agent_pane() {
+	local session="$1" worktree="$2" role="$3" task="$4" manager="$5"
+	local model="$6" perm="$7" mode="$8" agent="${9:-claude}" prompt="${10}"
+	local issue="${11}" pr="${12}"
+
+	# Idempotency: reuse an existing pane already doing this exact task
+	# instead of splitting a duplicate one (e.g. re-triggering the same
+	# review spawn twice).
+	local p existing_task
+	for p in ${(f)"$(tmux list-panes -t "$session" -F '#{pane_id}' 2>/dev/null)"}; do
+		existing_task=$(tmux show-option -p -t "$p" -qv @apex_task 2>/dev/null)
+		[[ -n $task && $existing_task == "$task" ]] || continue
+		_report_spawn "${session}:${p}" "$worktree"
+		return 0
+	done
+
+	local adapter="${SCRIPTS}/lib/agent-adapter.sh"
+	source "${SCRIPTS}/lib/agent-launch.sh"
+	local inner
+	inner=$(delta_agent_launch_cmd "${(q)agent}" "$model" "$perm" "" "$prompt" "$worktree" "$adapter")
+
+	local pane
+	pane=$(tmux split-window -t "$session" -h -p 33 -c "$worktree" -P -F '#{pane_id}' \
+		"direnv exec ${(q)worktree} zsh -ic ${(q)inner}")
+	if [[ -z $pane ]]; then
+		echo "Error: failed to create agent pane in session '$session'"
+		return 1
+	fi
+
+	"${SCRIPTS}/tmux-apex.sh" _register-member "$pane" "$manager" "$role" "$task" "$worktree" \
+		"$model" "$perm" "$mode" "$agent" "" "$issue" "$pr" >/dev/null 2>&1
+
+	_report_spawn "${session}:${pane}" "$worktree"
+}
+
 _confirm() {
 	local prompt="$1"
 	# Non-interactive callers (tmux-apex.sh) have no tty: decline by default so
@@ -861,6 +915,26 @@ _open_pr_review() {
 		tmux attach-session -t "$selected_name"
 		tmux send-keys -t "$selected_name" "${SCRIPTS}/tmux-dev-layout.sh" Enter
 		exit 0
+	fi
+
+	# Some other apex member already owns a pane in this session (e.g. a
+	# worker mid-task on this exact branch) — github issue #8. Used to
+	# collide by overwriting that member's env instead of starting an
+	# independent reviewer; add a new pane here instead.
+	if tmux has-session -t="$selected_name" 2>/dev/null && _session_has_apex_member "$selected_name"; then
+		local role=worker manager="" model="" perm="" agent=claude kv
+		for kv in "${_spawn_env[@]}"; do
+			case "$kv" in
+				CODING_AGENT_ROLE=*)             role="${kv#*=}" ;;
+				CODING_AGENT_APEX_SESSION=*)     manager="${kv#*=}" ;;
+				CODING_AGENT_MODEL=*)            model="${kv#*=}" ;;
+				CODING_AGENT_PERMISSION_MODE=*)  perm="${kv#*=}" ;;
+				CODING_AGENT=*)                  agent="${kv#*=}" ;;
+			esac
+		done
+		_add_agent_pane "$selected_name" "$selected" "$role" "pr:${pr_number}" "$manager" \
+			"$model" "$perm" review "$agent" "/my-pr-review ${pr_number}" "" "$pr_number"
+		return
 	fi
 
 	local newly_created=false
