@@ -6,9 +6,14 @@
 #   Notification -> notify  (agent is blocked, wants input)
 #   Stop         -> clear   (agent finished its turn)
 #
-# @agent_working         renders the peach robot in the session pill
-# @agent_needs_attention paints the whole pill orange; cleared by the
-#                        client-session-changed hook in tmux-delta.tmux
+# State is recorded twice: pane-scoped (per agent — this is what the session
+# pill's per-agent icons are built from) and session-scoped (an "any agent
+# busy" aggregate, kept for the fallback path in agent-icons-refresh.sh).
+#
+# @agent_present         this pane hosts an agent; drives the idle robot icon
+# @agent_working         mid-turn; drives the "excited" robot icon
+# @agent_needs_attention blocked; drives the "confused" robot icon, cleared by
+#                        the client-session-changed hook in tmux-delta.tmux
 #
 # When the session is an apex-mode member (see tmux-apex.sh), the same transitions
 # are forwarded so the manager agent learns about them.
@@ -40,13 +45,15 @@ case "$1" in
 esac
 tmux list-clients -F '#{client_name}' | xargs -n1 tmux refresh-client -S -t
 
-# Apex member (pane-scoped) reporting — no-op for panes that aren't a
-# registered apex member. This pane's own @apex_role is what tells apex
-# apart from the plain session-scoped write above; a pane with no
-# pane-scoped @apex_role at all is either a non-apex session or the
-# session's non-agent pane (editor), and gets no further treatment.
+# Pane-scoped reporting, for every agent pane — not just apex members: the
+# session pill now draws one icon per agent pane, so a plain (non-apex) agent
+# needs its own pane state too. Forwarding to the manager stays apex-only, and
+# is still keyed off this pane's own @apex_role.
 pane="$TMUX_PANE"
-if [ -n "$pane" ] && [ -n "$(tmux show-option -p -t "$pane" -qv @apex_role 2>/dev/null)" ]; then
+if [ -n "$pane" ]; then
+  # Presence is sticky for the life of the pane: an agent that has finished its
+  # turn is still an agent, and the pill shows it as idle rather than vanishing.
+  tmux set-option -p -t "$pane" @agent_present 1 2>/dev/null || true
   case "$1" in
     set)
       tmux set-option -p -t "$pane" @agent_working 1
@@ -61,5 +68,10 @@ if [ -n "$pane" ] && [ -n "$(tmux show-option -p -t "$pane" -qv @apex_role 2>/de
       tmux set-option -u -p -t "$pane" @agent_needs_attention 2>/dev/null || true
       ;;
   esac
-  "$(dirname "$(readlink -f "$0")")/tmux-apex.sh" event "$1" >/dev/null 2>&1 || true
+  if [ -n "$(tmux show-option -p -t "$pane" -qv @apex_role 2>/dev/null)" ]; then
+    "$(dirname "$(readlink -f "$0")")/tmux-apex.sh" event "$1" >/dev/null 2>&1 || true
+  fi
 fi
+
+# Rebuild the session's per-agent icon string from the pane state written above.
+"$(dirname "$(readlink -f "$0")")/agent-icons-refresh.sh" "$session" >/dev/null 2>&1 || true
