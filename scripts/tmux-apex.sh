@@ -1868,7 +1868,14 @@ _apex_pending_sig() {
 			' "${files[$i]}" 2>/dev/null) || continue
 		[[ -n $one ]] && out+=("${names[$i]}${one}")
 	done
-	print -r -- "${(j:,:)${(o)out}}"
+	# (@o), not (o): inside double quotes a nested ${(o)out} collapses to one
+	# space-joined word, leaving the outer (j:,:) a single element and nothing
+	# to join — so this path used to emit "a b" where the slurped path emits
+	# "a,b". Both halves matter: the separator differs on every fallback with
+	# two pending members, and the sort keeps the two paths agreeing if the
+	# glob ever stops arriving in order. A sig that changes shape without the
+	# pending set changing is a spurious nudge into the manager's pane.
+	print -r -- "${(j:,:)${(@o)out}}"
 }
 
 # _apex_watch_state <manager> <key> / _apex_watch_save <manager> <patch-json>

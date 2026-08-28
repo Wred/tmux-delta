@@ -303,6 +303,20 @@ print -r -- '{ truncated' > "$(apex_member_file "$MGR" 'bad:%9')"
 eq "the fallback honours escalations too" "good:%8#4!" \
 	"$(_apex_pending_sig "$MGR" 2>/dev/null)"
 
+# The two paths are two serializations of the same answer, and the poller
+# compares sigs as opaque strings — so a difference in *shape* alone is a
+# changed fingerprint, i.e. a nudge typed into the manager's pane for a pending
+# set that did not change. Pin them byte-identical over a multi-member set,
+# which is the only case where joining can disagree.
+reset
+member 'a:%1' idle 2 -1
+member 'b:%2' attention 1 -1
+slurped=$(_apex_pending_sig "$MGR")
+print -r -- '{ truncated' > "$(apex_member_file "$MGR" 'bad:%9')"
+fallback=$(_apex_pending_sig "$MGR" 2>/dev/null)
+eq "the slurped path joins on comma, sorted" "a:%1#2,b:%2#1" "$slurped"
+eq "and the fallback serializes identically" "$slurped" "$fallback"
+
 # ── a comma in a session name ────────────────────────────────────────
 # tmux allows it (`tmux new-session -s a,b` succeeds), so the names cannot ride
 # alongside the slurped documents on a comma — one name would split into two
