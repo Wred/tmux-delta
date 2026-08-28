@@ -30,6 +30,21 @@ APEX_QUIET_SECS=${APEX_QUIET_SECS:-30}
 
 _die() { print -u2 "tmux-apex: $*"; exit 1; }
 
+# _need_val <context> <flag> $# — guard a two-argument option.
+#
+# zsh's `shift 2` with only one positional left fails *and leaves $# unchanged*,
+# so an unguarded `while (( $# ))` parser spins at 100% CPU forever on a dropped
+# value. That is not merely a bad error message here: `verdict` is run by the
+# reviewer agent itself, and a wedged pane never reaches its Stop hook — so
+# `_settle` never runs and the loop's own "reviewer went idle without a verdict"
+# escalation never fires either. The pair just hangs, silently.
+#
+# Takes the remaining argument count rather than the value, so an intentionally
+# empty value (`--note ''`) is still accepted.
+_need_val() {
+	(( $3 >= 2 )) || _die "$1: $2 needs a value"
+}
+
 _cur_session() {
 	tmux display-message -p '#S' 2>/dev/null
 }
@@ -369,17 +384,18 @@ _cmd_spawn() {
 
 	while (( $# )); do
 		case "$1" in
-			--issue)            issue="$2"; shift 2 ;;
-			--review-pr)        review_pr="$2"; shift 2 ;;
-			--role)             role="$2"; shift 2 ;;
-			--agent)            agent="$2"; shift 2 ;;
-			--model)            model="$2"; shift 2 ;;
-			--profile)          profile="$2"; shift 2 ;;
+			--issue)      _need_val spawn "$1" $#; issue="$2"; shift 2 ;;
+			--review-pr)  _need_val spawn "$1" $#; review_pr="$2"; shift 2 ;;
+			--role)       _need_val spawn "$1" $#; role="$2"; shift 2 ;;
+			--agent)      _need_val spawn "$1" $#; agent="$2"; shift 2 ;;
+			--model)      _need_val spawn "$1" $#; model="$2"; shift 2 ;;
+			--profile)    _need_val spawn "$1" $#; profile="$2"; shift 2 ;;
 			# --agent-flags is the accurate name: only claude calls this a
 			# "permission mode". Both spellings feed the same slot.
-			--permission-mode|--agent-flags) perm="$2"; shift 2 ;;
-			--mode)             mode="$2"; shift 2 ;;
-			--switch)           switch="switch"; shift ;;
+			--mode)       _need_val spawn "$1" $#; mode="$2"; shift 2 ;;
+			--permission-mode|--agent-flags)
+			              _need_val spawn "$1" $#; perm="$2"; shift 2 ;;
+			--switch)     switch="switch"; shift ;;
 			*) _die "spawn: unknown argument '$1'" ;;
 		esac
 	done
@@ -810,7 +826,6 @@ _pair_advance() {
 		return 0
 	fi
 
-	local -a patch=()
 	if [[ $role == reviewer ]]; then
 		local vround findings note
 		vround=$(apex_member_get "$manager" "$member" verdict_round)
@@ -835,25 +850,32 @@ _pair_advance() {
 		fi
 
 		local next=$(( round + 1 ))
+		# Write the partner's pair state *before* delivering, not after.
+		# Delivery wakes the partner agent, whose own `event set` merges
+		# {status,seq} into the same member file; apex_member_merge is a
+		# lock-free read-modify-write, so a write scheduled after the relay
+		# can lose the pair_turn flip to that agent's — and a lost flip is
+		# silent, not escalated: the partner's next idle falls through to
+		# the manager with a stale round counter.
+		apex_member_merge "$manager" "$member" \
+			"$(jq -nc --argjson r "$next" '{pair_round:$r, pair_turn:"worker"}')"
+		apex_member_merge "$manager" "$pair" \
+			"$(jq -nc --argjson r "$next" '{pair_round:$r, pair_turn:"worker"}')"
 		if ! _pair_relay "$manager" "$pair" \
 			"$(_pair_worker_msg "$pr" "$next" "$findings" "$note")"; then
 			_pair_escalate "$manager" "$member" stuck \
 				"PAIRED REVIEW STUCK: could not deliver the reviewer's ${findings} finding(s) on PR #${pr} to the worker ($pair) — no reachable coding agent in that pane."
 			return 0
 		fi
-		apex_member_merge "$manager" "$member" \
-			"$(jq -nc --argjson r "$next" '{pair_round:$r, pair_turn:"worker"}')"
-		apex_member_merge "$manager" "$pair" \
-			"$(jq -nc --argjson r "$next" '{pair_round:$r, pair_turn:"worker"}')"
 	else
+		apex_member_merge "$manager" "$member" '{"pair_turn":"reviewer"}'
+		apex_member_merge "$manager" "$pair" '{"pair_turn":"reviewer"}'
 		if ! _pair_relay "$manager" "$pair" \
 			"$(_pair_reviewer_msg "$pr" "$round" rereview)"; then
 			_pair_escalate "$manager" "$member" stuck \
 				"PAIRED REVIEW STUCK: the worker finished round ${round} on PR #${pr} but the reviewer ($pair) could not be reached — no reachable coding agent in that pane."
 			return 0
 		fi
-		apex_member_merge "$manager" "$member" '{"pair_turn":"reviewer"}'
-		apex_member_merge "$manager" "$pair" '{"pair_turn":"reviewer"}'
 	fi
 
 	# Consume the ping: the whole point of the loop is that the manager is
@@ -868,10 +890,10 @@ _cmd_link() {
 	local worker="" reviewer="" pr="" max="$APEX_PAIR_MAX_ROUNDS"
 	while (( $# )); do
 		case "$1" in
-			--worker)     worker="$2"; shift 2 ;;
-			--reviewer)   reviewer="$2"; shift 2 ;;
-			--pr)         pr="$2"; shift 2 ;;
-			--max-rounds) max="$2"; shift 2 ;;
+			--worker)     _need_val link "$1" $#; worker="$2"; shift 2 ;;
+			--reviewer)   _need_val link "$1" $#; reviewer="$2"; shift 2 ;;
+			--pr)         _need_val link "$1" $#; pr="$2"; shift 2 ;;
+			--max-rounds) _need_val link "$1" $#; max="$2"; shift 2 ;;
 			*) _die "link: unknown argument '$1'" ;;
 		esac
 	done
@@ -944,33 +966,58 @@ _cmd_unlink() {
 # pair-resume — hand a stuck loop back to the agents after a human has
 # unstuck whatever it was stuck on.
 _cmd_pair_resume() {
-	local member="$1"
-	[[ -n $member ]] || _die "pair-resume: usage: pair-resume <session:%pane>"
+	local member="" extend=""
+	while (( $# )); do
+		case "$1" in
+			--max-rounds) _need_val pair-resume "$1" $#; extend="$2"; shift 2 ;;
+			-*) _die "pair-resume: unknown argument '$1'" ;;
+			*)  member="$1"; shift ;;
+		esac
+	done
+	[[ -n $member ]] || _die "pair-resume: usage: pair-resume <session:%pane> [--max-rounds N]"
+	[[ -z $extend || $extend == <-> ]] || _die "pair-resume: --max-rounds must be a positive integer"
+
 	local manager
 	manager=$(_require_manager)
 	APEX_SESSION="$manager"
 
-	local pair pr role
+	local pair pr role round max
 	pair=$(apex_member_get "$manager" "$member" pair)
 	[[ -n $pair ]] || _die "pair-resume: '$member' is not linked to a partner"
 	pr=$(apex_member_get "$manager" "$member" pair_pr)
 	role=$(apex_member_get "$manager" "$member" pair_role)
+	round=$(apex_member_get "$manager" "$member" pair_round); [[ -n $round ]] || round=1
+	max=$(apex_member_get "$manager" "$member" pair_max_rounds); [[ -n $max ]] || max=$APEX_PAIR_MAX_ROUNDS
+
+	# Resuming a cap-stuck loop without raising the cap re-invokes the
+	# reviewer at round == max, so the moment it reports any finding the cap
+	# check fires again: a wasted review turn, duplicate PR comments, and the
+	# same escalation. Refuse rather than pretend to have resumed.
+	if [[ -n $extend ]]; then
+		(( extend > max )) || _die "pair-resume: --max-rounds ${extend} is not above the current cap (${max})"
+		max="$extend"
+	elif (( round >= max )); then
+		_die "pair-resume: round ${round} is already at the cap (${max}), so the loop would escalate again on the reviewer's first finding. Raise it: pair-resume ${member} --max-rounds $(( max + 2 ))"
+	fi
 
 	local reviewer
 	[[ $role == reviewer ]] && reviewer="$member" || reviewer="$pair"
 
 	local m
 	for m in "$member" "$pair"; do
-		apex_member_merge "$manager" "$m" \
-			'{"pair_state":"active","pair_turn":"reviewer","pair_message":""}'
+		# Do not resurrect a reaped partner as a phantom member — `status`
+		# and `pending` would then report a pane that no longer exists.
+		[[ -f $(apex_member_file "$manager" "$m") ]] || continue
+		apex_member_merge "$manager" "$m" "$(jq -nc --argjson max "$max" \
+			'{pair_state:"active", pair_turn:"reviewer", pair_message:"",
+			  pair_max_rounds:$max}')"
 	done
-	local round
-	round=$(apex_member_get "$manager" "$member" pair_round); [[ -n $round ]] || round=1
 
 	_pair_relay "$manager" "$reviewer" "$(_pair_reviewer_msg "$pr" "$round" rereview)" \
 		|| _die "pair-resume: could not reach the reviewer ($reviewer)"
-	apex_event "$manager" "$(jq -nc --arg s "$member" '{event:"pair-resume", session:$s}')"
-	print "Resumed the loop on PR #${pr}; reviewer re-invoked for round ${round}."
+	apex_event "$manager" "$(jq -nc --arg s "$member" --argjson max "$max" \
+		'{event:"pair-resume", session:$s, max_rounds:$max}')"
+	print "Resumed the loop on PR #${pr}; reviewer re-invoked for round ${round} of ${max}."
 }
 
 # verdict — run by the *reviewer* in its own pane. This is the loop's only
@@ -979,9 +1026,9 @@ _cmd_verdict() {
 	local findings="" note=""
 	while (( $# )); do
 		case "$1" in
-			--findings) findings="$2"; shift 2 ;;
+			--findings) _need_val verdict "$1" $#; findings="$2"; shift 2 ;;
 			--none)     findings=0; shift ;;
-			--note)     note="$2"; shift 2 ;;
+			--note)     _need_val verdict "$1" $#; note="$2"; shift 2 ;;
 			*) _die "verdict: unknown argument '$1'" ;;
 		esac
 	done
@@ -1192,11 +1239,20 @@ _cmd_pending() {
 	manager=$(_require_manager)
 	APEX_SESSION="$manager"
 
-	local s st seq pinged role task facts summary
+	local s st seq pinged role task facts summary pair_msg
 	for s in ${(f)"$(apex_members "$manager")"}; do
 		[[ -z $s ]] && continue
 		st=$(apex_member_get "$manager" "$s" status)
-		[[ $st == idle || $st == attention ]] || continue
+		pair_msg=$(apex_member_get "$manager" "$s" pair_message)
+
+		# A terminal pair escalation is reported on its own merit, not via
+		# the `status` field it forces: the partner's relay can wake this
+		# member back into `working` before the manager next pulls, which
+		# would otherwise defer "READY FOR HUMAN REVIEW" by a whole agent
+		# turn — likeliest in exactly the cases that need it soonest.
+		if [[ -z $pair_msg ]]; then
+			[[ $st == idle || $st == attention ]] || continue
+		fi
 
 		seq=$(apex_member_get "$manager" "$s" seq); [[ -z $seq ]] && seq=0
 		pinged=$(apex_member_get "$manager" "$s" pinged_seq); [[ -z $pinged ]] && pinged=-1
@@ -1206,9 +1262,6 @@ _cmd_pending() {
 		task=$(_sopt "$s" @apex_task)
 		facts=$(_member_facts "$s")
 		summary=$(_facts_line "$facts")
-
-		local pair_msg
-		pair_msg=$(apex_member_get "$manager" "$s" pair_message)
 
 		if [[ -n $pair_msg ]]; then
 			print "[apex] session=${s} role=${role} ${task:+task=${task} }— ${pair_msg} (${summary})"
@@ -1453,6 +1506,7 @@ case "${1:-}" in
 		print "      opts: --pr N --max-rounds N (default ${APEX_PAIR_MAX_ROUNDS})"
 		print "  unlink <member>                drop the pairing (both halves)"
 		print "  pair-resume <member>           restart a loop that escalated as stuck"
+		print "      opts: --max-rounds N       required if it stuck at the round cap"
 		print "  verdict --findings N | --none  reviewer-only: record the round's outcome"
 		print "                                 (the loop's termination signal) [--note TEXT]"
 		print "  status [--json]                state of every member"

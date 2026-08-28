@@ -18,7 +18,7 @@ APEX="$ROOT/scripts/tmux-apex.sh"
 TMPROOT=$(mktemp -d "${TMPDIR:-/tmp}/apex-pair-test.XXXXXX")
 trap 'rm -rf "$TMPROOT"' EXIT
 
-typeset -i PASS=0 FAIL=0
+typeset -i PASS=0 FAIL=0 rc=0
 ok()  { print -- "  ok   $1"; PASS=$(( PASS + 1 )) }
 bad() { print -u2 -- "  FAIL $1"; print -u2 -- "       $2"; FAIL=$(( FAIL + 1 )) }
 eq() {
@@ -317,10 +317,41 @@ eq "loop is marked stuck" stuck "$(mget "$WORKER" pair_state)"
 eq "no third round is relayed" "" "$(sent_to %1)"
 eq "the PR is left as a draft" "" "$(cat "$STUB_GH")"
 
+# Resuming at the cap without raising it would re-invoke the reviewer for a
+# full turn, collect duplicate PR comments, and land back in `stuck` on its
+# first finding. Refuse instead of pretending to resume. (PR #13 review.)
 out=$(apex pair-resume "$WORKER")
+contains "resume at the cap is refused"  "already at the cap" "$out"
+contains "refusal names the way out"     "--max-rounds"       "$out"
+eq "loop is left stuck" stuck "$(mget "$WORKER" pair_state)"
+eq "and the reviewer is not woken for nothing" "" "$(sent_to %2)"
+
+out=$(apex pair-resume "$WORKER" --max-rounds 2)
+contains "a cap that is not actually higher is refused" "not above the current cap" "$out"
+
+out=$(apex pair-resume "$WORKER" --max-rounds 4)
 contains "pair-resume restarts the round" "Resumed the loop" "$out"
+contains "and reports the new cap"        "round 2 of 4"     "$out"
 eq "loop is active again" active "$(mget "$WORKER" pair_state)"
+eq "the raised cap lands on both halves (worker)"   4 "$(mget "$WORKER" pair_max_rounds)"
+eq "the raised cap lands on both halves (reviewer)" 4 "$(mget "$REVIEWER" pair_max_rounds)"
 contains "and the reviewer is re-invoked" "Re-review" "$(sent_to %2)"
+
+# The point of raising it: the next round must actually make progress rather
+# than re-escalating immediately.
+: > "$STUB_SENT"
+verdict --findings 1 >/dev/null
+settle "$REVIEWER" >/dev/null
+eq "the resumed round relays instead of re-escalating" active "$(mget "$WORKER" pair_state)"
+contains "and the worker gets the findings" "1 finding(s)" "$(sent_to %1)"
+eq "round advances past the old cap" 3 "$(mget "$WORKER" pair_round)"
+
+# A reaped partner must not be resurrected as a phantom member.
+print "\npair-resume does not recreate a reaped partner"
+reset --max=3
+rm -f "$MEMBERS/$REVIEWER.json"
+apex pair-resume "$WORKER" >/dev/null
+eq "the reaped member file stays gone" "" "$(print -r -- "$MEMBERS/$REVIEWER.json"(N))"
 
 # ── dead partner ─────────────────────────────────────────────────────
 print "\na dead partner escalates"
@@ -358,6 +389,49 @@ contains "verdict rejects a non-integer" "non-negative integer" "$out"
 # The worker must not be able to close out its own review.
 out=$(worker_verdict --none)
 contains "only the reviewer may record a verdict" "only the reviewer" "$out"
+
+# ── two-argument option guards ───────────────────────────────────────
+# zsh's `shift 2` with one positional left fails *and leaves $# unchanged*, so
+# an unguarded `while (( $# ))` parser spins forever. `verdict` is run by the
+# reviewer agent unattended, and a wedged pane never reaches its Stop hook — so
+# the loop's own "idle without a verdict" escalation never fires either, and the
+# pair hangs with nobody notified. (PR #13 review.)
+print "\nmissing option values fail fast instead of spinning"
+
+for cmd in \
+	'verdict --findings' 'verdict --note' \
+	'link --worker' 'link --reviewer' 'link --pr' 'link --max-rounds' \
+	'pair-resume --max-rounds' \
+	'spawn --issue' 'spawn --review-pr' 'spawn --role' 'spawn --agent' \
+	'spawn --model' 'spawn --profile' 'spawn --mode' 'spawn --agent-flags'
+do
+	# Capture the status outside a command substitution: err_return aborts the
+	# subshell on the failure itself, before a trailing `print $?` can run.
+	timeout 5 zsh "$APEX" ${=cmd} > "$TMPROOT/out" 2>&1 && rc=0 || rc=$?
+	eq "'${cmd}' with no value exits, not 124/timeout" 1 "$rc"
+	contains "'${cmd}' says which flag needs a value" \
+		"${cmd##* } needs a value" "$(cat "$TMPROOT/out")"
+done
+
+# An intentionally empty value is still a value.
+reset
+verdict --findings 2 --note '' >/dev/null
+eq "an empty --note is accepted" 2 "$(mget "$REVIEWER" verdict_findings)"
+
+# ── escalations are not gated on the status field ────────────────────
+# A relay wakes the partner, whose own `event set` overwrites status to
+# `working` and bumps seq. Gating `pending` on status would defer a terminal
+# ping by a whole agent turn — likeliest in exactly the cases that need it
+# soonest. (PR #13 review.)
+print "\na terminal escalation reaches the manager even mid-turn"
+reset
+verdict --none >/dev/null
+settle "$REVIEWER" >/dev/null
+jq -c '.status = "working" | .seq = 99' "$MEMBERS/$WORKER.json" > "$TMPROOT/w" \
+	&& mv "$TMPROOT/w" "$MEMBERS/$WORKER.json"
+out=$(apex pending)
+contains "the ready ping is not withheld while the worker is busy" \
+	"READY FOR HUMAN REVIEW" "$out"
 
 # ── unlink ───────────────────────────────────────────────────────────
 print "\nunlink"

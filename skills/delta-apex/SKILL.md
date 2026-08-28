@@ -201,7 +201,10 @@ Then pick one:
   REVIEW" means the reviewer signed off and the PR is out of draft: report it to
   the human, do not merge it. "PAIRED REVIEW STUCK" means the loop could not
   finish on its own — read `status --json`, fix the cause, then
-  `tmux-apex.sh pair-resume <member>` or take over by hand.
+  `tmux-apex.sh pair-resume <member>` or take over by hand. If it stuck at the
+  round cap, `pair-resume` requires `--max-rounds N` above the old cap, and you
+  should decide whether another round is actually warranted: the two agents
+  disagreeing is a judgement call, not a retry.
 - **Idle with nothing pushed and no blocker** → it probably stopped early.
   Send it a nudge naming what is still missing.
 - **A question only the human can answer** (product decisions, tradeoffs,

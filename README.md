@@ -388,6 +388,7 @@ tmux-apex.sh link --worker wt:%3 --reviewer wt:%7    # --pr N is inferred
 tmux-apex.sh link --worker wt:%3 --reviewer wt:%7 --max-rounds 3
 tmux-apex.sh unlink wt:%3
 tmux-apex.sh pair-resume wt:%3                       # restart a stuck loop
+tmux-apex.sh pair-resume wt:%3 --max-rounds 8        # ...one stuck at the cap
 ```
 
 From then on each idle transition is relayed instead of surfacing:
@@ -415,7 +416,9 @@ The loop escalates rather than spinning whenever it cannot make progress on its
 own — the round cap is hit (worker and reviewer are not converging), no verdict
 was recorded, the partner's pane is gone, or the relay could not be delivered.
 Only then does the manager get a ping, and the message says which of those it
-is. The terminal ping is framed as the decision that is actually the human's —
+is. `pair-resume` on a loop that stuck *at the cap* requires a higher
+`--max-rounds`: resuming at `round == max` would burn a full review turn and
+re-escalate on the reviewer's first finding. The terminal ping is framed as the decision that is actually the human's —
 the merge call — not as a generic "a member went idle".
 
 ### How reporting works
@@ -559,7 +562,9 @@ it needs neither a live agent nor a tmux server.
 `apex-pair.test.sh` covers the linked-pair state machine: the relay in both
 directions, the round cap, a missing verdict, an unreachable or dead partner, a
 failed `gh pr ready`, and the two properties the feature exists for — no manager
-ping on an intermediate round, exactly one on termination. tmux is a file-backed
+ping on an intermediate round, exactly one on termination. It also pins down the
+option parsers: zsh's `shift 2` with a missing value leaves `$#` unchanged, so
+every two-argument flag is asserted to fail fast rather than spin. tmux is a file-backed
 option-store stub and `gh` records its argv, so member state is the real thing
 but nothing touches a live PR.
 
