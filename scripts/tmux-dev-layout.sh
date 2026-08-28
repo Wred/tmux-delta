@@ -76,7 +76,8 @@ inner=$(delta_agent_launch_cmd '${CODING_AGENT:-claude}' "$agent_model" "$agent_
 # -P -F publishes the agent pane id so other sessions (and tmux-apex.sh) can
 # address this agent with send-keys.
 local agent_pane
-agent_pane=$(tmux split-window -h -p 50 -c "$project_dir" -P -F '#{pane_id}' \
+agent_pane=$(tmux split-window -h -p $DELTA_AGENT_PANE_PCT_NEW \
+	-c "$project_dir" -P -F '#{pane_id}' \
 	"direnv exec ${(q)project_dir} zsh -ic ${(q)inner}")
 [[ -n $agent_pane ]] && tmux set-option -t "$session" @agent_pane "$agent_pane"
 

@@ -612,7 +612,8 @@ _add_agent_pane() {
 	inner=$(delta_agent_launch_cmd "${(q)agent}" "$model" "$perm" "$system" "$prompt" "$worktree" "$adapter")
 
 	local pane
-	pane=$(tmux split-window -t "$session" -h -p 33 -c "$worktree" -P -F '#{pane_id}' \
+	pane=$(tmux split-window -t "$session" -h -p $DELTA_AGENT_PANE_PCT_EXTRA \
+		-c "$worktree" -P -F '#{pane_id}' \
 		"direnv exec ${(q)worktree} zsh -ic ${(q)inner}")
 	if [[ -z $pane ]]; then
 		echo "Error: failed to create agent pane in session '$session'"
@@ -737,21 +738,8 @@ _delete_wt() {
 # Falls back gracefully: non-git sessions or the main worktree keep their
 # full name so the status-format conditional stays correct.
 _set_session_label() {
-	local session_name="$1" session_path="$2" pr_number="${3:-}"
-	local main_tree
-	main_tree=$(git -C "$session_path" worktree list 2>/dev/null | awk 'NR==1{print $1}')
-	[[ -z $main_tree ]] && return
-	local repo_prefix short_label
-	repo_prefix=$(basename "$main_tree" | tr . _)
-	short_label=${session_name#${repo_prefix}-}
-	if [[ -n $pr_number ]]; then
-		local max_len=20
-		if (( ${#short_label} > max_len )); then
-			short_label="${short_label:0:$max_len}…"
-		fi
-		short_label="${pr_number}: ${short_label}"
-	fi
-	tmux set-option -t "$session_name" @session_label "$short_label"
+	source "${SCRIPTS}/lib/session-label.sh"
+	delta_session_label "$@"
 }
 
 _switch_session() {
@@ -947,9 +935,11 @@ _open_pr_review() {
 				CODING_AGENT=*)                  agent="${kv#*=}" ;;
 			esac
 		done
+		source "${SCRIPTS}/lib/agent-prompts.sh"
 		_set_session_label "$selected_name" "$selected" "$pr_number"
 		_add_agent_pane "$selected_name" "$selected" "$role" "pr:${pr_number}" "$manager" \
-			"$model" "$perm" review "$agent" "/my-pr-review ${pr_number}" "" "$pr_number"
+			"$model" "$perm" review "$agent" \
+			"$(delta_task_prompt "" "$pr_number" review)" "" "$pr_number"
 		return
 	fi
 

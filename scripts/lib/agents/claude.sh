@@ -24,13 +24,17 @@ delta_agent_argv() {
 	# live in this worktree (a worker and its reviewer share a worktree, so
 	# "newest here" is a coin flip between the two).
 	#
-	# The fresh fallback keeps the prompt: if the transcript for that id is gone
-	# (pruned, or the worktree was recreated), the pane starts a normal fresh
-	# session on the same task rather than dying with a resume error.
+	# No fresh fallback on this path, deliberately. agent-adapter.sh fires the
+	# fallback on ANY non-zero exit, not just "there was nothing to resume", and
+	# the fallback argv here would carry DELTA_AGENT_PROMPT — so an agent that
+	# was interrupted, crashed mid-turn, or hit a transient API error would
+	# immediately relaunch with the full autonomous prompt and redo the task:
+	# duplicate commits, duplicate draft PR. `recover` is the only caller that
+	# sets DELTA_AGENT_RESUME and it only passes an id it just located a
+	# transcript for, so "nothing to resume" is already ruled out before we get
+	# here; a resume that still fails should surface as an error, not as a
+	# second run of the task.
 	if [[ -n $DELTA_AGENT_RESUME ]]; then
-		agent_argv_fresh=("${agent_argv[@]}")
-		[[ -n $DELTA_AGENT_PROMPT ]] && agent_argv_fresh+=("$DELTA_AGENT_PROMPT")
-		agent_argv_fresh_set=1
 		agent_argv+=(--resume "$DELTA_AGENT_RESUME")
 	elif [[ -n $DELTA_AGENT_PROMPT ]]; then
 		agent_argv+=("$DELTA_AGENT_PROMPT")

@@ -745,8 +745,21 @@ opening task prompt (a worker and its reviewer share a worktree, so the prompt
 is the only thing that tells them apart — hence the single copy of that text in
 `scripts/lib/agent-prompts.sh`). A slash command is stored expanded rather than
 verbatim, so a reviewer's `/my-pr-review 17` is folded back from its
-`<command-name>`/`<command-args>` form before matching. The id only exists after the member's first
-turn, so it is filled in on the member's first `event` call, not at spawn.
+`<command-name>`/`<command-args>` form before matching. The marker has to be
+followed by end-of-line or a space: `/my-pr-review 4` is a prefix of
+`/my-pr-review 43`, and resuming the wrong PR's review looks like it worked. The
+id only exists after the member's first turn, so it is filled in on the member's
+first `event` call, not at spawn.
+
+The record is a cache; the transcript is the authority. `recover` re-resolves the
+id every time and says so when a recorded one no longer resolves, so a record
+that went stale (or was written empty because nothing resolved) self-heals rather
+than pinning recovery to a dead conversation. Registration writes the field
+unconditionally — a member is born there, so there is nothing to inherit from a
+recycled pane id. When registration does find a stale record on a pane id tmux
+reused, it replaces it and writes a `stale-record-replaced` entry to
+`events.jsonl`: the real call sites redirect stderr to `/dev/null`, so a warning
+alone would never be seen.
 
 `recover` is a dry run by default, like `reap`; `--yes` acts. Pass member keys
 to limit it. It skips members whose worktree is gone, and members whose task is
@@ -822,7 +835,8 @@ idempotency, a recycled pane id neither faking a live member nor corrupting an
 existing member's record, one
 task per member (never `issue:42pr:43`), and an apex spawn into a session that
 already has a member landing in its own new pane without rewriting that
-session's `CODING_AGENT_*` env. `tmux`, `gh` and `git` are stubbed.
+session's `CODING_AGENT_*` env, and colliding task numbers (PR 4 vs 43, issue 4
+vs 42) not matching each other's transcripts. `tmux`, `gh` and `git` are stubbed.
 
 ## Shell functions (gwt.zsh)
 

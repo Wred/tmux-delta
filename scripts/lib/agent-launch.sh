@@ -25,6 +25,16 @@
 # `tmux-apex.sh recover`: it resumes that exact recorded conversation instead of
 # starting a fresh one. Every other caller omits it.
 
+# Width of the agent pane, as a percentage, for the two shapes of split that
+# exist. Named because three call sites have to agree: a recovered session must
+# not be visibly laid out differently from the one it replaces.
+#   NEW   — the agent is the second pane of a fresh session (editor | agent),
+#           as tmux-dev-layout.sh builds it.
+#   EXTRA — the agent is an additional pane in a session that is already
+#           populated (tmux-picker.sh's _add_agent_pane).
+typeset -g DELTA_AGENT_PANE_PCT_NEW=50
+typeset -g DELTA_AGENT_PANE_PCT_EXTRA=33
+
 delta_agent_launch_cmd() {
 	local agent_expr="$1" model="$2" flags="$3" system="$4" prompt="$5" dir="$6" adapter="$7"
 	local resume="${8:-}"

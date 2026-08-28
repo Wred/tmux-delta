@@ -232,6 +232,15 @@ print "conversation identity"
 # Load just the discovery helpers out of tmux-apex.sh.
 eval "$(sed -n '/^_claude_project_dirs()/,/^}/p; /^_claude_normalize_prompt()/,/^}/p;
 	/^_claude_session_for()/,/^}/p' "$SCRIPTS/tmux-apex.sh")"
+# The extraction is line-anchored, so a rename, an indent, `name () {`, or a
+# nested `}` at column zero makes sed emit nothing or half a function. Without
+# this check the section below would "pass" against functions that do not exist.
+for fn in _claude_project_dirs _claude_normalize_prompt _claude_session_for; do
+	(( ${+functions[$fn]} )) || {
+		print -u2 "apex-recover.test.sh: could not extract $fn from tmux-apex.sh"
+		exit 1
+	}
+done
 
 eq "worker's own conversation, not the newer reviewer's" \
 	"$WORKER_ID" "$(_claude_session_for "$WT" "$(delta_task_marker 42 '')")"
@@ -250,6 +259,21 @@ eq "an argument-less slash command keeps no trailing space" "/compact" \
 	"$(_claude_normalize_prompt '<command-name>/compact</command-name>')"
 eq "an ordinary prompt passes through untouched" "GitHub issue #42. Read it" \
 	"$(_claude_normalize_prompt 'GitHub issue #42. Read it')"
+
+# A marker is matched as a prefix, so a low-numbered task must not match a
+# higher-numbered one that starts with the same digits. The issue marker is
+# terminated by its own "."; the PR marker is not, and "/my-pr-review 4" does
+# prefix "/my-pr-review 43" — which had recover on PR #4 resume PR #43's review.
+# Only the PR-43 and issue-42 transcripts exist in this worktree, so anything
+# these two return is a wrong match.
+eq "a low-numbered PR does not match a higher one" "" \
+	"$(_claude_session_for "$WT" "$(delta_task_marker '' 4)" || true)"
+eq "a low-numbered issue does not match a higher one" "" \
+	"$(_claude_session_for "$WT" "$(delta_task_marker 4 '')" || true)"
+eq "the exact PR still matches" "$REVIEW_ID" \
+	"$(_claude_session_for "$WT" "$(delta_task_marker '' 43)")"
+eq "the exact issue still matches" "$WORKER_ID" \
+	"$(_claude_session_for "$WT" "$(delta_task_marker 42 '')")"
 
 # The marker must be a prefix of every prompt variant for the same task, or
 # matching silently fails for whichever mode wasn't tested.
@@ -278,12 +302,22 @@ argv_for() {
 
 argv_for "the task" "$WORKER_ID"
 eq "resume wins over the prompt" "--resume $WORKER_ID" "${(j: :)agent_argv}"
-eq "fresh fallback keeps the task prompt" "the task" "${(j: :)agent_argv_fresh}"
-eq "fallback is armed, so an unresumable id degrades to a fresh start" \
-	1 "${+agent_argv_fresh_set}"
+# agent-adapter.sh fires the fresh fallback on ANY non-zero exit, not only on
+# "nothing to resume". Arming it on a prompt-carrying invocation means an
+# interrupted or crashed agent silently redoes an autonomous task — duplicate
+# commits, duplicate draft PR. recover only ever passes an id whose transcript
+# it just found, so there is nothing for a fallback to rescue here.
+eq "a resumed agent never re-runs its task on a bad exit" 0 "${+agent_argv_fresh_set}"
 
 argv_for "the task" ""
 eq "no resume id: plain prompt, no --resume" "the task" "${(j: :)agent_argv}"
+
+# The promptless --continue path keeps its fallback: resuming fails on a
+# worktree the agent has never seen, and the fallback there is a bare
+# interactive session, which is harmless to enter twice.
+argv_for "" ""
+eq "a promptless launch still falls back" 1 "${+agent_argv_fresh_set}"
+eq "…from --continue" "--continue" "${(j: :)agent_argv}"
 
 source "$SCRIPTS/lib/agent-launch.sh"
 contains "launch command exports the resume id" "DELTA_AGENT_RESUME=sid-9" \
@@ -432,13 +466,21 @@ eq "the new member's PR stands"        43      "$(print -r -- "$rec" | jq -r '.r
 eq "the old member's issue is gone"    ""      "$(print -r -- "$rec" | jq -r '.issue')"
 eq "no stale sequence number survives" 0       "$(print -r -- "$rec" | jq -r '.seq')"
 
-# Re-registering the SAME task is still a merge, not a wipe: that is the
-# ordinary idempotent path and it must keep accumulated fields.
-apex _register-member '%1' "$MANAGER" monitor pr:43 "$WT" '' '' review claude '' '' 43 >/dev/null 2>&1
+contains "the replacement is recorded where stderr cannot be swallowed" \
+	'"event":"stale-record-replaced"' "$(cat "$APEX_ROOT/$MANAGER/events.jsonl")"
+
+# Registration is the birth of a member, so it never inherits a conversation id
+# — not even from a record on the same key with the same task. Pane ids get
+# recycled, and a new agent pointed at a dead agent's conversation is the same
+# bug as the stale record above, just harder to see.
 apex_root_file="$APEX_ROOT/$MANAGER/members/recycled:%1.json"
-jq '. + {agent_session_id:"kept-id"}' "$apex_root_file" > "$apex_root_file.t" && mv "$apex_root_file.t" "$apex_root_file"
+jq '. + {agent_session_id:"stale-id"}' "$apex_root_file" > "$apex_root_file.t"
+mv "$apex_root_file.t" "$apex_root_file"
 apex _register-member '%1' "$MANAGER" monitor pr:43 "$WT" '' '' review claude '' '' 43 >/dev/null 2>&1
-eq "an unchanged re-registration preserves the conversation id" "kept-id" \
+eq "registration never inherits a conversation id" "" \
+	"$(jq -r '.agent_session_id' "$apex_root_file")"
+apex _register-member '%1' "$MANAGER" monitor pr:43 "$WT" '' '' review claude '' '' 43 fresh-id >/dev/null 2>&1
+eq "…and takes the one it is given" "fresh-id" \
 	"$(jq -r '.agent_session_id' "$apex_root_file")"
 
 # ─── 6. one task per member ──────────────────────────────────────────

@@ -46,6 +46,13 @@ delta_task_prompt() {
 # the prompt above, stable across autonomous/interactive mode. This is what
 # transcript matching keys on; keep it a prefix of every variant emitted by
 # delta_task_prompt for the same task.
+#
+# The match is a prefix match, so a marker MUST end where the task id ends and
+# nothing may extend it: "/my-pr-review 4" prefixes "/my-pr-review 43", which
+# had `recover` on PR #4 resume PR #43's conversation in the same worktree. The
+# issue marker is terminated by its own "." — the PR marker has no such
+# character, so _claude_session_for requires the marker to be followed by end of
+# string or a space rather than trusting the marker to terminate itself.
 delta_task_marker() {
 	local issue="$1" pr="$2"
 	if [[ -n $issue ]]; then
