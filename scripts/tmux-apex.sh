@@ -731,6 +731,21 @@ _pair_relay() {
 	return 0
 }
 
+# _pair_rollback <manager> <member> <pair> <round> <turn>
+#
+# Undo the pair state written ahead of a relay that then failed to deliver.
+# The pre-write is deliberate (it must not race the wake-up it causes), so the
+# undelivered case is the one that has to clean up after it.
+_pair_rollback() {
+	local manager="$1" round="$4" turn="$5" m
+	for m in "$2" "$3"; do
+		[[ -n $m ]] || continue
+		apex_member_merge "$manager" "$m" "$(jq -nc \
+			--argjson r "$round" --arg t "$turn" \
+			'{pair_round:$r, pair_turn:$t}')"
+	done
+}
+
 # _pair_escalate <manager> <member> <state> <message>
 #
 # Terminal state for the loop: mark both halves, then make the *worker* the
@@ -863,6 +878,12 @@ _pair_advance() {
 			"$(jq -nc --argjson r "$next" '{pair_round:$r, pair_turn:"worker"}')"
 		if ! _pair_relay "$manager" "$pair" \
 			"$(_pair_worker_msg "$pr" "$next" "$findings" "$note")"; then
+			# Roll the pre-written state back: nobody performed round
+			# $next, and leaving it bumped spends one of the cap's
+			# attempts on a round that never happened — which now costs
+			# more, since `pair-resume` refuses to resume at the cap
+			# without a raised --max-rounds.
+			_pair_rollback "$manager" "$member" "$pair" "$round" reviewer
 			_pair_escalate "$manager" "$member" stuck \
 				"PAIRED REVIEW STUCK: could not deliver the reviewer's ${findings} finding(s) on PR #${pr} to the worker ($pair) — no reachable coding agent in that pane."
 			return 0
@@ -872,6 +893,7 @@ _pair_advance() {
 		apex_member_merge "$manager" "$pair" '{"pair_turn":"reviewer"}'
 		if ! _pair_relay "$manager" "$pair" \
 			"$(_pair_reviewer_msg "$pr" "$round" rereview)"; then
+			_pair_rollback "$manager" "$member" "$pair" "$round" worker
 			_pair_escalate "$manager" "$member" stuck \
 				"PAIRED REVIEW STUCK: the worker finished round ${round} on PR #${pr} but the reviewer ($pair) could not be reached — no reachable coding agent in that pane."
 			return 0
@@ -981,11 +1003,12 @@ _cmd_pair_resume() {
 	manager=$(_require_manager)
 	APEX_SESSION="$manager"
 
-	local pair pr role round max
+	local pair pr role round max reviewer
 	pair=$(apex_member_get "$manager" "$member" pair)
 	[[ -n $pair ]] || _die "pair-resume: '$member' is not linked to a partner"
 	pr=$(apex_member_get "$manager" "$member" pair_pr)
 	role=$(apex_member_get "$manager" "$member" pair_role)
+	[[ $role == reviewer ]] && reviewer="$member" || reviewer="$pair"
 	round=$(apex_member_get "$manager" "$member" pair_round); [[ -n $round ]] || round=1
 	max=$(apex_member_get "$manager" "$member" pair_max_rounds); [[ -n $max ]] || max=$APEX_PAIR_MAX_ROUNDS
 
@@ -1000,9 +1023,6 @@ _cmd_pair_resume() {
 		_die "pair-resume: round ${round} is already at the cap (${max}), so the loop would escalate again on the reviewer's first finding. Raise it: pair-resume ${member} --max-rounds $(( max + 2 ))"
 	fi
 
-	local reviewer
-	[[ $role == reviewer ]] && reviewer="$member" || reviewer="$pair"
-
 	local m
 	for m in "$member" "$pair"; do
 		# Do not resurrect a reaped partner as a phantom member — `status`
@@ -1012,6 +1032,17 @@ _cmd_pair_resume() {
 			'{pair_state:"active", pair_turn:"reviewer", pair_message:"",
 			  pair_max_rounds:$max}')"
 	done
+
+	# Clear the reviewer's verdict. A resume re-invokes the reviewer for the
+	# *same* round, and the freshness check only compares verdict_round to
+	# pair_round — so a verdict recorded before the loop got stuck would be
+	# accepted as this round's, relaying stale findings and skipping the
+	# no-verdict escalation entirely. Resuming is a request for a fresh
+	# verdict; the old one must not satisfy it.
+	if [[ -f $(apex_member_file "$manager" "$reviewer") ]]; then
+		apex_member_merge "$manager" "$reviewer" \
+			'{"verdict_round":"","verdict_findings":"","verdict_note":""}'
+	fi
 
 	_pair_relay "$manager" "$reviewer" "$(_pair_reviewer_msg "$pr" "$round" rereview)" \
 		|| _die "pair-resume: could not reach the reviewer ($reviewer)"

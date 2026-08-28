@@ -418,8 +418,10 @@ was recorded, the partner's pane is gone, or the relay could not be delivered.
 Only then does the manager get a ping, and the message says which of those it
 is. `pair-resume` on a loop that stuck *at the cap* requires a higher
 `--max-rounds`: resuming at `round == max` would burn a full review turn and
-re-escalate on the reviewer's first finding. The terminal ping is framed as the decision that is actually the human's —
-the merge call — not as a generic "a member went idle".
+re-escalate on the reviewer's first finding. Resuming also clears the reviewer's
+last verdict, so a stale one cannot pass for the resumed round's. The terminal
+ping is framed as the decision that is actually the human's — the merge call —
+not as a generic "a member went idle".
 
 ### How reporting works
 
@@ -564,9 +566,9 @@ directions, the round cap, a missing verdict, an unreachable or dead partner, a
 failed `gh pr ready`, and the two properties the feature exists for — no manager
 ping on an intermediate round, exactly one on termination. It also pins down the
 option parsers: zsh's `shift 2` with a missing value leaves `$#` unchanged, so
-every two-argument flag is asserted to fail fast rather than spin. tmux is a file-backed
-option-store stub and `gh` records its argv, so member state is the real thing
-but nothing touches a live PR.
+every two-argument flag is asserted to fail fast rather than spin. tmux is a
+file-backed option-store stub and `gh` records its argv, so member state is the
+real thing but nothing touches a live PR.
 
 It also pins the two halves together: `install-agent-hooks.sh` runs into a
 throwaway `$HOME` and `doctor` has to accept what it wrote, both from scratch and

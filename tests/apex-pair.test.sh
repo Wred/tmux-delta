@@ -337,8 +337,23 @@ eq "the raised cap lands on both halves (worker)"   4 "$(mget "$WORKER" pair_max
 eq "the raised cap lands on both halves (reviewer)" 4 "$(mget "$REVIEWER" pair_max_rounds)"
 contains "and the reviewer is re-invoked" "Re-review" "$(sent_to %2)"
 
-# The point of raising it: the next round must actually make progress rather
-# than re-escalating immediately.
+# A resume re-invokes the reviewer for the *same* round, and the freshness check
+# only compares verdict_round to pair_round — so without clearing it, the
+# verdict recorded before the loop got stuck passes for the resumed round's.
+# That relays stale findings and skips the no-verdict escalation, in the one
+# property the whole design rests on. (PR #13 re-review.)
+eq "resume clears the stale verdict round"    "" "$(mget "$REVIEWER" verdict_round)"
+eq "resume clears the stale verdict findings" "" "$(mget "$REVIEWER" verdict_findings)"
+: > "$STUB_SENT"
+settle "$REVIEWER" >/dev/null
+contains "a resumed reviewer that records nothing is escalated, not believed" \
+	"without recording a verdict" "$(apex pending)"
+eq "and no stale findings are relayed" "" "$(sent_to %1)"
+eq "loop is stuck again, honestly" stuck "$(mget "$WORKER" pair_state)"
+
+# The point of raising the cap: with a *fresh* verdict, the next round must
+# actually make progress rather than re-escalating immediately.
+apex pair-resume "$WORKER" --max-rounds 5 >/dev/null
 : > "$STUB_SENT"
 verdict --findings 1 >/dev/null
 settle "$REVIEWER" >/dev/null
@@ -352,6 +367,26 @@ reset --max=3
 rm -f "$MEMBERS/$REVIEWER.json"
 apex pair-resume "$WORKER" >/dev/null
 eq "the reaped member file stays gone" "" "$(print -r -- "$MEMBERS/$REVIEWER.json"(N))"
+
+# ── an undeliverable relay must not spend a round ────────────────────
+# The pair state is written ahead of the relay on purpose (it must not race the
+# wake-up it causes), so the undelivered case has to roll it back — otherwise a
+# round nobody performed eats one of the cap's attempts, which now costs a
+# mandatory --max-rounds bump to recover from. (PR #13 re-review.)
+print "\nan undeliverable relay does not consume a round"
+reset --max=3
+verdict --findings 2 >/dev/null
+export STUB_PANE_CMD=zsh          # the worker's pane is no longer an agent
+settle "$REVIEWER" >/dev/null
+unset STUB_PANE_CMD
+contains "the stuck ping names the delivery failure" "no reachable coding agent" "$(apex pending)"
+eq "the round is rolled back (worker)"   1 "$(mget "$WORKER" pair_round)"
+eq "the round is rolled back (reviewer)" 1 "$(mget "$REVIEWER" pair_round)"
+eq "and so is the turn" reviewer "$(mget "$WORKER" pair_turn)"
+# With the round rolled back, resuming does not need the cap raised.
+out=$(apex pair-resume "$WORKER")
+contains "resume works without raising the cap" "Resumed the loop" "$out"
+contains "and resumes the round that never ran" "round 1 of 3" "$out"
 
 # ── dead partner ─────────────────────────────────────────────────────
 print "\na dead partner escalates"
