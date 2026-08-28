@@ -409,6 +409,8 @@ tmux-apex.sh send <session> "rebase on main, CI is red"
 tmux-apex.sh link --worker wt:%3 --reviewer wt:%7   # automatic fix/re-review loop
 tmux-apex.sh status                  # or --json
 tmux-apex.sh reap --yes              # remove finished/dead members
+tmux-apex.sh recover                 # dry run: what a tmux crash took out
+tmux-apex.sh recover --yes           # recreate those panes, resuming their conversations
 tmux-apex.sh stop
 ```
 
@@ -727,6 +729,30 @@ them when launching the agent:
 | `@agent_icons` | any session | rendered per-agent icon string |
 | `@agent_icons_outline` | any session | same, outline glyphs, for the selected pill |
 
+### Crash recovery
+
+Members are pane-scoped, so a tmux server crash (or `kill-server`) takes every
+worker with it while the durable member records under
+`$XDG_CACHE_HOME/tmux-delta/apex/<manager>/members/` survive. `recover` walks
+those records, and for each one whose pane is gone it recreates the session and
+pane and restarts the agent **on its original conversation** rather than from a
+blank context.
+
+It can do that because registration records an `agent_session_id` field: the
+Claude Code conversation id, discovered from the transcript under
+`~/.claude/projects/<mangled-worktree>/<id>.jsonl` by matching `cwd` plus the
+opening task prompt (a worker and its reviewer share a worktree, so the prompt
+is the only thing that tells them apart — hence the single copy of that text in
+`scripts/lib/agent-prompts.sh`). The id only exists after the member's first
+turn, so it is filled in on the member's first `event` call, not at spawn.
+
+`recover` is a dry run by default, like `reap`; `--yes` acts. Pass member keys
+to limit it. It skips members whose worktree is gone, and members whose task is
+already live in a pane. When no conversation can be resumed it says so and
+starts a fresh one on the same task. Non-claude agents always restart fresh —
+their thread ids are recorded but not yet wired to a resume flag.
+
+
 ## Tests
 
 ```bash
@@ -734,11 +760,12 @@ tests/apex-delivery.test.sh
 tests/apex-send.test.sh
 tests/apex-pair.test.sh
 tests/apex-watch.test.sh
+tests/apex-recover.test.sh
 tests/agent-icons.test.sh
 tests/status-format.test.sh
 ```
 
-All six stub `tmux`, so none of them needs a tmux server or a live agent.
+All seven stub `tmux`, so none of them needs a tmux server or a live agent.
 
 Covers apex ping delivery: which output channel `apex-manager-notify.sh` picks
 per event, that an invocation which cannot deliver also does not *consume*
@@ -785,6 +812,14 @@ urgency colour, and that `--ack` reaches the current window's panes only.
 used in a format string is actually assigned (an unset one expands to nothing in
 tmux and silently unstyles a pill), and both icon slots are present in both
 pill branches.
+
+`tests/apex-recover.test.sh` covers crash recovery: picking a worker's own
+conversation out of a worktree it shares with its reviewer, `--resume` argv
+construction and its fresh-start fallback, `recover`'s dry run / `--yes` /
+idempotency, recycled pane ids not corrupting an existing member's record, one
+task per member (never `issue:42pr:43`), and an apex spawn into a session that
+already has a member landing in its own new pane without rewriting that
+session's `CODING_AGENT_*` env. `tmux`, `gh` and `git` are stubbed.
 
 ## Shell functions (gwt.zsh)
 
