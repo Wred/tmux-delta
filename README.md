@@ -500,12 +500,18 @@ so the watcher is guarded rather than trusted:
 | an unparseable state file is reset and the tick skipped | every key then reads `""`, and `""` is not a safe default anywhere: it makes the debounce stop debouncing and the grace window expire instantly, i.e. a nudge per second that clears the box each time |
 | one unparseable *member* file only loses its own member | the cheap gate slurps every member file in one `jq`, and a slurp aborts on the first bad document — returning "nothing pending" for the whole set, from a poller that keeps reporting itself healthy |
 
-"Quiet" is not only a timer. `client_activity` is the last time an attached
-client sent *input* (unlike `session_activity`, which also moves on pane
-output), and ghost text is painted with no client activity at all — so a human
-using the session keeps their draft for as long as they keep using it, while an
-unattended pane still expires on schedule. The window closes either way, so
-ghost text delays delivery; it never blocks it.
+"Quiet" is not only a timer. `client_activity` is a per-client attribute — the
+last time that client sent input — and it stays frozen while a pane emits output
+with nobody typing, so recent input from a client *looking at the manager's
+pane* pushes the clock forward and a human pausing mid-draft keeps their draft.
+Scoped to that pane on purpose: read across the whole session it would count
+typing in a sibling shell, a window switch or a scroll as evidence of a draft,
+and defer for as long as anyone worked next door. It is also capped at twice the
+grace window measured from when the box was first seen, so the window closes on
+schedule whatever the signal says — ghost text delays delivery, it never blocks
+it, unconditionally rather than only once the human stops. The signal is treated
+as a reason to defer and never as permission to clear; the timer is what
+guarantees delivery.
 
 Tunable with `APEX_WATCH_INTERVAL` (1s), `APEX_WATCH_BOX_GRACE` (60s) and
 `APEX_WATCH_RENUDGE` (60s); all three are validated as numbers before the loop

@@ -38,9 +38,16 @@ cat > "$BIN/tmux" <<'STUB'
 case "$1" in
 	capture-pane) cat "$PANE_FILE" ;;
 	list-panes)   printf '%s\n' "$MGR_PANE" ;;
-	list-clients) [ -n "${CLIENT_ACTIVITY:-}" ] && printf '%s\n' "$CLIENT_ACTIVITY" ;;
+	list-clients) [ -n "${CLIENT_ACTIVITY:-}" ] && printf '%s\n' "client-0" ;;
 	has-session)  exit 0 ;;
-	display-message) printf '%s\n' "${PANE_CMD:-node}" ;;
+	display-message)
+		case "$*" in
+			*client_activity*) printf '%s\n' "$CLIENT_ACTIVITY" ;;
+			# Which pane the client is looking at — $CLIENT_PANE lets a test put
+			# it on a sibling pane rather than the manager's.
+			*pane_id*)         printf '%s\n' "${CLIENT_PANE:-$MGR_PANE}" ;;
+			*)                 printf '%s\n' "${PANE_CMD:-node}" ;;
+		esac ;;
 	show-option)  printf '%s\n' "" ;;
 	send-keys)
 		shift; args="$*"
@@ -56,7 +63,7 @@ STUB
 chmod +x "$BIN/tmux"
 export PATH="$BIN:$PATH"
 export PANE_FILE="$TMPROOT/pane" KEYS_LOG="$TMPROOT/keys" MGR_PANE='%1'
-export PANE_CMD=node
+export PANE_CMD=node CLIENT_ACTIVITY="" CLIENT_PANE=""
 export EMPTY_BOX='│ >                                    │'
 export XDG_CACHE_HOME="$TMPROOT/cache"
 
@@ -302,6 +309,37 @@ APEX_WATCH_BOX_GRACE=0
 tick >/dev/null
 contains "an unattended stale box still gets delivery" "[apex] a member just changed state" "$(keys)"
 APEX_WATCH_BOX_GRACE=60
+
+# client_activity is a *client* attribute, so an unscoped read counts typing in
+# a sibling shell pane, a window switch or a scroll as "mid-draft in the
+# manager's box" — which defers delivery for as long as someone works next door.
+reset
+member 'w:%7' idle 3 -1
+print -r -- '│ > ghost text the agent painted       │' > "$PANE_FILE"
+tick >/dev/null
+export CLIENT_ACTIVITY=$(date +%s) CLIENT_PANE='%99'   # busy, but next door
+APEX_WATCH_BOX_GRACE=0
+: > "$KEYS_LOG"
+tick >/dev/null
+contains "activity in a sibling pane does not defer" "[apex] a member just changed state" "$(keys)"
+export CLIENT_PANE=""
+APEX_WATCH_BOX_GRACE=60
+
+# And the extension is capped from box_since, so "ghost text delays delivery,
+# never blocks it" holds unconditionally rather than only once the human stops.
+reset
+member 'w:%7' idle 3 -1
+print -r -- '│ > ghost text the agent painted       │' > "$PANE_FILE"
+now=$(date +%s)
+tick >/dev/null
+# Backdate the box well past 2 x grace while a client keeps reporting activity.
+_apex_watch_save "$MGR" "$(jq -nc --argjson t "$(( now - 500 ))" '{box_since:$t}')"
+export CLIENT_ACTIVITY=$now
+APEX_WATCH_BOX_GRACE=60
+: > "$KEYS_LOG"
+tick >/dev/null
+contains "continuous client activity cannot defer past the cap" "[apex] a member just changed state" "$(keys)"
+export CLIENT_ACTIVITY=""
 
 # ── pidfile ownership ────────────────────────────────────────────────
 # The pidfile outlives reboots under $XDG_CACHE_HOME, after which the pid has

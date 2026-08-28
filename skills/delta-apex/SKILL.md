@@ -275,7 +275,8 @@ check `tmux-apex.sh watch --status` and start it with `tmux-apex.sh watch`.
 A ping that is late rather than missing is usually the poller deferring to
 unsent text in your own input box — it will not type over something a human
 looks to be working on. It clears and delivers once the box has been quiet for
-a while, so this costs latency, never the event.
+a while, and there is a hard cap on how long that can take, so this costs
+latency and never the event.
 
 The other reason to hear nothing is that delivery was never wired up on your
 side. Run `tmux-apex.sh doctor` — it names the missing hooks and prints the

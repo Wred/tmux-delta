@@ -1910,18 +1910,41 @@ _apex_watch_save() {
 	apex_write_atomic "$f" "$merged"
 }
 
-# _apex_client_activity <manager> — epoch seconds of the most recent input from
-# any client attached to <manager>'s session, or "" if nobody is attached.
+# _apex_client_activity <manager> <pane> — epoch seconds of the most recent
+# input from a client that is currently looking at <pane>, or "" if there is no
+# such client.
 #
-# Deliberately client_activity and not session_activity: the latter also moves
-# on pane *output*, which an agent produces constantly, so it would read as
-# "human present" forever.
+# client_activity is a *client* attribute, so `list-clients -t <session>` alone
+# answers a broader question than the one being asked: it would count typing in
+# a sibling shell pane, a window switch, or a scroll in copy-mode as evidence
+# that the human is mid-draft in the manager's box. In a session where someone
+# works steadily next door, that defers delivery for as long as they keep
+# working — a partial return of the blindness this whole path exists to fix. So
+# narrow it to clients whose active pane really is the manager's.
+#
+# One `display-message` per attached client is more tmux calls than the tick
+# budget would like, but this only runs on the cold path: something is pending,
+# the box is non-empty, and it has not changed since the last tick.
+#
+# Treat this as a conservative extra reason to *defer*, never as the thing that
+# authorises a clear — the `box_since` timer below is what guarantees the window
+# eventually closes. Two limits worth naming: whether client_activity advances
+# on every keystroke is not something this repo can assert (it cannot synthesise
+# real client input — `send-keys` goes through the server, not a client's tty),
+# and observation only confirms the half that matters, that it stays frozen
+# while a pane emits output with nobody typing.
 _apex_client_activity() {
-	local t
-	t=$(tmux list-clients -t "=$1" -F '#{client_activity}' 2>/dev/null \
-		| sort -rn | head -n 1)
-	[[ $t =~ '^[0-9]+$' ]] || return 0
-	print -r -- "$t"
+	local manager="$1" pane="$2" c t best=""
+	[[ -n $pane ]] || return 0
+	for c in ${(f)"$(tmux list-clients -t "=$manager" -F '#{client_name}' 2>/dev/null)"}; do
+		[[ -n $c ]] || continue
+		[[ $(tmux display-message -p -c "$c" '#{pane_id}' 2>/dev/null) == "$pane" ]] || continue
+		t=$(tmux display-message -p -c "$c" '#{client_activity}' 2>/dev/null)
+		[[ $t =~ '^[0-9]+$' ]] || continue
+		[[ -z $best ]] || (( t > best )) && best=$t
+	done
+	[[ -n $best ]] && print -r -- "$best"
+	return 0
 }
 
 # _apex_watch_tick <manager> — one poll. Prints a line per action taken so
@@ -1975,17 +1998,20 @@ _apex_watch_tick() {
 			print -r -- "manager input box busy; deferring"
 			return 0
 		fi
-		# The grace window is really asking "is a human present?", and a timer
-		# is only a proxy for it. tmux answers it directly: client_activity is
-		# the last time an attached client sent input, and ghost text is painted
-		# with no client activity at all. So let recent client activity push the
-		# clock forward — someone using the session keeps their draft safe for
-		# as long as they keep using it — while an unattended pane still expires
-		# on schedule. Bounded either way: the window still closes once they
-		# stop, so ghost text delays delivery, it never blocks it.
+		# The grace window is really asking "is a human present at this box?",
+		# and a plain timer is only a proxy for it. Recent input from a client
+		# looking at this pane pushes the clock forward, so someone pausing
+		# mid-draft keeps their draft — but only up to a hard cap measured from
+		# when the box was first seen, so the window closes on schedule whatever
+		# the activity signal says. Without that cap "ghost text delays delivery,
+		# it never blocks it" would hold only while the human eventually stops.
 		local since=$(( now - box_since )) act
-		act=$(_apex_client_activity "$manager")
-		[[ -n $act ]] && (( now - act < since )) && since=$(( now - act ))
+		act=$(_apex_client_activity "$manager" "$pane")
+		if [[ -n $act ]] && (( now - act < since )); then
+			since=$(( now - act ))
+			local cap=$(( 2 * APEX_WATCH_BOX_GRACE ))
+			(( now - box_since >= cap )) && since=$(( now - box_since ))
+		fi
 		if (( since < APEX_WATCH_BOX_GRACE )); then
 			print -r -- "manager input box in use ${since}s ago; deferring"
 			return 0
