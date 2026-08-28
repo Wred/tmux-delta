@@ -1000,7 +1000,7 @@ _pair_reviewer_msg() {
 # (_deliver rc 5) is a failure here even though a human `send` treats it as
 # recoverable: the text sits in the box unread, so the partner never wakes.
 #
-# Whatever the pane-clearing discarded (APEX_SEND_CLEARED, see _send_to_pane)
+# Whatever the box held before the send (APEX_SEND_CLEARED, see _send_to_pane)
 # is recorded as cleared_input on the event, the same as `send` does — and on
 # the failure path too, since a draft destroyed by a relay that then failed is
 # exactly as gone. This is the one delivery path that is both unattended and
