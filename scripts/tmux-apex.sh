@@ -30,6 +30,21 @@ APEX_QUIET_SECS=${APEX_QUIET_SECS:-30}
 
 _die() { print -u2 "tmux-apex: $*"; exit 1; }
 
+# _need_val <context> <flag> $# — guard a two-argument option.
+#
+# zsh's `shift 2` with only one positional left fails *and leaves $# unchanged*,
+# so an unguarded `while (( $# ))` parser spins at 100% CPU forever on a dropped
+# value. That is not merely a bad error message here: `verdict` is run by the
+# reviewer agent itself, and a wedged pane never reaches its Stop hook — so
+# `_settle` never runs and the loop's own "reviewer went idle without a verdict"
+# escalation never fires either. The pair just hangs, silently.
+#
+# Takes the remaining argument count rather than the value, so an intentionally
+# empty value (`--note ''`) is still accepted.
+_need_val() {
+	(( $3 >= 2 )) || _die "$1: $2 needs a value"
+}
+
 _cur_session() {
 	tmux display-message -p '#S' 2>/dev/null
 }
@@ -275,7 +290,14 @@ _send_to_pane() {
 	text=${text//$'\r'/ }
 	[[ -z $text ]] && return 1
 
+	# APEX_SEND_CLEARED is the pre-send box read, taken before we know whether
+	# clearing will take. APEX_SEND_SPLICED says it did not: the text below is
+	# still in the box and our message got appended to it. Callers that log
+	# APEX_SEND_CLEARED must log this too — "we discarded a draft" and "we
+	# garbled our own instruction onto one" are opposite outcomes, and on the
+	# relay path the stderr line that distinguishes them is unread by design.
 	APEX_SEND_CLEARED=$(_pane_input_line "$pane" 2>/dev/null)
+	APEX_SEND_SPLICED=""
 	if [[ -n $APEX_SEND_CLEARED ]] && [[ ${APEX_SEND_CLEAR:-1} == 1 ]]; then
 		print -u2 "tmux-apex: pane $pane had unsent input; clearing it before delivery:"
 		print -u2 "  ${APEX_SEND_CLEARED}"
@@ -284,12 +306,14 @@ _send_to_pane() {
 		local unclearable
 		unclearable=$(_clear_pane_input "$pane")
 		if [[ -n $unclearable ]]; then
+			APEX_SEND_SPLICED="$unclearable"
 			print -u2 "tmux-apex: pane $pane input box did not clear; delivery will be"
 			print -u2 "  appended to: ${unclearable}"
 		fi
 	elif [[ -n $APEX_SEND_CLEARED ]]; then
 		# APEX_SEND_CLEAR=0: report, but leave the box alone and let the
 		# splice happen rather than destroying input the operator may want.
+		APEX_SEND_SPLICED="$APEX_SEND_CLEARED"
 		print -u2 "tmux-apex: pane $pane has unsent input and APEX_SEND_CLEAR=0;"
 		print -u2 "  delivering anyway — it will be appended to: ${APEX_SEND_CLEARED}"
 	fi
@@ -592,17 +616,18 @@ _cmd_spawn() {
 
 	while (( $# )); do
 		case "$1" in
-			--issue)            issue="$2"; shift 2 ;;
-			--review-pr)        review_pr="$2"; shift 2 ;;
-			--role)             role="$2"; shift 2 ;;
-			--agent)            agent="$2"; shift 2 ;;
-			--model)            model="$2"; shift 2 ;;
-			--profile)          profile="$2"; shift 2 ;;
+			--issue)      _need_val spawn "$1" $#; issue="$2"; shift 2 ;;
+			--review-pr)  _need_val spawn "$1" $#; review_pr="$2"; shift 2 ;;
+			--role)       _need_val spawn "$1" $#; role="$2"; shift 2 ;;
+			--agent)      _need_val spawn "$1" $#; agent="$2"; shift 2 ;;
+			--model)      _need_val spawn "$1" $#; model="$2"; shift 2 ;;
+			--profile)    _need_val spawn "$1" $#; profile="$2"; shift 2 ;;
 			# --agent-flags is the accurate name: only claude calls this a
 			# "permission mode". Both spellings feed the same slot.
-			--permission-mode|--agent-flags) perm="$2"; shift 2 ;;
-			--mode)             mode="$2"; shift 2 ;;
-			--switch)           switch="switch"; shift ;;
+			--mode)       _need_val spawn "$1" $#; mode="$2"; shift 2 ;;
+			--permission-mode|--agent-flags)
+			              _need_val spawn "$1" $#; perm="$2"; shift 2 ;;
+			--switch)     switch="switch"; shift ;;
 			*) _die "spawn: unknown argument '$1'" ;;
 		esac
 	done
@@ -808,39 +833,81 @@ _send_native() {
 
 # ─── send ────────────────────────────────────────────────────────────
 
+# _deliver <target> <from-label> <text>
+#
+# The delivery half of `send`, factored out so the paired fix/re-review loop
+# (see "pair" below) can relay between two members without going through the
+# manager. Prints nothing; returns non-zero with a reason on stderr-free
+# failure so callers can decide whether that is fatal.
+#
+# Sets _DELIVER_VIA to a human-readable channel description on success.
+#
+# Return codes: 0 delivered; 1 target dead or empty text; 2 no agent pane;
+# 3 pane is not running a coding agent; 4 the send itself failed; 5 the text
+# was typed into the pane but never confirmed submitted (see _send_to_pane).
+# 5 is deliberately distinct from 4: the message *is* sitting in the member's
+# input box, so an operator has something to act on, and `send` reports that
+# rather than a flat failure. Non-interactive callers (the pair loop) still
+# treat it as undelivered — an unsubmitted relay never wakes the partner.
+_DELIVER_VIA=""
+_deliver() {
+	local target="$1" from="$2" text="$3"
+	_DELIVER_VIA=""
+	# Reset here rather than in each caller: the native path never enters
+	# _send_to_pane, so a stale value from an earlier send-keys delivery would
+	# otherwise be logged as this delivery's work.
+	APEX_SEND_CLEARED=""
+	APEX_SEND_SPLICED=""
+	[[ -z $target || -z $text ]] && return 1
+	_member_alive "$target" || return 1
+
+	local full="[apex from:${from:-manager}] ${text}"
+
+	# Native delivery only applies to a tracked apex member — anything else
+	# (a hand-run session, or an agent with no native API) falls straight
+	# through to the tmux send-keys path exactly as before.
+	local manager agent wt pane
+	manager=$(_resolve_manager "$target" 2>/dev/null)
+	if [[ -n $manager ]]; then
+		agent=$(apex_member_get "$manager" "$target" agent)
+		wt=$(apex_member_get "$manager" "$target" worktree)
+		if _send_native "$agent" "$wt" "$full"; then
+			_DELIVER_VIA="native: $agent"
+			return 0
+		fi
+	fi
+
+	pane=$(_agent_pane "$target")
+	[[ -n $pane ]] || return 2
+	_pane_is_agent "$pane" || return 3
+	local src=0
+	_send_to_pane "$pane" "$full" || src=$?
+	(( src == 1 )) && return 4
+	(( src == 2 )) && return 5
+	_DELIVER_VIA="$pane"
+	return 0
+}
+
 _cmd_send() {
 	local target="$1"; shift
 	[[ -z $target ]] && _die "send: usage: send <session> <text>"
 	local text="$*"
 	[[ -z $text ]] && _die "send: empty message"
-	APEX_SEND_CLEARED=""
-
 	_member_alive "$target" || _die "send: session '$target' is not running"
 
-	local from full
+	local from rc manager
 	from=$(_cur_session 2>/dev/null)
-	full="[apex from:${from:-manager}] ${text}"
-
-	# Native delivery only applies to a tracked apex member — anything else
-	# (a hand-run session, or an agent with no native API) falls straight
-	# through to the tmux send-keys path exactly as before.
-	local manager agent wt pane delivered=false
+	# Resolved before delivery, not after: the unconfirmed-send branch below
+	# needs somewhere to record what is now sitting in the member's input box.
 	manager=$(_resolve_manager "$target" 2>/dev/null)
-	if [[ -n $manager ]]; then
-		agent=$(apex_member_get "$manager" "$target" agent)
-		wt=$(apex_member_get "$manager" "$target" worktree)
-		_send_native "$agent" "$wt" "$full" && delivered=true
-	fi
 
-	if ! $delivered; then
-		pane=$(_agent_pane "$target")
-		[[ -n $pane ]] || _die "send: session '$target' has no @agent_pane (no coding agent split?)"
-		_pane_is_agent "$pane" || _die "send: pane $pane of '$target' is not running a coding agent — refusing to send"
-		local rc=0
-		_send_to_pane "$pane" "$full" || rc=$?
-		(( rc == 1 )) && _die "send: delivery failed"
-		if (( rc == 2 )); then
-			print -u2 "tmux-apex: send: text was typed into $pane but never submitted"
+	_deliver "$target" "${from:-manager}" "$text"; rc=$?
+	case $rc in
+		0) ;;
+		2) _die "send: session '$target' has no @agent_pane (no coding agent split?)" ;;
+		3) _die "send: pane $(_agent_pane "$target") of '$target' is not running a coding agent — refusing to send" ;;
+		5)
+			print -u2 "tmux-apex: send: text was typed into $(_agent_pane "$target") but never submitted"
 			print -u2 "  (re-typed and Enter re-sent 3x; still in the input box)"
 			# Record the text: it *is* in the member's pane now and may yet be
 			# submitted by a stray Enter. Without it the log says a send failed
@@ -849,25 +916,490 @@ _cmd_send() {
 			[[ -n $manager ]] && apex_event "$manager" "$(jq -nc \
 				--arg s "$target" --arg from "$from" --arg text "$text" \
 				--arg cleared "${APEX_SEND_CLEARED:-}" \
+				--arg spliced "${APEX_SEND_SPLICED:-}" \
 				'{event:"send-unsubmitted", session:$s, from:$from, text:$text}
-				 + (if $cleared != "" then {cleared_input:$cleared} else {} end)')"
+				 + (if $cleared != "" then {cleared_input:$cleared} else {} end)
+				 + (if $spliced != "" then {spliced_onto:$spliced} else {} end)')"
 			_die "send: delivery unconfirmed"
-		fi
-	fi
+			;;
+		*) _die "send: delivery failed" ;;
+	esac
 
 	[[ -z $manager ]] && manager="$from"
 	[[ -n $manager ]] && apex_event "$manager" "$(jq -nc \
 		--arg s "$target" --arg from "$from" --arg text "$text" \
 		--arg cleared "${APEX_SEND_CLEARED:-}" \
+		--arg spliced "${APEX_SEND_SPLICED:-}" \
 		'{event:"send", session:$s, from:$from, text:$text}
-		 + (if $cleared != "" then {cleared_input:$cleared} else {} end)')"
+		 + (if $cleared != "" then {cleared_input:$cleared} else {} end)
+		 + (if $spliced != "" then {spliced_onto:$spliced} else {} end)')"
 
-	if $delivered; then
-		print "Delivered to $target (native: $agent)."
+	print "Delivered to $target (${_DELIVER_VIA})."
+	if [[ -n ${APEX_SEND_SPLICED:-} ]]; then
+		print "WARNING: input box would not clear; this was appended to: ${APEX_SEND_SPLICED}"
+	elif [[ -n ${APEX_SEND_CLEARED:-} ]]; then
+		print "Cleared unsent input first: ${APEX_SEND_CLEARED}"
+	fi
+}
+
+# ─── paired worker↔reviewer fix/re-review loop (issue #9) ────────────
+#
+# Two members already working the same PR (a `worker` on the issue and a
+# `monitor` spawned with --review-pr) are, by default, independent records
+# keyed by session:pane with no relationship between them. `link` records
+# that relationship on both sides, after which every idle transition of
+# either one is relayed straight to the other instead of surfacing to the
+# manager:
+#
+#   reviewer idle → verdict says N>0 findings → relay to worker, round++
+#   worker   idle → relay "re-review" to reviewer
+#   reviewer idle → verdict says 0 findings   → `gh pr ready`, ping manager
+#
+# The termination signal is a real check, not a text-scrape of the review
+# prose: the reviewer is required to record `verdict --findings N` (or
+# --none) before it stops. A reviewer that goes idle without recording one
+# halts the loop and escalates, because "no verdict" and "no findings" are
+# very different states and guessing between them silently flips a PR to
+# ready-for-review.
+#
+# Member fields owned by this section:
+#   pair            other member's key ("session:%pane")
+#   pair_role       worker | reviewer   (this member's role in the loop)
+#   pair_pr         PR number the loop is about
+#   pair_round      1-based round counter
+#   pair_max_rounds cap; exceeding it escalates as "stuck", never loops on
+#   pair_turn       worker | reviewer — whose idle transition relays next
+#   pair_state      active | complete | stuck
+#   pair_message    escalation text for `pending` to surface, once terminal
+#   verdict_round / verdict_findings / verdict_note   last recorded verdict
+
+APEX_PAIR_MAX_ROUNDS=${APEX_PAIR_MAX_ROUNDS:-5}
+
+_pair_worker_msg() {
+	local pr="$1" round="$2" findings="$3" note="$4"
+	print -r -- "PAIRED REVIEW round ${round}: the reviewer on PR #${pr} recorded ${findings} finding(s) worth addressing${note:+ — \"${note}\"}. Read them with 'gh pr view ${pr} --comments' and 'gh api repos/{owner}/{repo}/pulls/${pr}/comments'. Fix every BUG/CONCERN finding and push to the PR branch; for anything you disagree with, reply on that review thread saying why rather than silently skipping it. Do NOT message the manager or wait for a human — when your commits are pushed, just stop. The reviewer is re-invoked automatically."
+}
+
+_pair_reviewer_msg() {
+	local pr="$1" round="$2" kind="$3"
+	local lead
+	if [[ $kind == initial ]]; then
+		lead="PAIRED REVIEW round ${round}: you are now the reviewer half of an automatic fix/re-review loop on PR #${pr}."
 	else
-		print "Delivered to $target ($pane)."
-		[[ -n ${APEX_SEND_CLEARED:-} ]] && \
-			print "Cleared unsent input first: ${APEX_SEND_CLEARED}"
+		lead="PAIRED REVIEW round ${round}: the worker pushed fixes for PR #${pr}. Re-review it (/my-pr-review ${pr}), covering the findings you raised last round and anything new in the diff. Post findings as PR comments as usual."
+	fi
+	print -r -- "${lead} Before you stop you MUST record a machine-readable verdict — the loop halts and escalates to a human without one: run 'tmux-apex.sh verdict --findings <count worth addressing>', or 'tmux-apex.sh verdict --none' if nothing is left worth fixing. Count BUG/CONCERN findings, plus any SUGGESTION you genuinely think should be acted on; do not count nits you would not block on. Recording --none flips the PR out of draft and hands it to a human, so only do that when you would approve it. Do NOT message the manager."
+}
+
+# _pair_relay <manager> <target> <text> — deliver, or halt the loop if the
+# partner cannot be reached. A relay that silently fails would strand both
+# members idle with nobody notified.
+#
+# On failure, sets _PAIR_RELAY_WHY to a phrase naming the cause, so the
+# escalation says something an operator can act on. An unsubmitted relay
+# (_deliver rc 5) is a failure here even though a human `send` treats it as
+# recoverable: the text sits in the box unread, so the partner never wakes.
+#
+# Whatever the box held before the send (APEX_SEND_CLEARED, see _send_to_pane)
+# is recorded as cleared_input on the event, the same as `send` does — and on
+# the failure path too, since a draft destroyed by a relay that then failed is
+# exactly as gone. This is the one delivery path that is both unattended and
+# unwatched: it runs from _cmd_settle under `tmux run-shell -b -d`, so
+# _send_to_pane's stderr report has no operator reading it, and the event log
+# is the only place the discarded text survives.
+#
+# If clearing did not take, the delivery was appended to whatever was there
+# (APEX_SEND_SPLICED) and the event says spliced_onto instead. The distinction
+# is the point: a discarded draft is a lost note, but a spliced one means the
+# partner agent received `<draft><relay>` as a single garbled instruction, and
+# an unattended loop has no other way to say so.
+_PAIR_RELAY_WHY=""
+_pair_relay() {
+	local manager="$1" target="$2" text="$3" rc=0
+	_PAIR_RELAY_WHY=""
+	_deliver "$target" "apex-pair" "$text" || rc=$?
+	local ev
+	ev=$(jq -nc --arg s "$target" --arg text "$text" \
+		--arg cleared "${APEX_SEND_CLEARED:-}" \
+		--arg spliced "${APEX_SEND_SPLICED:-}" --argjson rc "$rc" \
+		'{session:$s, text:$text}
+		 + (if $rc != 0 then {rc:$rc} else {} end)
+		 + (if $cleared != "" then {cleared_input:$cleared} else {} end)
+		 + (if $spliced != "" then {spliced_onto:$spliced} else {} end)')
+	if (( rc )); then
+		case $rc in
+			5) _PAIR_RELAY_WHY="the relay was typed into that pane but never submitted; it is sitting unsent in the input box" ;;
+			2|3) _PAIR_RELAY_WHY="no reachable coding agent in that pane" ;;
+			*) _PAIR_RELAY_WHY="delivery to that pane failed" ;;
+		esac
+		apex_event "$manager" \
+			"$(print -r -- "$ev" | jq -c '{event:"pair-relay-failed"} + .')"
+		return 1
+	fi
+	apex_event "$manager" \
+		"$(print -r -- "$ev" | jq -c '{event:"pair-relay"} + .')"
+	return 0
+}
+
+# _pair_rollback <manager> <member> <pair> <round> <turn>
+#
+# Undo the pair state written ahead of a relay that then failed to deliver.
+# The pre-write is deliberate (it must not race the wake-up it causes), so the
+# undelivered case is the one that has to clean up after it.
+_pair_rollback() {
+	local manager="$1" round="$4" turn="$5" m
+	for m in "$2" "$3"; do
+		[[ -n $m ]] || continue
+		apex_member_merge "$manager" "$m" "$(jq -nc \
+			--argjson r "$round" --arg t "$turn" \
+			'{pair_round:$r, pair_turn:$t}')"
+	done
+}
+
+# _pair_escalate <manager> <member> <state> <message>
+#
+# Terminal state for the loop: mark both halves, then make the *worker* the
+# member the manager is told about (it owns the PR) with pinged_seq reset so
+# `pending` is guaranteed to surface it once, even if this member's current
+# seq was already delivered.
+_pair_escalate() {
+	local manager="$1" member="$2" state="$3" msg="$4"
+	local pair worker
+	pair=$(apex_member_get "$manager" "$member" pair)
+	if [[ $(apex_member_get "$manager" "$member" pair_role) == worker ]]; then
+		worker="$member"
+	else
+		worker="$pair"
+	fi
+	[[ -n $worker ]] || worker="$member"
+
+	local m
+	for m in "$member" "$pair"; do
+		[[ -n $m ]] || continue
+		apex_member_merge "$manager" "$m" \
+			"$(jq -nc --arg st "$state" '{pair_state:$st}')"
+	done
+
+	apex_member_merge "$manager" "$worker" "$(jq -nc \
+		--arg msg "$msg" --arg st attention --argjson p -1 \
+		'{pair_message:$msg, status:$st, pinged_seq:$p}')"
+
+	# Escalate once, about the PR — not twice, once per pane. The half that
+	# is not carrying the message has its own ping consumed so `pending`
+	# does not also emit a bare "reviewer went idle" line beside it.
+	local seq
+	for m in "$member" "$pair"; do
+		[[ -n $m && $m != "$worker" ]] || continue
+		seq=$(apex_member_get "$manager" "$m" seq); [[ -n $seq ]] || seq=0
+		apex_member_merge "$manager" "$m" "$(jq -nc --argjson s "$seq" '{pinged_seq:$s}')"
+	done
+
+	apex_event "$manager" "$(jq -nc --arg s "$worker" --arg st "$state" --arg msg "$msg" \
+		'{event:"pair-" + $st, session:$s, message:$msg}')"
+}
+
+_pair_finish() {
+	local manager="$1" member="$2" round="$3"
+	local pair worker pr wt ready_note=""
+	pair=$(apex_member_get "$manager" "$member" pair)
+	if [[ $(apex_member_get "$manager" "$member" pair_role) == worker ]]; then
+		worker="$member"
+	else
+		worker="$pair"
+	fi
+	pr=$(apex_member_get "$manager" "$member" pair_pr)
+	wt=$(apex_member_get "$manager" "$worker" worktree)
+
+	if [[ -n $pr ]]; then
+		if [[ -n $wt && -d $wt ]] && ( cd "$wt" && gh pr ready "$pr" >/dev/null 2>&1 ); then
+			ready_note="PR #${pr} flipped out of draft to ready-for-review."
+		else
+			ready_note="Could not flip PR #${pr} out of draft automatically ('gh pr ready ${pr}' failed) — do it by hand."
+		fi
+	fi
+
+	_pair_escalate "$manager" "$member" complete \
+		"READY FOR HUMAN REVIEW: the paired reviewer found no further findings worth addressing on PR #${pr} after ${round} round(s). ${ready_note} Nothing is left for an agent to do — this needs the human's merge decision."
+}
+
+# _pair_advance <manager> <member>
+#
+# Returns 0 if this idle transition was consumed by the loop (so the caller
+# must not surface it to the manager), 1 if it should fall through to normal
+# reporting.
+_pair_advance() {
+	local manager="$1" member="$2"
+	local pair role state turn round max pr
+	pair=$(apex_member_get "$manager" "$member" pair)
+	[[ -n $pair ]] || return 1
+	state=$(apex_member_get "$manager" "$member" pair_state)
+	[[ $state == active ]] || return 1
+
+	role=$(apex_member_get "$manager" "$member" pair_role)
+	turn=$(apex_member_get "$manager" "$member" pair_turn)
+	[[ $turn == "$role" ]] || return 1     # not this half's move (e.g. the
+	                                       # worker idling before the first
+	                                       # review) — let the manager see it
+
+	round=$(apex_member_get "$manager" "$member" pair_round); [[ -n $round ]] || round=1
+	max=$(apex_member_get "$manager" "$member" pair_max_rounds); [[ -n $max ]] || max=$APEX_PAIR_MAX_ROUNDS
+	pr=$(apex_member_get "$manager" "$member" pair_pr)
+
+	if ! _member_alive "$pair"; then
+		_pair_escalate "$manager" "$member" stuck \
+			"PAIRED REVIEW STUCK: the ${role} on PR #${pr} finished round ${round}, but its partner session ($pair) is gone. The loop cannot continue on its own."
+		return 0
+	fi
+
+	if [[ $role == reviewer ]]; then
+		local vround findings note
+		vround=$(apex_member_get "$manager" "$member" verdict_round)
+		findings=$(apex_member_get "$manager" "$member" verdict_findings)
+		note=$(apex_member_get "$manager" "$member" verdict_note)
+
+		if [[ $vround != "$round" || -z $findings ]]; then
+			_pair_escalate "$manager" "$member" stuck \
+				"PAIRED REVIEW STUCK: the reviewer on PR #${pr} went idle after round ${round} without recording a verdict ('tmux-apex.sh verdict --findings N' / '--none'), so whether findings remain is unknown. Read the review yourself, or re-run the round: tmux-apex.sh pair-resume ${member}"
+			return 0
+		fi
+
+		if (( findings == 0 )); then
+			_pair_finish "$manager" "$member" "$round"
+			return 0
+		fi
+
+		if (( round >= max )); then
+			_pair_escalate "$manager" "$member" stuck \
+				"PAIRED REVIEW STUCK: round ${round} of ${max} on PR #${pr} still has ${findings} open finding(s) — the loop cap is reached, so worker and reviewer are not converging. This needs a human call, not another round."
+			return 0
+		fi
+
+		local next=$(( round + 1 ))
+		# Write the partner's pair state *before* delivering, not after.
+		# Delivery wakes the partner agent, whose own `event set` merges
+		# {status,seq} into the same member file; apex_member_merge is a
+		# lock-free read-modify-write, so a write scheduled after the relay
+		# can lose the pair_turn flip to that agent's — and a lost flip is
+		# silent, not escalated: the partner's next idle falls through to
+		# the manager with a stale round counter.
+		apex_member_merge "$manager" "$member" \
+			"$(jq -nc --argjson r "$next" '{pair_round:$r, pair_turn:"worker"}')"
+		apex_member_merge "$manager" "$pair" \
+			"$(jq -nc --argjson r "$next" '{pair_round:$r, pair_turn:"worker"}')"
+		if ! _pair_relay "$manager" "$pair" \
+			"$(_pair_worker_msg "$pr" "$next" "$findings" "$note")"; then
+			# Roll the pre-written state back: nobody performed round
+			# $next, and leaving it bumped spends one of the cap's
+			# attempts on a round that never happened — which now costs
+			# more, since `pair-resume` refuses to resume at the cap
+			# without a raised --max-rounds.
+			_pair_rollback "$manager" "$member" "$pair" "$round" reviewer
+			_pair_escalate "$manager" "$member" stuck \
+				"PAIRED REVIEW STUCK: could not deliver the reviewer's ${findings} finding(s) on PR #${pr} to the worker ($pair) — ${_PAIR_RELAY_WHY}."
+			return 0
+		fi
+	else
+		apex_member_merge "$manager" "$member" '{"pair_turn":"reviewer"}'
+		apex_member_merge "$manager" "$pair" '{"pair_turn":"reviewer"}'
+		if ! _pair_relay "$manager" "$pair" \
+			"$(_pair_reviewer_msg "$pr" "$round" rereview)"; then
+			_pair_rollback "$manager" "$member" "$pair" "$round" worker
+			_pair_escalate "$manager" "$member" stuck \
+				"PAIRED REVIEW STUCK: the worker finished round ${round} on PR #${pr} but the reviewer ($pair) could not be reached — ${_PAIR_RELAY_WHY}."
+			return 0
+		fi
+	fi
+
+	# Consume the ping: the whole point of the loop is that the manager is
+	# not woken at every idle transition.
+	local seq
+	seq=$(apex_member_get "$manager" "$member" seq); [[ -n $seq ]] || seq=0
+	apex_member_merge "$manager" "$member" "$(jq -nc --argjson s "$seq" '{pinged_seq:$s}')"
+	return 0
+}
+
+_cmd_link() {
+	local worker="" reviewer="" pr="" max="$APEX_PAIR_MAX_ROUNDS"
+	while (( $# )); do
+		case "$1" in
+			--worker)     _need_val link "$1" $#; worker="$2"; shift 2 ;;
+			--reviewer)   _need_val link "$1" $#; reviewer="$2"; shift 2 ;;
+			--pr)         _need_val link "$1" $#; pr="$2"; shift 2 ;;
+			--max-rounds) _need_val link "$1" $#; max="$2"; shift 2 ;;
+			*) _die "link: unknown argument '$1'" ;;
+		esac
+	done
+	[[ -n $worker && -n $reviewer ]] || _die "link: usage: link --worker <session:%pane> --reviewer <session:%pane> [--pr N] [--max-rounds N]"
+	[[ $worker == "$reviewer" ]] && _die "link: worker and reviewer must be different members"
+	[[ $max == <-> ]] && (( max >= 1 )) || _die "link: --max-rounds must be a positive integer"
+
+	local manager
+	manager=$(_require_manager)
+	APEX_SESSION="$manager"
+
+	local m
+	for m in "$worker" "$reviewer"; do
+		[[ -f $(apex_member_file "$manager" "$m") ]] || _die "link: '$m' is not a member of $manager (see 'status')"
+		_member_alive "$m" || _die "link: '$m' is not running"
+	done
+
+	if [[ -z $pr ]]; then
+		pr=$(_member_facts "$worker" | jq -r '.pr_number // ""')
+		[[ -z $pr ]] && pr=$(apex_member_get "$manager" "$reviewer" review_pr)
+	fi
+	[[ -n $pr ]] || _die "link: could not determine the PR number — pass --pr N"
+
+	apex_member_merge "$manager" "$worker" "$(jq -nc \
+		--arg pair "$reviewer" --arg pr "$pr" --argjson max "$max" \
+		'{pair:$pair, pair_role:"worker", pair_pr:$pr, pair_round:1,
+		  pair_max_rounds:$max, pair_turn:"reviewer", pair_state:"active",
+		  pair_message:""}')"
+	apex_member_merge "$manager" "$reviewer" "$(jq -nc \
+		--arg pair "$worker" --arg pr "$pr" --argjson max "$max" \
+		'{pair:$pair, pair_role:"reviewer", pair_pr:$pr, pair_round:1,
+		  pair_max_rounds:$max, pair_turn:"reviewer", pair_state:"active",
+		  pair_message:"", verdict_round:"", verdict_findings:"", verdict_note:""}')"
+
+	apex_event "$manager" "$(jq -nc --arg w "$worker" --arg r "$reviewer" \
+		--arg pr "$pr" --argjson max "$max" \
+		'{event:"pair-link", session:$w, reviewer:$r, review_pr:$pr, max_rounds:$max}')"
+
+	# The reviewer is already running with its own review prompt and knows
+	# nothing about the verdict protocol until told.
+	if _pair_relay "$manager" "$reviewer" "$(_pair_reviewer_msg "$pr" 1 initial)"; then
+		print "Linked pair on PR #${pr} (max ${max} rounds); reviewer briefed on the verdict protocol."
+	else
+		print -u2 "tmux-apex: WARNING — linked, but could not brief the reviewer ($reviewer)."
+		print -u2 "  it will not know to record a verdict, and the loop will escalate as stuck."
+	fi
+	print "  worker   : $worker"
+	print "  reviewer : $reviewer"
+}
+
+_cmd_unlink() {
+	local member="$1"
+	[[ -n $member ]] || _die "unlink: usage: unlink <session:%pane>"
+	local manager
+	manager=$(_require_manager)
+	APEX_SESSION="$manager"
+
+	local pair m
+	pair=$(apex_member_get "$manager" "$member" pair)
+	for m in "$member" "$pair"; do
+		[[ -n $m ]] || continue
+		[[ -f $(apex_member_file "$manager" "$m") ]] || continue
+		apex_member_merge "$manager" "$m" \
+			'{"pair":"","pair_role":"","pair_state":"","pair_turn":"","pair_message":""}'
+	done
+	apex_event "$manager" "$(jq -nc --arg s "$member" '{event:"pair-unlink", session:$s}')"
+	print "Unlinked ${member}${pair:+ and $pair}."
+}
+
+# pair-resume — hand a stuck loop back to the agents after a human has
+# unstuck whatever it was stuck on.
+_cmd_pair_resume() {
+	local member="" extend=""
+	while (( $# )); do
+		case "$1" in
+			--max-rounds) _need_val pair-resume "$1" $#; extend="$2"; shift 2 ;;
+			-*) _die "pair-resume: unknown argument '$1'" ;;
+			*)  member="$1"; shift ;;
+		esac
+	done
+	[[ -n $member ]] || _die "pair-resume: usage: pair-resume <session:%pane> [--max-rounds N]"
+	[[ -z $extend || $extend == <-> ]] || _die "pair-resume: --max-rounds must be a positive integer"
+
+	local manager
+	manager=$(_require_manager)
+	APEX_SESSION="$manager"
+
+	local pair pr role round max reviewer
+	pair=$(apex_member_get "$manager" "$member" pair)
+	[[ -n $pair ]] || _die "pair-resume: '$member' is not linked to a partner"
+	pr=$(apex_member_get "$manager" "$member" pair_pr)
+	role=$(apex_member_get "$manager" "$member" pair_role)
+	[[ $role == reviewer ]] && reviewer="$member" || reviewer="$pair"
+	round=$(apex_member_get "$manager" "$member" pair_round); [[ -n $round ]] || round=1
+	max=$(apex_member_get "$manager" "$member" pair_max_rounds); [[ -n $max ]] || max=$APEX_PAIR_MAX_ROUNDS
+
+	# Resuming a cap-stuck loop without raising the cap re-invokes the
+	# reviewer at round == max, so the moment it reports any finding the cap
+	# check fires again: a wasted review turn, duplicate PR comments, and the
+	# same escalation. Refuse rather than pretend to have resumed.
+	if [[ -n $extend ]]; then
+		(( extend > max )) || _die "pair-resume: --max-rounds ${extend} is not above the current cap (${max})"
+		max="$extend"
+	elif (( round >= max )); then
+		_die "pair-resume: round ${round} is already at the cap (${max}), so the loop would escalate again on the reviewer's first finding. Raise it: pair-resume ${member} --max-rounds $(( max + 2 ))"
+	fi
+
+	local m
+	for m in "$member" "$pair"; do
+		# Do not resurrect a reaped partner as a phantom member — `status`
+		# and `pending` would then report a pane that no longer exists.
+		[[ -f $(apex_member_file "$manager" "$m") ]] || continue
+		apex_member_merge "$manager" "$m" "$(jq -nc --argjson max "$max" \
+			'{pair_state:"active", pair_turn:"reviewer", pair_message:"",
+			  pair_max_rounds:$max}')"
+	done
+
+	# Clear the reviewer's verdict. A resume re-invokes the reviewer for the
+	# *same* round, and the freshness check only compares verdict_round to
+	# pair_round — so a verdict recorded before the loop got stuck would be
+	# accepted as this round's, relaying stale findings and skipping the
+	# no-verdict escalation entirely. Resuming is a request for a fresh
+	# verdict; the old one must not satisfy it.
+	if [[ -f $(apex_member_file "$manager" "$reviewer") ]]; then
+		apex_member_merge "$manager" "$reviewer" \
+			'{"verdict_round":"","verdict_findings":"","verdict_note":""}'
+	fi
+
+	_pair_relay "$manager" "$reviewer" "$(_pair_reviewer_msg "$pr" "$round" rereview)" \
+		|| _die "pair-resume: could not reach the reviewer ($reviewer)"
+	apex_event "$manager" "$(jq -nc --arg s "$member" --argjson max "$max" \
+		'{event:"pair-resume", session:$s, max_rounds:$max}')"
+	print "Resumed the loop on PR #${pr}; reviewer re-invoked for round ${round} of ${max}."
+}
+
+# verdict — run by the *reviewer* in its own pane. This is the loop's only
+# termination signal, and deliberately a structured one.
+_cmd_verdict() {
+	local findings="" note=""
+	while (( $# )); do
+		case "$1" in
+			--findings) _need_val verdict "$1" $#; findings="$2"; shift 2 ;;
+			--none)     findings=0; shift ;;
+			--note)     _need_val verdict "$1" $#; note="$2"; shift 2 ;;
+			*) _die "verdict: unknown argument '$1'" ;;
+		esac
+	done
+	[[ -n $findings ]] || _die "verdict: usage: verdict --findings N | --none [--note TEXT]"
+	[[ $findings == <-> ]] || _die "verdict: --findings must be a non-negative integer"
+
+	local member manager
+	member=$(_cur_member) || _die "verdict: not inside a tmux pane"
+	manager=$(_sopt "$member" @apex_session)
+	[[ -n $manager ]] || _die "verdict: this pane is not an apex member"
+	APEX_SESSION="$manager"
+
+	local role round
+	role=$(apex_member_get "$manager" "$member" pair_role)
+	[[ $role == reviewer ]] || _die "verdict: only the reviewer half of a linked pair records verdicts (this member's pair_role is '${role:-<unlinked>}')"
+	round=$(apex_member_get "$manager" "$member" pair_round); [[ -n $round ]] || round=1
+
+	apex_member_merge "$manager" "$member" "$(jq -nc \
+		--arg r "$round" --arg f "$findings" --arg n "$note" \
+		'{verdict_round:$r, verdict_findings:$f, verdict_note:$n}')"
+	apex_event "$manager" "$(jq -nc --arg s "$member" --arg r "$round" \
+		--argjson f "$findings" --arg n "$note" \
+		'{event:"pair-verdict", session:$s, round:$r, findings:$f, note:$n}')"
+
+	if (( findings == 0 )); then
+		print "Verdict recorded for round ${round}: no findings worth addressing."
+		print "When you stop, the PR is flipped to ready-for-review and the human is pinged."
+	else
+		print "Verdict recorded for round ${round}: ${findings} finding(s) worth addressing."
+		print "When you stop, the worker is asked to address them; you will be re-invoked after it pushes."
 	fi
 }
 
@@ -950,6 +1482,12 @@ _cmd_settle() {
 	[[ $(apex_member_get "$manager" "$session" settled_seq) == "$seq" ]] && return 0
 	apex_member_merge "$manager" "$session" "$(jq -nc --argjson seq "$seq" '{settled_seq:$seq}')"
 	_record_status "$manager" "$session" idle
+
+	# A linked pair relays this idle transition to its partner and marks the
+	# ping consumed, so the manager is not woken once per round-trip. The
+	# status event above is still written either way — the durable log stays
+	# complete whether or not the loop swallowed the ping.
+	_pair_advance "$manager" "$session" || true
 }
 
 # ─── status ──────────────────────────────────────────────────────────
@@ -1065,11 +1603,20 @@ _cmd_pending() {
 	manager=$(_require_manager)
 	APEX_SESSION="$manager"
 
-	local s st seq pinged role task facts summary
+	local s st seq pinged role task facts summary pair_msg
 	for s in ${(f)"$(apex_members "$manager")"}; do
 		[[ -z $s ]] && continue
 		st=$(apex_member_get "$manager" "$s" status)
-		[[ $st == idle || $st == attention ]] || continue
+		pair_msg=$(apex_member_get "$manager" "$s" pair_message)
+
+		# A terminal pair escalation is reported on its own merit, not via
+		# the `status` field it forces: the partner's relay can wake this
+		# member back into `working` before the manager next pulls, which
+		# would otherwise defer "READY FOR HUMAN REVIEW" by a whole agent
+		# turn — likeliest in exactly the cases that need it soonest.
+		if [[ -z $pair_msg ]]; then
+			[[ $st == idle || $st == attention ]] || continue
+		fi
 
 		seq=$(apex_member_get "$manager" "$s" seq); [[ -z $seq ]] && seq=0
 		pinged=$(apex_member_get "$manager" "$s" pinged_seq); [[ -z $pinged ]] && pinged=-1
@@ -1080,9 +1627,19 @@ _cmd_pending() {
 		facts=$(_member_facts "$s")
 		summary=$(_facts_line "$facts")
 
-		print "[apex] session=${s} role=${role} ${task:+task=${task} }status=${st} — ${summary}. Full state: ${SELF} status --json"
+		if [[ -n $pair_msg ]]; then
+			print "[apex] session=${s} role=${role} ${task:+task=${task} }— ${pair_msg} (${summary})"
+		else
+			print "[apex] session=${s} role=${role} ${task:+task=${task} }status=${st} — ${summary}. Full state: ${SELF} status --json"
+		fi
 
-		$mark && apex_member_merge "$manager" "$s" "$(jq -nc --argjson seq "$seq" '{pinged_seq:$seq}')"
+		# pair_message is a one-shot escalation, not a status field: clearing
+		# it on delivery keeps a later idle transition of the same member
+		# from re-reporting a resolved round as if it were fresh.
+		if $mark; then
+			apex_member_merge "$manager" "$s" "$(jq -nc --argjson seq "$seq" '{pinged_seq:$seq}')"
+			[[ -n $pair_msg ]] && apex_member_merge "$manager" "$s" '{"pair_message":""}'
+		fi
 	done
 }
 
@@ -1283,6 +1840,10 @@ case "${1:-}" in
 	relink)   shift; _cmd_relink "$@" ;;
 	spawn)    shift; _cmd_spawn "$@" ;;
 	send)     shift; _cmd_send "$@" ;;
+	link)     shift; _cmd_link "$@" ;;
+	unlink)   shift; _cmd_unlink "$@" ;;
+	pair-resume) shift; _cmd_pair_resume "$@" ;;
+	verdict)  shift; _cmd_verdict "$@" ;;
 	event)    shift; _cmd_event "$@" ;;
 	status)   shift; _cmd_status "$@" ;;
 	pending)  shift; _cmd_pending "$@" ;;
@@ -1303,6 +1864,15 @@ case "${1:-}" in
 		print "            --model M"
 		print "            --agent-flags ARGV --mode autonomous|interactive --switch"
 		print "  send <session> <text>          message a session's coding agent"
+		print "  link --worker M --reviewer M   run an automatic fix/re-review loop between two"
+		print "                                 members on one PR; the manager is only pinged"
+		print "                                 once it terminates"
+		print "      opts: --pr N --max-rounds N (default ${APEX_PAIR_MAX_ROUNDS})"
+		print "  unlink <member>                drop the pairing (both halves)"
+		print "  pair-resume <member>           restart a loop that escalated as stuck"
+		print "      opts: --max-rounds N       required if it stuck at the round cap"
+		print "  verdict --findings N | --none  reviewer-only: record the round's outcome"
+		print "                                 (the loop's termination signal) [--note TEXT]"
 		print "  status [--json]                state of every member"
 		print "  pending [--mark-delivered]     members not yet delivered to the manager"
 		print "  reap [--yes]                   clean up finished/dead members"

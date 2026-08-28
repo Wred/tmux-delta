@@ -75,6 +75,29 @@ tmux-apex.sh spawn --issue 44 --profile hard --agent-flags bypassPermissions
 tmux-apex.sh spawn --review-pr 17 --role monitor --profile hard
 ```
 
+### Linked pairs — do not relay reviews by hand
+
+Once a worker has a draft PR and you have spawned a reviewer on it, link them
+and stay out of the way:
+
+```bash
+tmux-apex.sh status                                  # copy the two member keys
+tmux-apex.sh link --worker <session:%pane> --reviewer <session:%pane>
+```
+
+After that the reviewer's findings go straight to the worker, the worker's
+pushes re-invoke the reviewer, and you are pinged **once** — either because the
+reviewer signed off (PR flipped out of draft, human's merge call) or because the
+loop is stuck. Do not read the review thread and re-send it yourself; that is
+the round-trip the link exists to remove.
+
+Add `--max-rounds N` (default 5) if a PR deserves more or fewer attempts before
+it escalates as "not converging". `tmux-apex.sh unlink <member>` drops the
+pairing if you want to drive it manually again.
+
+If you spawn a reviewer and *don't* link it, you own every round-trip. Only do
+that for a one-shot review you have no intention of iterating on.
+
 Choose a tier per task and say out loud why you chose it — trivial/easy for
 mechanical, well-specified work; standard (sonnet) for most everyday issue
 work; hard (opus) for design work, tricky refactors, and reviews; extreme
@@ -173,19 +196,28 @@ Then pick one:
 - **Stuck or asking a question you can answer** → `tmux-apex.sh send <session>
   "<instruction>"`. Be specific; the worker cannot see your context.
 - **Done but unreviewed and worth reviewing** → spawn a reviewer with
-  `--review-pr`.
-- **Reviewer reports findings** → the reviewer posts them to the PR itself
-  (that is its job); tell it to do that rather than fix the code. Then send
-  the original worker an instruction to go read the findings on the PR and
-  address them — don't summarize or relay the findings yourself. Only let a
-  reviewer fix directly when the human explicitly says so for that case (e.g.
-  a small draft PR with no worker actively iterating on it). A reviewer added
-  via `--review-pr` shares the worker's session/worktree (pane-scoped members,
-  `session:pane_id`), so if a reviewer does fix something directly, the fix
-  lands on disk immediately but the worker's own conversation history doesn't
-  know it happened — point the worker at the PR/commit so it isn't reasoning
-  from a stale mental model of the code, instead of narrating the change to it
-  yourself.
+  `--review-pr`, then `link` the pair (below) so you are not the relay.
+- **Reviewer reports findings and the pair is *not* linked** → the reviewer posts
+  them to the PR itself (that is its job); tell it to do that rather than fix the
+  code. Then send the original worker an instruction to go read the findings on
+  the PR and address them — don't summarize or relay the findings yourself. Only
+  let a reviewer fix directly when the human explicitly says so for that case
+  (e.g. a small draft PR with no worker actively iterating on it). A reviewer
+  added via `--review-pr` shares the worker's session/worktree (pane-scoped
+  members, `session:pane_id`), so if a reviewer does fix something directly, the
+  fix lands on disk immediately but the worker's own conversation history doesn't
+  know it happened — point the worker at the PR/commit so it isn't reasoning from
+  a stale mental model of the code, instead of narrating the change to it
+  yourself. A **linked** pair does all of this relaying for you; if you find
+  yourself doing it by hand, you forgot to `link`.
+- **A linked pair's loop terminated** → the ping says which. "READY FOR HUMAN
+  REVIEW" means the reviewer signed off and the PR is out of draft: report it to
+  the human, do not merge it. "PAIRED REVIEW STUCK" means the loop could not
+  finish on its own — read `status --json`, fix the cause, then
+  `tmux-apex.sh pair-resume <member>` or take over by hand. If it stuck at the
+  round cap, `pair-resume` requires `--max-rounds N` above the old cap, and you
+  should decide whether another round is actually warranted: the two agents
+  disagreeing is a judgement call, not a retry.
 - **Idle with nothing pushed and no blocker** → it probably stopped early.
   Send it a nudge naming what is still missing.
 - **A question only the human can answer** (product decisions, tradeoffs,

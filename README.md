@@ -299,6 +299,9 @@ set -g @tmux_delta_apex_agent_cmds 'node bun claude codex gemini pi opencode'
 `APEX_QUIET_SECS` (env, default `30`) is how long a worker must be idle before
 its "turn finished" ping reaches the manager.
 
+`APEX_PAIR_MAX_ROUNDS` (env, default `5`) is the default `--max-rounds` cap for
+a linked pair's fix/re-review loop.
+
 ### Editor
 
 The dev layout opens `nvim` on the left pane by default. Override the command via `.envrc` in your project:
@@ -347,6 +350,7 @@ tmux-apex.sh spawn --issue 43 --profile hard
 tmux-apex.sh spawn --issue 44 --agent opencode --model anthropic/claude-sonnet-4-6 --agent-flags '--auto'
 tmux-apex.sh spawn --review-pr 17 --profile hard --role monitor
 tmux-apex.sh send <session> "rebase on main, CI is red"
+tmux-apex.sh link --worker wt:%3 --reviewer wt:%7   # automatic fix/re-review loop
 tmux-apex.sh status                  # or --json
 tmux-apex.sh reap --yes              # remove finished/dead members
 tmux-apex.sh stop
@@ -367,6 +371,57 @@ clients, so the manager keeps focus; pass `--switch` to jump to the new session.
 **The manager may not merge or close anything.** It spawns, instructs, kills and
 reaps; when work is done it reports "ready to merge" and stops. That boundary
 lives in the skill.
+
+### Linked pairs: automatic fix/re-review loop
+
+A worker and a reviewer on the same PR are, by default, two unrelated member
+records. Driving them means the manager reads the reviewer's comments, decides
+what to relay, tells the worker, waits, re-invokes the reviewer, and repeats —
+shuttling messages between two agents that could resolve it themselves.
+
+`link` records the relationship on both sides and hands the round-trip to the
+agents:
+
+```zsh
+tmux-apex.sh status                                  # get the two member keys
+tmux-apex.sh link --worker wt:%3 --reviewer wt:%7    # --pr N is inferred
+tmux-apex.sh link --worker wt:%3 --reviewer wt:%7 --max-rounds 3
+tmux-apex.sh unlink wt:%3
+tmux-apex.sh pair-resume wt:%3                       # restart a stuck loop
+tmux-apex.sh pair-resume wt:%3 --max-rounds 8        # ...one stuck at the cap
+```
+
+From then on each idle transition is relayed instead of surfacing:
+
+| Idle member | Verdict | What happens |
+|-------------|---------|--------------|
+| reviewer | `N > 0` findings | worker is told to read and fix them; round `++` |
+| worker | — | reviewer is re-invoked on the updated PR |
+| reviewer | `0` findings | `gh pr ready`, then the manager is pinged **once** |
+
+The termination signal is a structured record, not a text-scrape of the review
+prose. The reviewer is required to run, before it stops:
+
+```zsh
+tmux-apex.sh verdict --findings 2 --note 'unquoted vars in the new helper'
+tmux-apex.sh verdict --none          # nothing left worth fixing
+```
+
+`link` briefs the reviewer on that protocol, since it is already running its own
+review prompt by then. A reviewer that goes idle *without* recording a verdict
+halts the loop and escalates: "no verdict" and "no findings" are different
+states, and guessing between them silently flips a PR to ready-for-review.
+
+The loop escalates rather than spinning whenever it cannot make progress on its
+own — the round cap is hit (worker and reviewer are not converging), no verdict
+was recorded, the partner's pane is gone, or the relay could not be delivered.
+Only then does the manager get a ping, and the message says which of those it
+is. `pair-resume` on a loop that stuck *at the cap* requires a higher
+`--max-rounds`: resuming at `round == max` would burn a full review turn and
+re-escalate on the reviewer's first finding. Resuming also clears the reviewer's
+last verdict, so a stale one cannot pass for the resumed round's. The terminal
+ping is framed as the decision that is actually the human's — the merge call —
+not as a generic "a member went idle".
 
 ### How reporting works
 
@@ -460,6 +515,25 @@ that pane's input box:
   would quietly stop happening. It runs the match under a UTF-8 locale of its
   own choosing, scoped to the call.
 
+A linked pair's relays go through the same path and get the same treatment, on
+the `pair-relay` and `pair-relay-failed` events. That matters more there than
+for `send`: a relay fires from a background `run-shell` with no operator
+attached, so the stderr report is unread and the event is the only surviving
+record — including when the delivery that displaced the text then failed, since
+the draft is gone either way.
+
+Because the event is the sole record there, it distinguishes the two outcomes
+that stderr distinguishes and a bare `cleared_input` would not. `cleared_input`
+is the pre-send box read: whatever the box held before the delivery. On its own
+it means the box then drained and that text was discarded. `spliced_onto`
+alongside it means the clear did not take — the delivery was appended instead,
+and the receiving agent got `<draft><message>` as one garbled instruction; the
+value is that combined line, so the two keys hold different text. The splice is
+the worse outcome and the one you want to find in the log, so it gets its own
+key rather than reading identically to a clean discard. Filter on
+`spliced_onto` first: `cleared_input` alone is only a clean discard when
+`spliced_onto` is absent. `send` reports both the same way.
+
 `status` lists any unsent text it finds in member input boxes, with the caveat
 attached: it is usually the agent's own autosuggestion rather than a failed
 delivery or stray injection, which is otherwise impossible to tell apart from
@@ -529,6 +603,7 @@ them when launching the agent:
 
 ```bash
 tests/apex-delivery.test.sh
+tests/apex-pair.test.sh
 ```
 
 Covers apex ping delivery: which output channel `apex-manager-notify.sh` picks
@@ -537,6 +612,15 @@ per event, that an invocation which cannot deliver also does not *consume*
 files — correctly wired, unwired, wired without the argument, wired with another
 event's argument, and malformed JSON. `tmux` and `tmux-apex.sh` are stubbed, so
 it needs neither a live agent nor a tmux server.
+
+`apex-pair.test.sh` covers the linked-pair state machine: the relay in both
+directions, the round cap, a missing verdict, an unreachable or dead partner, a
+failed `gh pr ready`, and the two properties the feature exists for — no manager
+ping on an intermediate round, exactly one on termination. It also pins down the
+option parsers: zsh's `shift 2` with a missing value leaves `$#` unchanged, so
+every two-argument flag is asserted to fail fast rather than spin. tmux is a
+file-backed option-store stub and `gh` records its argv, so member state is the
+real thing but nothing touches a live PR.
 
 It also pins the two halves together: `install-agent-hooks.sh` runs into a
 throwaway `$HOME` and `doctor` has to accept what it wrote, both from scratch and
