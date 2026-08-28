@@ -980,21 +980,42 @@ _pair_reviewer_msg() {
 # escalation says something an operator can act on. An unsubmitted relay
 # (_deliver rc 5) is a failure here even though a human `send` treats it as
 # recoverable: the text sits in the box unread, so the partner never wakes.
+#
+# Whatever the pane-clearing discarded (APEX_SEND_CLEARED, see _send_to_pane)
+# is recorded as cleared_input on the event, the same as `send` does — and on
+# the failure path too, since a draft destroyed by a relay that then failed is
+# exactly as gone. This is the one delivery path that is both unattended and
+# unwatched: it runs from _cmd_settle under `tmux run-shell -b -d`, so
+# _send_to_pane's stderr report has no operator reading it, and the event log
+# is the only place the discarded text survives.
+#
+# The global is reset before delivering: on the native path _send_to_pane never
+# runs, and a stale value from an earlier send-keys delivery would otherwise be
+# logged as if this relay had cleared it.
 _PAIR_RELAY_WHY=""
 _pair_relay() {
 	local manager="$1" target="$2" text="$3" rc=0
 	_PAIR_RELAY_WHY=""
+	APEX_SEND_CLEARED=""
 	_deliver "$target" "apex-pair" "$text" || rc=$?
+	local ev
+	ev=$(jq -nc --arg s "$target" --arg text "$text" \
+		--arg cleared "${APEX_SEND_CLEARED:-}" --argjson rc "$rc" \
+		'{session:$s, text:$text}
+		 + (if $rc != 0 then {rc:$rc} else {} end)
+		 + (if $cleared != "" then {cleared_input:$cleared} else {} end)')
 	if (( rc )); then
 		case $rc in
 			5) _PAIR_RELAY_WHY="the relay was typed into that pane but never submitted; it is sitting unsent in the input box" ;;
 			2|3) _PAIR_RELAY_WHY="no reachable coding agent in that pane" ;;
 			*) _PAIR_RELAY_WHY="delivery to that pane failed" ;;
 		esac
+		apex_event "$manager" \
+			"$(print -r -- "$ev" | jq -c '{event:"pair-relay-failed"} + .')"
 		return 1
 	fi
-	apex_event "$manager" "$(jq -nc --arg s "$target" --arg text "$text" \
-		'{event:"pair-relay", session:$s, text:$text}')"
+	apex_event "$manager" \
+		"$(print -r -- "$ev" | jq -c '{event:"pair-relay"} + .')"
 	return 0
 }
 

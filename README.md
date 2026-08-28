@@ -515,6 +515,13 @@ that pane's input box:
   would quietly stop happening. It runs the match under a UTF-8 locale of its
   own choosing, scoped to the call.
 
+A linked pair's relays go through the same path and get the same treatment, on
+the `pair-relay` and `pair-relay-failed` events. That matters more there than
+for `send`: a relay fires from a background `run-shell` with no operator
+attached, so the stderr report is unread and the event is the only surviving
+record of what the clearing discarded — including when the delivery that
+displaced it then failed, since the draft is gone either way.
+
 `status` lists any unsent text it finds in member input boxes, with the caveat
 attached: it is usually the agent's own autosuggestion rather than a failed
 delivery or stray injection, which is otherwise impossible to tell apart from

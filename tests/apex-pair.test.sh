@@ -123,7 +123,17 @@ case "$cmd" in
 	# Empty unless a test opts in, so `send` sees a drained input box and
 	# _send_to_pane confirms submission (the ordinary case here).
 	capture-pane)
-		[[ -n ${STUB_PANE_TEXT:-} ]] && print -r -- "$STUB_PANE_TEXT"
+		# STUB_PANE_TEXT_ONCE: report the text on the first read only, so the
+		# box appears to drain and _send_to_pane confirms submission. Without
+		# it a static box makes every relay look unsubmitted.
+		[[ -n ${STUB_PANE_TEXT:-} ]] || exit 0
+		if [[ -n ${STUB_PANE_TEXT_ONCE:-} ]]; then
+			# The stub is a fresh process per call, so "once" has to be
+			# file-backed: after the first read the box reports empty.
+			[[ -e "$STUB_SENT.pt" ]] && exit 0
+			: > "$STUB_SENT.pt"
+		fi
+		print -r -- "$STUB_PANE_TEXT"
 		exit 0
 		;;
 	has-session)  exit 0 ;;
@@ -155,19 +165,24 @@ MGR=mgr
 WORKER='wt:%1'
 REVIEWER='wt:%2'
 MEMBERS="$XDG_CACHE_HOME/tmux-delta/apex/$MGR/members"
+EVENTS="$XDG_CACHE_HOME/tmux-delta/apex/$MGR/events.jsonl"
 
 # `_die` exits non-zero; every failure here is asserted on its message, so
 # swallow the status rather than tripping err_return.
 apex() { "$APEX" "$@" 2>&1 || true }
+# Last event of a given type, as compact JSON ("" if none).
+ev() { jq -c --arg e "$1" 'select(.event == $e)' "$EVENTS" 2>/dev/null | tail -1 }
+
 mget() { jq -r --arg k "$2" '.[$k] // "" | tostring' "$MEMBERS/$1.json" }
 
 # reset [--no-link] [--max N] — rebuild a clean two-member world.
 reset() {
+	rm -f "$STUB_SENT.pt"
 	local nolink=false max=5 a
 	for a in "$@"; do
 		case "$a" in --no-link) nolink=true ;; --max=*) max="${a#--max=}" ;; esac
 	done
-	rm -rf "$XDG_CACHE_HOME" "$STUB_OPTS" "$STUB_PANES" "$STUB_SENT" "$STUB_GH"
+	rm -rf "$XDG_CACHE_HOME" "$STUB_OPTS" "$STUB_PANES" "$STUB_SENT" "$STUB_GH" "$STUB_SENT.pt"
 	mkdir -p "$MEMBERS"
 	: > "$STUB_OPTS"; : > "$STUB_SENT"; : > "$STUB_GH"
 	printf '%%1\n%%2\n' > "$STUB_PANES"
@@ -414,6 +429,42 @@ contains "the stuck ping names the unsent text, not a dead pane" \
 	"sitting unsent in the input box" "$(apex pending)"
 eq "the round is rolled back" 1 "$(mget "$WORKER" pair_round)"
 eq "and so is the turn" reviewer "$(mget "$WORKER" pair_turn)"
+# The failure path logs too: the pane-clearing already ran, so whatever it
+# discarded is gone whether or not the delivery that displaced it landed.
+contains "the failed relay is logged" '"event":"pair-relay-failed"' \
+	"$(ev pair-relay-failed)"
+contains "with the _deliver return code" '"rc":5' "$(ev pair-relay-failed)"
+contains "and what the clearing discarded" "PAIRED REVIEW" \
+	"$(ev pair-relay-failed)"
+
+# ── the relay records what its pane-clearing discarded ───────────────
+# `_send_to_pane` fires C-e/C-u before typing (#12), and the contract for
+# that is that nothing vanishes silently: whatever was in the box is
+# reported on stderr and stored as cleared_input on the event. A relay is
+# the one delivery path where the stderr half is worthless — it runs from
+# _cmd_settle under `tmux run-shell -b -d`, with no operator attached — so
+# the event is the only record, on the success *and* failure paths: a draft
+# destroyed by a relay that then failed is exactly as destroyed.
+print "\ndiscarded pane input is recorded on the relay event"
+reset --max=3
+verdict --findings 2 >/dev/null
+# Non-static: the stub clears STUB_PANE_TEXT once read, so the box drains and
+# _send_to_pane confirms submission — a successful relay that still discarded
+# a draft to make room for itself.
+export STUB_PANE_TEXT='│ > half-written note                        │'
+export STUB_PANE_TEXT_ONCE=1
+settle "$REVIEWER" >/dev/null
+unset STUB_PANE_TEXT STUB_PANE_TEXT_ONCE
+eq "the relay succeeded" 2 "$(mget "$WORKER" pair_round)"
+contains "and still recorded the discarded draft" "half-written note" \
+	"$(ev pair-relay)"
+
+print "\nan uneventful relay records no cleared_input"
+reset --max=3
+verdict --findings 2 >/dev/null
+settle "$REVIEWER" >/dev/null
+eq "no cleared_input key when the box was empty" "" \
+	"$(print -r -- "$(ev pair-relay)" | jq -r '.cleared_input // ""')"
 
 # ── dead partner ─────────────────────────────────────────────────────
 print "\na dead partner escalates"
