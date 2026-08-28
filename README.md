@@ -59,16 +59,49 @@ export PATH="$HOME/.tmux/plugins/tmux-delta/scripts:$PATH"
 
 ### 3. Coding-agent hooks (optional — activity pills and apex-mode reporting)
 
+These hooks live outside this repo — in `~/.claude/settings.json`, in each
+agent's own extension directory, in `~/.codex/config.toml` — so cloning or
+TPM-installing tmux-delta never installs them by itself. `tmux-delta.tmux`
+closes that gap automatically: every time tmux (re)loads the plugin it
+backgrounds `scripts/install-agent-hooks.sh`, which wires whichever of
+Claude Code / pi / opencode / codex it finds installed, using absolute paths
+resolved from wherever the repo actually is (TPM's `~/.tmux/plugins/tmux-delta`,
+a manual clone elsewhere, doesn't matter). It's upsert-by-marker, so it's a
+no-op once wired and self-heals a hook left pointing at a moved clone or a
+stale verb; it never touches hook entries it doesn't own (e.g. other
+`PreToolUse` hooks already in your `settings.json`). Its output goes to
+`~/.cache/tmux-delta/install-agent-hooks.log`, not the terminal, since a
+backgrounded `run-shell` has nothing to print to.
+
+Run it by hand if you want to see what it would do before the next reload
+does it for you:
+
+```zsh
+~/.tmux/plugins/tmux-delta/scripts/install-agent-hooks.sh --dry-run
+```
+
 `scripts/agent-tmux-status.sh` drives the per-session activity indicators and,
 in apex mode, forwards worker transitions to the manager. It takes one of three
-verbs, and the semantics matter — `notify` pings the apex manager *immediately*
-with no debounce, so it must mean "blocked on a human", never "turn ended":
+verbs:
 
-| Verb | Meaning | Pill | Apex ping |
-|------|---------|------|-----------|
-| `set` | agent is working | peach robot | none |
-| `notify` | agent is blocked on you | pill turns orange | immediate |
-| `clear` | agent is idle | reset | after `APEX_QUIET_SECS` |
+| Verb | Meaning | Pill |
+|------|---------|------|
+| `set` | agent is working | peach robot |
+| `notify` | agent is blocked on you | pill turns orange |
+| `clear` | agent is idle | reset |
+
+Delivery into the *manager's own* pane is pull-based, not pushed: `set`/
+`notify`/`clear` only ever write durable state (`~/.cache/tmux-delta/apex/`),
+debounced through `APEX_QUIET_SECS` for `clear`. `scripts/apex-manager-notify.sh`,
+wired to the manager's own `UserPromptSubmit` and `SessionStart` hooks, is what
+actually surfaces pending events — it prepends them to the manager's next turn
+(or on resume), so nothing ever gets typed into a live pane out from under you.
+That script also self-heals `@apex_role`/`@apex_session` after a session
+restart (see `tmux-apex.sh relink`), so it needs to run for every session, not
+just managers.
+
+The installer wires all of this. What follows is the manual/reference form, for
+troubleshooting or hand-editing.
 
 **Claude Code** — `~/.claude/settings.json`:
 
@@ -83,6 +116,12 @@ with no debounce, so it must mean "blocked on a human", never "turn ended":
     ],
     "Stop": [
       { "matcher": "", "hooks": [{ "type": "command", "command": "~/.tmux/plugins/tmux-delta/scripts/agent-tmux-status.sh clear" }] }
+    ],
+    "UserPromptSubmit": [
+      { "matcher": "", "hooks": [{ "type": "command", "command": "~/.tmux/plugins/tmux-delta/scripts/apex-manager-notify.sh", "timeout": 10 }] }
+    ],
+    "SessionStart": [
+      { "matcher": "startup|resume", "hooks": [{ "type": "command", "command": "~/.tmux/plugins/tmux-delta/scripts/apex-manager-notify.sh", "timeout": 10 }] }
     ]
   }
 }

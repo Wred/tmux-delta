@@ -201,3 +201,24 @@ tmux set-option -g status-style bg=black
 # Refreshes all sessions every 60 s. Safe to call on every config reload —
 # exits immediately if already running.
 tmux run-shell -b "${SCRIPTS}/tmux-pr-status-bg.sh"
+
+# ─── Agent hook install/repair ───────────────────────────────────────────────
+# Wires Claude Code/pi/opencode/codex hooks (outside this repo, so `git clone`
+# never carries them) and self-heals ones left pointing at a relocated clone
+# or a stale verb. Upsert-by-marker makes it a no-op once wired, so it's safe
+# to call on every load; backgrounded so a slow/missing jq never blocks
+# startup. Output goes to a log, not the terminal, since a background
+# run-shell has no attached output.
+#
+# Sources ~/.zshrc (non-interactively) first so `command -v pi/opencode/codex`
+# sees the same PATH your login shell has (pnpm/asdf/etc. bin dirs are
+# typically only added there) — the tmux server's own PATH is whatever it
+# inherited at server-start, not that, and detection would silently miss
+# agents installed after tmux started or added via an rc-file PATH line.
+# Deliberately `zsh -c`, not `-ic`: sourcing without `-i` still runs the
+# PATH exports but skips zsh's own interactive-only subsystems (zle,
+# job-control monitor mode, prompt/gitstatus init), which error under
+# run-shell's tty-less background execution.
+CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/tmux-delta"
+mkdir -p "$CACHE_DIR"
+tmux run-shell -b "zsh -c 'source ~/.zshrc >/dev/null 2>&1; \"${SCRIPTS}/install-agent-hooks.sh\"' >'${CACHE_DIR}/install-agent-hooks.log' 2>&1"
