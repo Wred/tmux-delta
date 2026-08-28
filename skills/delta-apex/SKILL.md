@@ -197,6 +197,19 @@ Then pick one:
   "<instruction>"`. Be specific; the worker cannot see your context.
 - **Done but unreviewed and worth reviewing** → spawn a reviewer with
   `--review-pr`, then `link` the pair (below) so you are not the relay.
+- **Reviewer reports findings and the pair is *not* linked** → the reviewer posts
+  them to the PR itself (that is its job); tell it to do that rather than fix the
+  code. Then send the original worker an instruction to go read the findings on
+  the PR and address them — don't summarize or relay the findings yourself. Only
+  let a reviewer fix directly when the human explicitly says so for that case
+  (e.g. a small draft PR with no worker actively iterating on it). A reviewer
+  added via `--review-pr` shares the worker's session/worktree (pane-scoped
+  members, `session:pane_id`), so if a reviewer does fix something directly, the
+  fix lands on disk immediately but the worker's own conversation history doesn't
+  know it happened — point the worker at the PR/commit so it isn't reasoning from
+  a stale mental model of the code, instead of narrating the change to it
+  yourself. A **linked** pair does all of this relaying for you; if you find
+  yourself doing it by hand, you forgot to `link`.
 - **A linked pair's loop terminated** → the ping says which. "READY FOR HUMAN
   REVIEW" means the reviewer signed off and the PR is out of draft: report it to
   the human, do not merge it. "PAIRED REVIEW STUCK" means the loop could not
@@ -249,6 +262,32 @@ settings to add. Suspect this specifically when the human tells you a worker
 finished some time ago and you had no idea: a manager with no hooks installed
 looks entirely normal from the inside, because `pending` keeps returning the
 right answer whenever you ask it by hand.
+
+## Unsent text in a member's input box
+
+`status` may report unsent text sitting in a member's input box. **That is
+almost always the agent's own autosuggestion, not a bug.** Claude Code predicts
+a plausible next input and paints it into an idle, empty box — `mark ready for
+review` and similar. From outside the pane it is indistinguishable from
+something having been typed there or injected by mistake, which has already
+cost real diagnosis time (issue #10).
+
+So:
+
+- Do not treat it as evidence that a `send` failed or leaked into the wrong
+  pane. `send` reports its own delivery, and verifies from the pane that the
+  text actually left the input box before claiming success.
+- Do not submit it. It is a guess about what someone might type next, not an
+  instruction from anyone.
+- `send` clears the box before it types where it can, and tells you what it
+  cleared — including when the box refused to clear (on
+  stderr and as `cleared_input` on the `send` event in `status --json`), so the
+  next delivery cannot be spliced onto it. Set `APEX_SEND_CLEAR=0` to keep the
+  old append-anyway behaviour if you ever need it.
+
+A `send-unsubmitted` event means the opposite and does matter: the text was
+typed into the pane, Enter was re-sent three times, and it is still unsent.
+Look at that pane.
 
 ## Reporting to the human
 

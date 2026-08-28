@@ -114,9 +114,17 @@ case "$cmd" in
 				-t) target="$2"; shift 2 ;;
 				-l|--) shift ;;
 				Enter) shift ;;
+				# Key names, not text: cursor/kill keys from _clear_pane_input.
+				C-e|C-u) shift ;;
 				*) print -r -- "$target	$1" >> "$STUB_SENT"; shift ;;
 			esac
 		done
+		;;
+	# Empty unless a test opts in, so `send` sees a drained input box and
+	# _send_to_pane confirms submission (the ordinary case here).
+	capture-pane)
+		[[ -n ${STUB_PANE_TEXT:-} ]] && print -r -- "$STUB_PANE_TEXT"
+		exit 0
 		;;
 	has-session)  exit 0 ;;
 	run-shell)    exit 0 ;;   # settle callbacks are driven explicitly here
@@ -387,6 +395,25 @@ eq "and so is the turn" reviewer "$(mget "$WORKER" pair_turn)"
 out=$(apex pair-resume "$WORKER")
 contains "resume works without raising the cap" "Resumed the loop" "$out"
 contains "and resumes the round that never ran" "round 1 of 3" "$out"
+
+# ── a relay that is typed but never submitted ────────────────────────
+# PR #12 taught `_send_to_pane` to distinguish "tmux refused" from "typed
+# into the box, Enter never took". `send` reports the second as a distinct
+# unconfirmed state because a human can act on it; the loop cannot — an
+# unsubmitted relay never wakes the partner — so it must escalate exactly
+# like an undeliverable one, round rollback included.
+print "\nan unsubmitted relay escalates and does not consume a round"
+reset --max=3
+verdict --findings 2 >/dev/null
+# A static box still showing our own text: the submit check never clears.
+export STUB_PANE_TEXT='│ > [apex from:apex-pair] PAIRED REVIEW              │'
+settle "$REVIEWER" >/dev/null
+unset STUB_PANE_TEXT
+eq "loop is marked stuck" stuck "$(mget "$REVIEWER" pair_state)"
+contains "the stuck ping names the unsent text, not a dead pane" \
+	"sitting unsent in the input box" "$(apex pending)"
+eq "the round is rolled back" 1 "$(mget "$WORKER" pair_round)"
+eq "and so is the turn" reviewer "$(mget "$WORKER" pair_turn)"
 
 # ── dead partner ─────────────────────────────────────────────────────
 print "\na dead partner escalates"
