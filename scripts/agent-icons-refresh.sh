@@ -63,20 +63,52 @@ COLOR_IDLE_ACTIVE=$(tmux show-option -gqv @tmux_delta_color_agent_idle_active 2>
 
 # More agents than this in one session and the rest collapse into a +N counter,
 # so a busy apex session can't push the pills off the status line.
-MAX_ICONS=4
+MAX_ICONS=$(tmux show-option -gqv @tmux_delta_agent_icons_max 2>/dev/null)
+case "$MAX_ICONS" in ''|*[!0-9]*|0) MAX_ICONS=4 ;; esac
+
+# Panes whose foreground command is one of these still count as hosting a live
+# agent. Only consulted for *idle* panes: @agent_present is sticky for the life
+# of the pane, so an agent that has exited leaves a pane that would otherwise
+# keep drawing an idle robot forever. A pane reporting working/attention has
+# just been heard from, so it is skipped — no flicker if an agent's tool call
+# briefly changes the foreground command.
+AGENT_CMDS=$(tmux show-option -gqv @tmux_delta_apex_agent_cmds 2>/dev/null)
+: "${AGENT_CMDS:=node bun claude codex gemini pi opencode}"
+
+# _is_agent_cmd <pane_current_command>
+_is_agent_cmd() {
+	local cmd="$1" allowed
+	[ -n "$cmd" ] || return 0   # unknown: don't hide the agent on a guess
+	for allowed in $AGENT_CMDS; do
+		[ "$cmd" = "$allowed" ] && return 0
+	done
+	return 1
+}
 
 # icons_for <session> — prints the filled icon string, a TAB, then the outline
 # icon string for one session. Either may be empty.
 icons_for() {
-	local session="$1" line pane role present working attention
-	local icons="" outline="" shown=0 extra=0
+	local session="$1" line pane role present working attention cmd
+	local icons="" outline="" shown=0 extra=0 extra_state=idle
 
-	while IFS='|' read -r pane role present working attention; do
+	while IFS='|' read -r pane role present working attention cmd; do
 		[ -n "$pane" ] || continue
 		# Not an agent pane: no apex role and no hook has ever fired here.
 		[ -n "$role" ] || [ -n "$present" ] || continue
+		# Idle and no agent process left in the pane: the agent has exited.
+		if [ -z "$working" ] && [ -z "$attention" ] && ! _is_agent_cmd "$cmd"; then
+			continue
+		fi
+		# Overflow keeps no glyph, but the +N counter is coloured by the most
+		# urgent state hidden behind it — with the session-wide peach pill gone,
+		# a blocked agent in the overflow would otherwise have no signal at all.
 		if [ "$shown" -ge "$MAX_ICONS" ]; then
 			extra=$((extra + 1))
+			if [ -n "$attention" ]; then
+				extra_state=attention
+			elif [ -n "$working" ] && [ "$extra_state" = idle ]; then
+				extra_state=working
+			fi
 			continue
 		fi
 		if [ "$shown" -gt 0 ]; then
@@ -96,7 +128,7 @@ icons_for() {
 		shown=$((shown + 1))
 	done <<-EOF
 		$(tmux list-panes -s -t "$session" -F \
-			'#{pane_id}|#{@apex_role}|#{@agent_present}|#{@agent_working}|#{@agent_needs_attention}' \
+			'#{pane_id}|#{@apex_role}|#{@agent_present}|#{@agent_working}|#{@agent_needs_attention}|#{pane_current_command}' \
 			2>/dev/null)
 	EOF
 
@@ -117,8 +149,14 @@ icons_for() {
 	fi
 
 	if [ "$extra" -gt 0 ]; then
-		icons+=" #[fg=${COLOR_IDLE}]+${extra}"
-		outline+=" #[fg=${COLOR_IDLE_ACTIVE}]+${extra}"
+		case "$extra_state" in
+			attention) icons+=" #[fg=${COLOR_ATTENTION}]+${extra}"
+			           outline+=" #[fg=${COLOR_ATTENTION}]+${extra}" ;;
+			working)   icons+=" #[fg=${COLOR_WORKING}]+${extra}"
+			           outline+=" #[fg=${COLOR_WORKING}]+${extra}" ;;
+			*)         icons+=" #[fg=${COLOR_IDLE}]+${extra}"
+			           outline+=" #[fg=${COLOR_IDLE_ACTIVE}]+${extra}" ;;
+		esac
 	fi
 	# TAB-separated: neither variant can contain one.
 	printf '%s\t%s' "$icons" "$outline"
@@ -141,7 +179,9 @@ refresh() {
 }
 
 # ack <session> — the user switched into this session, so the "wants input"
-# signal has been seen: clear it session-wide and on every pane in it.
+# signal has been seen. Clears the session aggregate, plus the panes of the
+# session's *current* window only: attention is per-agent now, and an agent
+# blocked in a window the user hasn't looked at has not been seen.
 ack() {
 	local session="$1" pane
 	[ -n "$session" ] || return 0
@@ -150,7 +190,7 @@ ack() {
 		[ -n "$pane" ] || continue
 		tmux set-option -u -p -t "$pane" @agent_needs_attention 2>/dev/null || true
 	done <<-EOF
-		$(tmux list-panes -s -t "$session" -F '#{pane_id}' 2>/dev/null)
+		$(tmux list-panes -t "$session" -F '#{pane_id}' 2>/dev/null)
 	EOF
 }
 

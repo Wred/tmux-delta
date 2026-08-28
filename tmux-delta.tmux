@@ -37,11 +37,15 @@ esac
 # run-shell -b spawns in the background so hooks never block input.
 hook_cmd="run-shell -b '${SCRIPTS}/tmux-kube-status-refresh.sh'; \
 run-shell -b '${SCRIPTS}/tmux-git-status-refresh.sh'; \
-run-shell -b '${SCRIPTS}/agent-icons-refresh.sh --all'; \
 run-shell -b '${SCRIPTS}/tmux-pr-status-refresh.sh --current'"
 tmux set-hook -g after-select-pane      "$hook_cmd"
 tmux set-hook -g after-select-window    "$hook_cmd"
-# Acknowledge the notification highlight when the user actually switches into the session.
+# Acknowledge the notification icons when the user actually switches into the
+# session. --ack clears the flags and rebuilds that session's icons itself; no
+# other icon refresh belongs in these hooks, both because agent state only
+# changes via the agent's own hooks (which refresh their own session) and
+# because a concurrent --all would race --ack and could write back the
+# attention glyph it just cleared.
 tmux set-hook -g client-session-changed "run-shell -b '${SCRIPTS}/agent-icons-refresh.sh --ack \"#{session_name}\"'; $hook_cmd"
 
 # ─── Picker keybind ──────────────────────────────────────────────────────────
@@ -75,6 +79,10 @@ unset _delta_default _delta_key _delta_val _delta_existing
 # Apex mode (see scripts/tmux-apex.sh).
 #   _icon       glyph marking the manager session's pill
 #   _agent_cmds pane commands tmux-apex.sh will deliver send-keys messages to
+# Most agent icons drawn in one pill before the rest collapse into "+N".
+_delta_existing=$(tmux show-option -gqv @tmux_delta_agent_icons_max 2>/dev/null)
+[[ -z "$_delta_existing" ]] && tmux set-option -g @tmux_delta_agent_icons_max 4
+
 _delta_existing=$(tmux show-option -gqv @tmux_delta_apex_icon 2>/dev/null)
 [[ -z "$_delta_existing" ]] && tmux set-option -g @tmux_delta_apex_icon '󱇖'
 # Material Design ships no outline variant of md-strategy, so the selected
@@ -203,6 +211,7 @@ APEX_ICON_ACTIVE=$(tmux show-option -gqv @tmux_delta_apex_icon_outline 2>/dev/nu
 # host several agents), so the inactive pill colours are plain constants.
 PILL_BG_INACTIVE="${C_SURFACE0}"
 PILL_FG_INACTIVE="${C_FG}"
+PILL_BG_ACTIVE="${C_MAUVE}"
 status_fmt0="#{S/n:#[range=session|#{session_id}]#[fg=${PILL_BG_INACTIVE}]#[bg=default]${SEP_L}#[fg=${PILL_FG_INACTIVE} bg=${PILL_BG_INACTIVE}]#{?#{==:#{@session_type},folder},󰉋,#{?#{==:#{@session_type},worktree},󰘬,󰊢}} #{?#{@session_label},#{@session_label},#{session_name}}#{?#{==:#{@apex_role},manager}, #[fg=${C_PINK}]${APEX_ICON}#[fg=${PILL_FG_INACTIVE}],}#{?#{@pr_icons}, #{@pr_icons},}#{?#{@agent_icons}, #{@agent_icons}#[fg=${PILL_FG_INACTIVE}],} #[fg=${PILL_BG_INACTIVE}]#[bg=default]${SEP_R}#[fg=default bg=default]#[norange] ,#[range=session|#{session_id}]#[fg=${PILL_BG_ACTIVE}]#[bg=default]${SEP_L}#[fg=${C_CRUST} bg=${PILL_BG_ACTIVE}]#{?#{==:#{@session_type},folder},󰉋,#{?#{==:#{@session_type},worktree},󰘬,󰊢}} #{?#{@session_label},#{@session_label},#{session_name}}#{?#{==:#{@apex_role},manager}, #[fg=${C_CRUST}]${APEX_ICON_ACTIVE}#[fg=${C_CRUST}],}#{?#{@pr_icons}, #{@pr_icons},}#{?#{@agent_icons_outline}, #{@agent_icons_outline}#[fg=${C_CRUST}],} #[fg=${PILL_BG_ACTIVE}]#[bg=default]${SEP_R}#[fg=default bg=default]#[norange] }#[align=right]#{E:status-right}"
 tmux set-option -g 'status-format[0]' "$status_fmt0"
 tmux set-option -g 'status-format[1]' '#{?#{!=:#{@git_repo_cache},},#{E:@catppuccin_status_repo} ,}#{?#{!=:#{@git_pr_number_cache},},#{E:@catppuccin_status_pr_number} ,}#{?#{!=:#{@git_pr_author_cache},},#{E:@catppuccin_status_pr_author} ,}#{?#{!=:#{@git_pr_title_cache},},#{E:@catppuccin_status_pr_title},} #{W:#[range=window|#{window_index}]#{E:window-status-format}#[norange default] ,#[range=window|#{window_index}]#{E:window-status-current-format}#[norange default] }#[align=right]#{?#{!=:#{@kube_context_cache},},#{E:@catppuccin_status_kube},}'
@@ -217,6 +226,10 @@ tmux set-option -g status-style bg=black
 # ─── PR status background daemon ─────────────────────────────────────────────
 # Refreshes all sessions every 60 s. Safe to call on every config reload —
 # exits immediately if already running.
+# Seed every session's agent icons once per load; from here on each session is
+# refreshed by its own agent hooks and by apex member registration.
+tmux run-shell -b "${SCRIPTS}/agent-icons-refresh.sh --all"
+
 tmux run-shell -b "${SCRIPTS}/tmux-pr-status-bg.sh"
 
 # ─── Agent hook install/repair ───────────────────────────────────────────────

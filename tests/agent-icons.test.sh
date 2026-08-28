@@ -3,8 +3,8 @@
 # the session pills.
 #
 # The script only talks to tmux, so a stub tmux on PATH is enough: pane state
-# comes from $STUB_PANES (one "pane|role|present|working|attention" line per
-# pane) and every write is appended to $STUB_LOG.
+# comes from $STUB_PANES (one "pane|role|present|working|attention|command"
+# line per pane) and every write is appended to $STUB_LOG.
 #
 # Run: tests/agent-icons.test.sh
 
@@ -47,19 +47,23 @@ cat > "$BIN/tmux" <<'EOF'
 #!/usr/bin/env bash
 # Stub tmux. Reads pane state from $STUB_PANES, session state from
 # $STUB_SESS_WORKING/$STUB_SESS_ATTENTION, and logs writes to $STUB_LOG.
-case "$1 $2" in
-	"list-panes -s")
+case "$1" in
+	list-panes)
+		# With -s: every pane in the session. Without: the current window only,
+		# which the stub models as $STUB_WINDOW_PANES.
 		if [[ "$*" == *"@apex_role"* ]]; then printf '%s\n' "$STUB_PANES"
-		else printf '%s\n' "$STUB_PANES" | sed 's/|.*//'; fi
+		elif [[ "$*" == *" -s "* ]]; then printf '%s\n' "$STUB_PANES" | sed 's/|.*//'
+		else printf '%s\n' "${STUB_WINDOW_PANES:-$STUB_PANES}" | sed 's/|.*//'; fi
 		exit 0 ;;
-	"list-sessions -F") printf '%s\n' "$STUB_SESSIONS"; exit 0 ;;
-	"display-message -p") printf '%s\n' "$STUB_SESSION"; exit 0 ;;
+	list-sessions) printf '%s\n' "$STUB_SESSIONS"; exit 0 ;;
+	display-message) printf '%s\n' "$STUB_SESSION"; exit 0 ;;
 esac
 case "$1" in
 	set-option) echo "set-option $*" >> "$STUB_LOG"; exit 0 ;;
 	refresh-client) exit 0 ;;
 esac
 case "$*" in
+	*@tmux_delta_agent_icons_max*) printf '%s\n' "$STUB_MAX" ;;
 	*@agent_icons_outline*)  printf '%s\n' "$STUB_PREV_OUTLINE" ;;
 	*@agent_icons*)          printf '%s\n' "$STUB_PREV" ;;
 	*@agent_needs_attention*) printf '%s\n' "$STUB_SESS_ATTENTION" ;;
@@ -72,7 +76,7 @@ chmod +x "$BIN/tmux"
 export PATH="$BIN:$PATH" TMUX=fake-socket LC_ALL=en_US.UTF-8
 export STUB_LOG="$TMPROOT/tmux.log"
 export STUB_SESSION=work STUB_SESSIONS=work STUB_PREV="" STUB_PREV_OUTLINE=""
-export STUB_SESS_WORKING="" STUB_SESS_ATTENTION=""
+export STUB_SESS_WORKING="" STUB_SESS_ATTENTION="" STUB_MAX="" STUB_WINDOW_PANES=""
 
 # icons <panes...> — runs the script and prints the @agent_icons value written
 # (empty when the script wrote nothing).
@@ -185,6 +189,53 @@ n=$(print -r -- "$out" | grep -o "$IDLE" | grep -c .)
 eq "at most four glyphs are drawn" 4 "$n"
 contains "the rest collapse into a counter" "+2" "$out"
 
+# ── stale presence ───────────────────────────────────────────────────
+# @agent_present is sticky for the life of the pane, so an exited agent would
+# otherwise leave an idle robot on the pill forever.
+print "stale presence"
+
+out=$(icons '%1|worker|1|||zsh')
+eq "an idle pane with no agent process shows nothing" "" "$out"
+
+out=$(icons '%1|worker|1|||node')
+contains "an idle pane still running the agent shows" "$IDLE" "$out"
+
+# Working/attention panes have just been heard from — never second-guessed by
+# the command check, so a tool call that changes the foreground command can't
+# blink the icon out.
+out=$(icons '%1|worker|1|1||git')
+contains "a working pane is kept whatever the foreground command" "$WORKING" "$out"
+out=$(icons '%1|worker|1||1|git')
+contains "a blocked pane is kept whatever the foreground command" "$ATTENTION" "$out"
+
+# ── overflow carries the most urgent hidden state ────────────────────
+# The peach pill background is gone, so a blocked agent hidden behind +N would
+# have no signal anywhere if the counter were always muted.
+print "overflow urgency"
+
+five_with() {
+	icons '%1|worker|1||' '%2|worker|1||' '%3|worker|1||' '%4|worker|1||' "$1"
+}
+out=$(five_with '%5|worker|1||1')
+contains "+N goes peach when a blocked agent is hidden" "#fab387]+1" "$out"
+out=$(five_with '%5|worker|1|1|')
+contains "+N goes green when a working agent is hidden" "#a6e3a1]+1" "$out"
+out=$(five_with '%5|worker|1||')
+contains "+N stays muted when only idle agents are hidden" "#6c7086]+1" "$out"
+
+# ── configurable cap ─────────────────────────────────────────────────
+print "icon cap"
+
+STUB_MAX=2
+out=$(icons '%1|worker|1||' '%2|worker|1||' '%3|worker|1||')
+n=$(print -r -- "$out" | grep -o "$IDLE" | grep -c .)
+eq "@tmux_delta_agent_icons_max caps the glyphs" 2 "$n"
+contains "and the remainder still counts" "+1" "$out"
+STUB_MAX="bogus"
+out=$(icons '%1|worker|1||' '%2|worker|1||' '%3|worker|1||' '%4|worker|1||' '%5|worker|1||')
+eq "a non-numeric cap falls back to 4" 4 "$(print -r -- "$out" | grep -o "$IDLE" | grep -c .)"
+STUB_MAX=""
+
 # ── no-op writes ─────────────────────────────────────────────────────
 print "change detection"
 
@@ -212,6 +263,17 @@ log=$(cat "$STUB_LOG")
 contains "ack clears the session flag"   "-u -t work @agent_needs_attention" "$log"
 contains "ack clears pane %1's flag"     "-u -p -t %1 @agent_needs_attention" "$log"
 contains "ack clears pane %2's flag"     "-u -p -t %2 @agent_needs_attention" "$log"
+
+# Attention is per-agent now: an agent blocked in a window the user never
+# looked at has not been seen, so ack must not reach it.
+: > "$STUB_LOG"
+export STUB_PANES=$'%1|worker|1||1\n%2|worker|1||1'
+export STUB_WINDOW_PANES='%1|worker|1||1'
+"$SCRIPTS/agent-icons-refresh.sh" --ack work >/dev/null 2>&1
+log=$(cat "$STUB_LOG")
+contains "ack reaches the current window's pane" "-u -p -t %1 @agent_needs_attention" "$log"
+lacks "ack leaves other windows' panes flagged"  "-u -p -t %2 @agent_needs_attention" "$log"
+export STUB_WINDOW_PANES=""
 
 print ""
 print "$PASS passed, $FAIL failed"

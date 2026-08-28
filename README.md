@@ -94,6 +94,18 @@ The pill for the **selected** session draws the outline variant of whichever
 glyph is showing (and the dark pill foreground for idle, since the muted grey is
 unreadable on mauve).
 
+Beyond `@tmux_delta_agent_icons_max` agents (default 4) the remainder collapses
+into a `+N` counter, coloured by the most urgent state hidden behind it, so a
+blocked agent in the overflow still shows up. An *idle* pane whose foreground
+command is no longer an agent (`@tmux_delta_apex_agent_cmds`) is dropped — pane
+options outlive the agent process, and without that check an exited agent would
+leave an idle robot on the pill forever. Panes reporting working or blocked are
+never second-guessed this way, so a tool call can't blink an icon out.
+
+Switching into a session clears the "blocked" flag for the panes of that
+session's **current window** only: attention is per-agent now, and an agent
+blocked in a window you never looked at has not been seen.
+
 The icons are **per agent**, not per session: one glyph per pane that hosts an
 agent, each in its own state, so a worktree running a worker and a reviewer
 shows two. Presence is what puts a glyph in the pill — an idle agent still
@@ -252,6 +264,9 @@ set -g @tmux_delta_color_agent_idle      '#6c7086'
 set -g @tmux_delta_color_agent_working   '#a6e3a1'
 set -g @tmux_delta_color_agent_attention '#fab387'
 set -g @tmux_delta_color_agent_idle_active '#11111b'
+
+# Most agent icons drawn in one pill before the rest collapse into "+N"
+set -g @tmux_delta_agent_icons_max 4
 
 # Segment separators (only used when catppuccin/tmux is not loaded)
 set -g @tmux_delta_separator_left  ''
@@ -699,9 +714,14 @@ them when launching the agent:
 
 ```bash
 tests/apex-delivery.test.sh
+tests/apex-send.test.sh
 tests/apex-pair.test.sh
 tests/apex-watch.test.sh
+tests/agent-icons.test.sh
+tests/status-format.test.sh
 ```
+
+All six stub `tmux`, so none of them needs a tmux server or a live agent.
 
 Covers apex ping delivery: which output channel `apex-manager-notify.sh` picks
 per event, that an invocation which cannot deliver also does not *consume*
@@ -738,6 +758,16 @@ tick and must never clear a draft, one unparseable member file must not hide
 every other member's pending event, a comma in a session name must not misalign
 names against documents, and a stale pidfile whose pid now belongs to something
 else must read as not-running rather than as a healthy watcher.
+
+`agent-icons.test.sh` covers the session pills' per-agent icons: one glyph per
+agent pane in its own state, outline variants for the selected pill, presence
+that survives an idle turn but not an exited agent, the `+N` overflow and its
+urgency colour, and that `--ack` reaches the current window's panes only.
+
+`status-format.test.sh` is a static check on `tmux-delta.tmux`: every `${VAR}`
+used in a format string is actually assigned (an unset one expands to nothing in
+tmux and silently unstyles a pill), and both icon slots are present in both
+pill branches.
 
 ## Shell functions (gwt.zsh)
 
