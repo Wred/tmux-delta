@@ -174,6 +174,18 @@ Then pick one:
   "<instruction>"`. Be specific; the worker cannot see your context.
 - **Done but unreviewed and worth reviewing** → spawn a reviewer with
   `--review-pr`.
+- **Reviewer reports findings** → the reviewer posts them to the PR itself
+  (that is its job); tell it to do that rather than fix the code. Then send
+  the original worker an instruction to go read the findings on the PR and
+  address them — don't summarize or relay the findings yourself. Only let a
+  reviewer fix directly when the human explicitly says so for that case (e.g.
+  a small draft PR with no worker actively iterating on it). A reviewer added
+  via `--review-pr` shares the worker's session/worktree (pane-scoped members,
+  `session:pane_id`), so if a reviewer does fix something directly, the fix
+  lands on disk immediately but the worker's own conversation history doesn't
+  know it happened — point the worker at the PR/commit so it isn't reasoning
+  from a stale mental model of the code, instead of narrating the change to it
+  yourself.
 - **Idle with nothing pushed and no blocker** → it probably stopped early.
   Send it a nudge naming what is still missing.
 - **A question only the human can answer** (product decisions, tradeoffs,
