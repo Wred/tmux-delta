@@ -519,8 +519,16 @@ A linked pair's relays go through the same path and get the same treatment, on
 the `pair-relay` and `pair-relay-failed` events. That matters more there than
 for `send`: a relay fires from a background `run-shell` with no operator
 attached, so the stderr report is unread and the event is the only surviving
-record of what the clearing discarded — including when the delivery that
-displaced it then failed, since the draft is gone either way.
+record — including when the delivery that displaced the text then failed, since
+the draft is gone either way.
+
+Because the event is the sole record there, it distinguishes the two outcomes
+that stderr distinguishes and a bare `cleared_input` would not. `cleared_input`
+means the box drained and a draft was discarded. `spliced_onto` means it did
+not: the delivery was appended, and the receiving agent got `<draft><message>`
+as one garbled instruction. The second is the worse outcome and the one you
+want to find in the log, so it gets its own key rather than reading identically
+to a clean discard. `send` reports both the same way.
 
 `status` lists any unsent text it finds in member input boxes, with the caveat
 attached: it is usually the agent's own autosuggestion rather than a failed

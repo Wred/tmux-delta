@@ -123,16 +123,18 @@ case "$cmd" in
 	# Empty unless a test opts in, so `send` sees a drained input box and
 	# _send_to_pane confirms submission (the ordinary case here).
 	capture-pane)
-		# STUB_PANE_TEXT_ONCE: report the text on the first read only, so the
-		# box appears to drain and _send_to_pane confirms submission. Without
-		# it a static box makes every relay look unsubmitted.
-		[[ -n ${STUB_PANE_TEXT:-} ]] || exit 0
-		if [[ -n ${STUB_PANE_TEXT_ONCE:-} ]]; then
-			# The stub is a fresh process per call, so "once" has to be
-			# file-backed: after the first read the box reports empty.
-			[[ -e "$STUB_SENT.pt" ]] && exit 0
-			: > "$STUB_SENT.pt"
+		# STUB_PANE_TEXT is the first read; STUB_PANE_TEXT_NEXT (default
+		# empty) is every read after it. That pair covers all three shapes
+		# the delivery code cares about: a box that drains (NEXT empty), one
+		# that never drains (NEXT == TEXT), and a foreign draft that will not
+		# clear with our own relay then appended to it (NEXT holds ours).
+		# File-backed because the stub is a fresh process per call.
+		if [[ -e "$STUB_SENT.pt" ]]; then
+			[[ -n ${STUB_PANE_TEXT_NEXT:-} ]] && print -r -- "$STUB_PANE_TEXT_NEXT"
+			exit 0
 		fi
+		[[ -n ${STUB_PANE_TEXT:-} ]] || exit 0
+		: > "$STUB_SENT.pt"
 		print -r -- "$STUB_PANE_TEXT"
 		exit 0
 		;;
@@ -422,8 +424,9 @@ reset --max=3
 verdict --findings 2 >/dev/null
 # A static box still showing our own text: the submit check never clears.
 export STUB_PANE_TEXT='│ > [apex from:apex-pair] PAIRED REVIEW              │'
+export STUB_PANE_TEXT_NEXT="$STUB_PANE_TEXT"    # never drains
 settle "$REVIEWER" >/dev/null
-unset STUB_PANE_TEXT
+unset STUB_PANE_TEXT STUB_PANE_TEXT_NEXT
 eq "loop is marked stuck" stuck "$(mget "$REVIEWER" pair_state)"
 contains "the stuck ping names the unsent text, not a dead pane" \
 	"sitting unsent in the input box" "$(apex pending)"
@@ -434,7 +437,12 @@ eq "and so is the turn" reviewer "$(mget "$WORKER" pair_turn)"
 contains "the failed relay is logged" '"event":"pair-relay-failed"' \
 	"$(ev pair-relay-failed)"
 contains "with the _deliver return code" '"rc":5' "$(ev pair-relay-failed)"
-contains "and what the clearing discarded" "PAIRED REVIEW" \
+# NOT a discarded human draft: the box here holds our own relay text, which is
+# what makes _box_pending see it as unsubmitted in the first place. What this
+# asserts is only that the pre-send box read is carried onto the failure event.
+# The draft-plus-rc-5 cross-product is asserted separately below, where the box
+# starts foreign and then holds ours.
+contains "the pre-send box read is carried onto the event" "PAIRED REVIEW" \
 	"$(ev pair-relay-failed)"
 
 # ── the relay records what its pane-clearing discarded ───────────────
@@ -448,16 +456,55 @@ contains "and what the clearing discarded" "PAIRED REVIEW" \
 print "\ndiscarded pane input is recorded on the relay event"
 reset --max=3
 verdict --findings 2 >/dev/null
-# Non-static: the stub clears STUB_PANE_TEXT once read, so the box drains and
-# _send_to_pane confirms submission — a successful relay that still discarded
-# a draft to make room for itself.
+# The box drains after the first read, so _send_to_pane confirms submission —
+# a successful relay that still discarded a draft to make room for itself.
 export STUB_PANE_TEXT='│ > half-written note                        │'
-export STUB_PANE_TEXT_ONCE=1
 settle "$REVIEWER" >/dev/null
-unset STUB_PANE_TEXT STUB_PANE_TEXT_ONCE
+unset STUB_PANE_TEXT
 eq "the relay succeeded" 2 "$(mget "$WORKER" pair_round)"
 contains "and still recorded the discarded draft" "half-written note" \
 	"$(ev pair-relay)"
+
+# A box that will not drain is a *splice*, not a clear: the relay is appended
+# to the draft and the partner receives `<draft><relay>` as one garbled
+# instruction. cleared_input alone reported that identically to a clean
+# discard — the worse outcome reading as the benign one, on the path where the
+# stderr line that distinguishes them is unread by design. (PR #13 round 4.)
+#
+# Note what this case does *not* do: it does not fail. The submit check cannot
+# detect a splice, so the loop cannot escalate on one. The event is the only
+# place a splice is visible at all, which is why it is asserted rather than the
+# return code.
+print "\na relay that spliced says so instead of claiming a clear"
+reset --max=3
+verdict --findings 2 >/dev/null
+# Foreign draft first, then our own text appended to it and never submitted.
+export STUB_PANE_TEXT='│ > half-written human note                   │'
+export STUB_PANE_TEXT_NEXT='│ > half-written human note[apex from:apex-pair] PAIRED REVIEW │'
+settle "$REVIEWER" >/dev/null
+unset STUB_PANE_TEXT STUB_PANE_TEXT_NEXT
+# The relay *succeeds*: _box_pending is a prefix check on our own text, and a
+# box holding `<draft><relay>` is not prefixed by `<relay>`, so the submit
+# check reads it as gone. The round advances, the loop stays healthy, and the
+# worker is now acting on a garbled line. Nothing about the delivery's return
+# value can say so — which is the whole argument for the event key.
+eq "the relay is reported as delivered" 2 "$(mget "$WORKER" pair_round)"
+eq "and the loop stays active" active "$(mget "$WORKER" pair_state)"
+contains "the event names what it spliced onto" "spliced_onto" \
+	"$(ev pair-relay)"
+contains "and quotes the draft it garbled" "half-written human note" \
+	"$(print -r -- "$(ev pair-relay)" | jq -r '.spliced_onto')"
+contains "with the pre-send read recorded too" "half-written human note" \
+	"$(print -r -- "$(ev pair-relay)" | jq -r '.cleared_input')"
+
+print "\na drained box reports cleared, never spliced"
+reset --max=3
+verdict --findings 2 >/dev/null
+export STUB_PANE_TEXT='│ > a draft that does drain                   │'
+settle "$REVIEWER" >/dev/null
+unset STUB_PANE_TEXT
+eq "no spliced_onto when the clear took" "" \
+	"$(print -r -- "$(ev pair-relay)" | jq -r '.spliced_onto // ""')"
 
 print "\nan uneventful relay records no cleared_input"
 reset --max=3
@@ -465,6 +512,8 @@ verdict --findings 2 >/dev/null
 settle "$REVIEWER" >/dev/null
 eq "no cleared_input key when the box was empty" "" \
 	"$(print -r -- "$(ev pair-relay)" | jq -r '.cleared_input // ""')"
+eq "and no spliced_onto either" "" \
+	"$(print -r -- "$(ev pair-relay)" | jq -r '.spliced_onto // ""')"
 
 # ── dead partner ─────────────────────────────────────────────────────
 print "\na dead partner escalates"

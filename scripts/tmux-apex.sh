@@ -290,7 +290,14 @@ _send_to_pane() {
 	text=${text//$'\r'/ }
 	[[ -z $text ]] && return 1
 
+	# APEX_SEND_CLEARED is the pre-send box read, taken before we know whether
+	# clearing will take. APEX_SEND_SPLICED says it did not: the text below is
+	# still in the box and our message got appended to it. Callers that log
+	# APEX_SEND_CLEARED must log this too — "we discarded a draft" and "we
+	# garbled our own instruction onto one" are opposite outcomes, and on the
+	# relay path the stderr line that distinguishes them is unread by design.
 	APEX_SEND_CLEARED=$(_pane_input_line "$pane" 2>/dev/null)
+	APEX_SEND_SPLICED=""
 	if [[ -n $APEX_SEND_CLEARED ]] && [[ ${APEX_SEND_CLEAR:-1} == 1 ]]; then
 		print -u2 "tmux-apex: pane $pane had unsent input; clearing it before delivery:"
 		print -u2 "  ${APEX_SEND_CLEARED}"
@@ -299,12 +306,14 @@ _send_to_pane() {
 		local unclearable
 		unclearable=$(_clear_pane_input "$pane")
 		if [[ -n $unclearable ]]; then
+			APEX_SEND_SPLICED="$unclearable"
 			print -u2 "tmux-apex: pane $pane input box did not clear; delivery will be"
 			print -u2 "  appended to: ${unclearable}"
 		fi
 	elif [[ -n $APEX_SEND_CLEARED ]]; then
 		# APEX_SEND_CLEAR=0: report, but leave the box alone and let the
 		# splice happen rather than destroying input the operator may want.
+		APEX_SEND_SPLICED="$APEX_SEND_CLEARED"
 		print -u2 "tmux-apex: pane $pane has unsent input and APEX_SEND_CLEAR=0;"
 		print -u2 "  delivering anyway — it will be appended to: ${APEX_SEND_CLEARED}"
 	fi
@@ -844,6 +853,11 @@ _DELIVER_VIA=""
 _deliver() {
 	local target="$1" from="$2" text="$3"
 	_DELIVER_VIA=""
+	# Reset here rather than in each caller: the native path never enters
+	# _send_to_pane, so a stale value from an earlier send-keys delivery would
+	# otherwise be logged as this delivery's work.
+	APEX_SEND_CLEARED=""
+	APEX_SEND_SPLICED=""
 	[[ -z $target || -z $text ]] && return 1
 	_member_alive "$target" || return 1
 
@@ -879,8 +893,6 @@ _cmd_send() {
 	[[ -z $target ]] && _die "send: usage: send <session> <text>"
 	local text="$*"
 	[[ -z $text ]] && _die "send: empty message"
-	APEX_SEND_CLEARED=""
-
 	_member_alive "$target" || _die "send: session '$target' is not running"
 
 	local from rc manager
@@ -904,8 +916,10 @@ _cmd_send() {
 			[[ -n $manager ]] && apex_event "$manager" "$(jq -nc \
 				--arg s "$target" --arg from "$from" --arg text "$text" \
 				--arg cleared "${APEX_SEND_CLEARED:-}" \
+				--arg spliced "${APEX_SEND_SPLICED:-}" \
 				'{event:"send-unsubmitted", session:$s, from:$from, text:$text}
-				 + (if $cleared != "" then {cleared_input:$cleared} else {} end)')"
+				 + (if $cleared != "" then {cleared_input:$cleared} else {} end)
+				 + (if $spliced != "" then {spliced_onto:$spliced} else {} end)')"
 			_die "send: delivery unconfirmed"
 			;;
 		*) _die "send: delivery failed" ;;
@@ -915,12 +929,17 @@ _cmd_send() {
 	[[ -n $manager ]] && apex_event "$manager" "$(jq -nc \
 		--arg s "$target" --arg from "$from" --arg text "$text" \
 		--arg cleared "${APEX_SEND_CLEARED:-}" \
+		--arg spliced "${APEX_SEND_SPLICED:-}" \
 		'{event:"send", session:$s, from:$from, text:$text}
-		 + (if $cleared != "" then {cleared_input:$cleared} else {} end)')"
+		 + (if $cleared != "" then {cleared_input:$cleared} else {} end)
+		 + (if $spliced != "" then {spliced_onto:$spliced} else {} end)')"
 
 	print "Delivered to $target (${_DELIVER_VIA})."
-	[[ -n ${APEX_SEND_CLEARED:-} ]] && \
+	if [[ -n ${APEX_SEND_SPLICED:-} ]]; then
+		print "WARNING: input box would not clear; this was appended to: ${APEX_SEND_SPLICED}"
+	elif [[ -n ${APEX_SEND_CLEARED:-} ]]; then
 		print "Cleared unsent input first: ${APEX_SEND_CLEARED}"
+	fi
 }
 
 # ─── paired worker↔reviewer fix/re-review loop (issue #9) ────────────
@@ -989,21 +1008,24 @@ _pair_reviewer_msg() {
 # _send_to_pane's stderr report has no operator reading it, and the event log
 # is the only place the discarded text survives.
 #
-# The global is reset before delivering: on the native path _send_to_pane never
-# runs, and a stale value from an earlier send-keys delivery would otherwise be
-# logged as if this relay had cleared it.
+# If clearing did not take, the delivery was appended to whatever was there
+# (APEX_SEND_SPLICED) and the event says spliced_onto instead. The distinction
+# is the point: a discarded draft is a lost note, but a spliced one means the
+# partner agent received `<draft><relay>` as a single garbled instruction, and
+# an unattended loop has no other way to say so.
 _PAIR_RELAY_WHY=""
 _pair_relay() {
 	local manager="$1" target="$2" text="$3" rc=0
 	_PAIR_RELAY_WHY=""
-	APEX_SEND_CLEARED=""
 	_deliver "$target" "apex-pair" "$text" || rc=$?
 	local ev
 	ev=$(jq -nc --arg s "$target" --arg text "$text" \
-		--arg cleared "${APEX_SEND_CLEARED:-}" --argjson rc "$rc" \
+		--arg cleared "${APEX_SEND_CLEARED:-}" \
+		--arg spliced "${APEX_SEND_SPLICED:-}" --argjson rc "$rc" \
 		'{session:$s, text:$text}
 		 + (if $rc != 0 then {rc:$rc} else {} end)
-		 + (if $cleared != "" then {cleared_input:$cleared} else {} end)')
+		 + (if $cleared != "" then {cleared_input:$cleared} else {} end)
+		 + (if $spliced != "" then {spliced_onto:$spliced} else {} end)')
 	if (( rc )); then
 		case $rc in
 			5) _PAIR_RELAY_WHY="the relay was typed into that pane but never submitted; it is sitting unsent in the input box" ;;
