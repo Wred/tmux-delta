@@ -14,8 +14,13 @@
 # behalf on every turn and on resume, so nothing ever writes into the
 # manager's own pane — see `pending` below for why that matters.
 #
+# That pull is manager-driven, so on its own it leaves the manager blind
+# between its own turns (issue #14). `watch` closes that gap: a background
+# poller, not an agent turn, that watches durable state at ~1s and nudges the
+# manager's pane only when `pending` has something — see `watch`.
+#
 # Subcommands: init stop relink spawn send event status pending reap profiles
-#              doctor
+#              watch doctor
 
 SELF="${0:A}"
 SCRIPTS="${SELF:h}"
@@ -509,6 +514,11 @@ _cmd_init() {
 	print "  pane    : ${TMUX_PANE:-<unknown>}"
 	print "  state   : $(apex_dir "$session")"
 
+	# Hooks only fire on the manager's own turns; the watcher is what notices a
+	# worker transition in between them. Started before the check below so that
+	# doctor's report of it is accurate. See `watch`.
+	_apex_watch_start "$session"
+
 	# Loud on stderr if ping delivery isn't wired — a manager with no hooks
 	# installed is silently blind to every worker transition. See `doctor`.
 	APEX_REPO="$main" _cmd_doctor --quiet || true
@@ -520,6 +530,7 @@ _cmd_stop() {
 	[[ $(_sopt "$session" @apex_role) == manager ]] || _die "this session is not an apex manager"
 	tmux set-option -u -t "$session" @apex_role 2>/dev/null
 	tmux set-option -u -t "$session" @apex_repo 2>/dev/null
+	_apex_watch_stop "$session" >/dev/null 2>&1 || true
 	apex_event "$session" "$(jq -nc '{event:"manager-stop"}')"
 	tmux refresh-client -S 2>/dev/null
 	print "Apex mode off. Member sessions keep running; state kept at $(apex_dir "$session")"
@@ -567,6 +578,9 @@ _cmd_relink() {
 			tmux set-option -t "$session" @apex_role manager
 			[[ -n $repo ]] && tmux set-option -t "$session" @apex_repo "$repo"
 			tmux refresh-client -S 2>/dev/null
+			# A restarted session has no watcher; relink is the one place that
+			# reliably runs in a resumed manager, so restart it here too.
+			_apex_watch_start "$session"
 			return 0
 		fi
 	fi
@@ -1710,6 +1724,276 @@ _cmd_profiles() {
 	print -r -- "$rows" | awk -F'\t' '{printf "  %-10s agent=%-9s model=%-16s flags=%-20s %s\n", $1, $2, $3, $4, $5}'
 }
 
+# ─── watch (fast automatic ping delivery) ────────────────────────────
+#
+# `pending` is the whole delivery mechanism, and until now the only things
+# that called it were the manager's own Claude Code hooks: before a human
+# message, mid-turn after a tool batch, at end of turn, and on resume. All
+# four are *manager-driven*. Nothing fires on a worker transition, so a
+# manager that has finished its turn and is waiting sits blind: a worker can
+# go `attention` and stay there indefinitely while `pending` would have
+# reported it correctly the whole time, had anyone asked (issue #14).
+#
+# `watch` is the thing that asks. It is a plain background process, not an
+# agent turn — one tick is a few file reads, so it can run at ~1s cadence,
+# and it only spends manager tokens when there is genuinely something to
+# deliver. That is the entire point of the split: `/loop 20m` pays a full
+# manager turn per tick whether or not anything happened, which is why it
+# had to be slow; this pays nothing per tick and a single turn per event.
+#
+# Delivery still goes through the same door as everything else — the nudge
+# lands in the manager's input box via `_send_to_pane`, which fires the
+# manager's UserPromptSubmit hook, which calls `pending --mark-delivered`
+# and attaches the real event list as context. So the watcher never has to
+# format or dedupe pings itself, and a manager with no hooks wired degrades
+# to exactly the behaviour it has today (see `doctor`).
+#
+# Writing into the manager's pane is the thing `_record_status` deliberately
+# refuses to do (issue #5: a keystroke can splice into a human's in-flight
+# draft or the agent's own ghost autosuggestion, indistinguishable from
+# outside the pane). That refusal is why this is a separate, guarded path
+# rather than a push from the worker's hook:
+#
+#   - Only ever into a pane actually running an agent (`_pane_is_agent`).
+#   - Never while the input box has text that is *changing*. A human typing
+#     moves the box every few seconds; Claude Code's ghost text does not. So
+#     unsent input defers the nudge, and only a box that has sat byte-identical
+#     for APEX_WATCH_BOX_GRACE seconds is treated as stale and cleared —
+#     otherwise ghost text would block delivery forever, which is the failure
+#     this command exists to fix.
+#   - One nudge per distinct set of undelivered pings, re-sent at most once
+#     every APEX_WATCH_RENUDGE seconds if the manager still hasn't consumed
+#     them (a queued message behind a long turn, a swallowed Enter).
+#
+# Knobs: APEX_WATCH_INTERVAL (1s), APEX_WATCH_BOX_GRACE (15s),
+# APEX_WATCH_RENUDGE (60s).
+
+APEX_WATCH_INTERVAL=${APEX_WATCH_INTERVAL:-1}
+APEX_WATCH_BOX_GRACE=${APEX_WATCH_BOX_GRACE:-15}
+APEX_WATCH_RENUDGE=${APEX_WATCH_RENUDGE:-60}
+
+_apex_watch_pidfile()   { printf '%s/watch.pid' "$(apex_dir "$1")"; }
+_apex_watch_statefile() { printf '%s/watch-state.json' "$(apex_dir "$1")"; }
+
+# _apex_pending_sig <manager> — a stable one-line fingerprint of everything
+# `pending` would report right now, or "" for nothing to report.
+#
+# This is the cheap gate the tick rate depends on, so it deliberately does
+# not go near `_member_facts`: that shells out to git and the PR cache per
+# member, which is fine once per manager turn and far too expensive once per
+# second. Same predicate as `_cmd_pending` (idle/attention, seq ahead of
+# pinged_seq), read straight out of the member state files in one jq.
+#
+# The seq is part of the fingerprint, not just the session: a worker that
+# settles, gets pinged, wakes and settles again is a new event to deliver,
+# and keying on session alone would swallow it as a duplicate.
+_apex_pending_sig() {
+	local manager="$1" dir
+	dir=$(apex_members_dir "$manager")
+	local -a files=("$dir"/*.json(N)) names=()
+	(( ${#files} )) || return 0
+	local f
+	for f in "${files[@]}"; do names+=("${${f:t}:r}"); done
+	# Member ids are "<session>:<pane_id>" and can hold neither a comma nor a
+	# newline, so one joined --arg is enough to line the names up with the
+	# slurped documents. jq's --args cannot be used for this: it would swallow
+	# the file list as positional arguments and leave jq reading stdin.
+	jq -rs --arg names "${(j:,:)names}" '
+		($names | split(",")) as $n
+		| [ range(0; length) as $i
+		    | .[$i]
+		    | select((.status == "idle" or .status == "attention")
+		             and ((.seq // 0) != (.pinged_seq // -1)))
+		    | "\($n[$i])#\(.seq // 0)" ]
+		| sort | join(",")' "${files[@]}" 2>/dev/null
+}
+
+# _apex_watch_state <manager> <key> / _apex_watch_save <manager> <patch-json>
+#
+# Tick state lives in a file rather than in shell variables so that a
+# `watch --once` invocation behaves identically to one iteration of the
+# daemon loop — that is what makes the decision logic testable, and it also
+# means a restarted daemon does not re-nudge for pings it already sent.
+_apex_watch_state() {
+	local f
+	f=$(_apex_watch_statefile "$1")
+	[[ -f $f ]] || return 0
+	jq -r --arg k "$2" '.[$k] // "" | tostring' "$f" 2>/dev/null
+}
+
+_apex_watch_save() {
+	local manager="$1" patch="$2" f base
+	f=$(_apex_watch_statefile "$manager")
+	base='{}'
+	[[ -f $f ]] && base=$(cat "$f")
+	apex_write_atomic "$f" "$(printf '%s\n%s\n' "$base" "$patch" | jq -s '.[0] * .[1]')"
+}
+
+# _apex_watch_tick <manager> — one poll. Prints a line per action taken so
+# `watch --once` is inspectable by hand; silent when there is nothing to do.
+_apex_watch_tick() {
+	local manager="$1" sig now
+	sig=$(_apex_pending_sig "$manager")
+	now=$(date +%s)
+
+	if [[ -z $sig ]]; then
+		# Nothing outstanding: forget the box we were waiting on, so the next
+		# real event starts its grace window from scratch instead of inheriting
+		# a stale timestamp and clearing someone's draft immediately.
+		_apex_watch_save "$manager" '{"box":"","box_since":0}'
+		return 0
+	fi
+
+	local pane
+	pane=$(_agent_pane "$manager")
+	if ! _pane_is_agent "$pane"; then
+		print -r -- "no agent pane for $manager; not delivering"
+		return 0
+	fi
+
+	local box last_box box_since
+	box=$(_pane_input_line "$pane" 2>/dev/null)
+	last_box=$(_apex_watch_state "$manager" box)
+	box_since=$(_apex_watch_state "$manager" box_since); [[ -z $box_since ]] && box_since=0
+
+	if [[ -n $box ]]; then
+		if [[ $box != $last_box ]]; then
+			_apex_watch_save "$manager" \
+				"$(jq -nc --arg b "$box" --argjson t "$now" '{box:$b, box_since:$t}')"
+			print -r -- "manager input box busy; deferring"
+			return 0
+		fi
+		if (( now - box_since < APEX_WATCH_BOX_GRACE )); then
+			print -r -- "manager input box unchanged for $(( now - box_since ))s; deferring"
+			return 0
+		fi
+		# Sat identical past the grace window: ghost text or an abandoned
+		# draft. _send_to_pane clears it, and says what it cleared on stderr
+		# and in the event log.
+	else
+		[[ -n $last_box ]] && _apex_watch_save "$manager" '{"box":"","box_since":0}'
+	fi
+
+	local last_sig last_nudge
+	last_sig=$(_apex_watch_state "$manager" sig)
+	last_nudge=$(_apex_watch_state "$manager" nudged_at); [[ -z $last_nudge ]] && last_nudge=0
+	if [[ $sig == $last_sig ]] && (( now - last_nudge < APEX_WATCH_RENUDGE )); then
+		return 0
+	fi
+
+	local rc=0
+	_send_to_pane "$pane" \
+		"[apex] a member just changed state — the pending events are attached to this message; review them and act." \
+		|| rc=$?
+
+	_apex_watch_save "$manager" "$(jq -nc --arg s "$sig" --argjson t "$now" \
+		'{sig:$s, nudged_at:$t, box:"", box_since:0}')"
+	apex_event "$manager" "$(jq -nc --arg s "$sig" --argjson rc "$rc" \
+		--arg cleared "${APEX_SEND_CLEARED:-}" \
+		'{event:"watch-nudge", pending:$s, rc:$rc}
+		 + (if $cleared != "" then {cleared_input:$cleared} else {} end)')"
+
+	case $rc in
+		0) print -r -- "nudged $manager for: $sig" ;;
+		2) print -r -- "nudged $manager for: $sig (typed but not confirmed submitted)" ;;
+		*) print -r -- "nudge to $manager failed (rc=$rc)" ;;
+	esac
+}
+
+# _apex_watch_running <manager> — pid of a live watcher, or nothing.
+_apex_watch_running() {
+	local f pid
+	f=$(_apex_watch_pidfile "$1")
+	[[ -f $f ]] || return 1
+	pid=$(cat "$f" 2>/dev/null)
+	[[ -n $pid ]] && kill -0 "$pid" 2>/dev/null || return 1
+	print -r -- "$pid"
+}
+
+# _apex_watch_start <manager> — idempotent; launches the daemon detached from
+# the caller via the tmux server, the same way the status-bar refreshers are
+# started. A hook process or an agent turn is far too short-lived to parent
+# it, and run-shell -b outlives both.
+_apex_watch_start() {
+	local manager="$1"
+	_apex_watch_running "$manager" >/dev/null && return 0
+	tmux run-shell -b "${SELF} watch --daemon ${(q)manager}" 2>/dev/null
+}
+
+_apex_watch_stop() {
+	local manager="$1" pid
+	pid=$(_apex_watch_running "$manager") || { rm -f "$(_apex_watch_pidfile "$manager")"; return 1; }
+	kill "$pid" 2>/dev/null
+	rm -f "$(_apex_watch_pidfile "$manager")"
+	return 0
+}
+
+_cmd_watch() {
+	local mode=loop manager="" a
+	for a in "$@"; do
+		case "$a" in
+			--once)   mode=once ;;
+			--stop)   mode=stop ;;
+			--status) mode=status ;;
+			--daemon) mode=daemon ;;
+			-*)       _die "watch: unknown option '$a'" ;;
+			*)        manager="$a" ;;
+		esac
+	done
+	[[ -z $manager ]] && manager=$(_require_manager)
+	APEX_SESSION="$manager"
+
+	local pid
+	case $mode in
+		status)
+			if pid=$(_apex_watch_running "$manager"); then
+				# The interval the *daemon* was started with, not this process's
+				# default — they are different knobs read in different shells.
+				local iv
+				iv=$(_apex_watch_state "$manager" interval); [[ -z $iv ]] && iv='?'
+				print "watch: running (pid $pid, interval ${iv}s) for $manager"
+			else
+				print "watch: not running for $manager"
+				return 1
+			fi
+			return 0 ;;
+		stop)
+			if _apex_watch_stop "$manager"; then
+				print "watch: stopped for $manager"
+			else
+				print "watch: was not running for $manager"
+			fi
+			return 0 ;;
+		once)
+			_apex_watch_tick "$manager"
+			return 0 ;;
+	esac
+
+	# daemon / loop: one per manager.
+	if pid=$(_apex_watch_running "$manager"); then
+		print "watch: already running (pid $pid) for $manager"
+		return 0
+	fi
+	apex_init_dirs "$manager"
+	local pidfile
+	pidfile=$(_apex_watch_pidfile "$manager")
+	printf '%d\n' "$$" > "$pidfile"
+	trap 'rm -f "$pidfile"; exit 0' EXIT INT TERM
+	_apex_watch_save "$manager" "$(jq -nc --argjson i "$APEX_WATCH_INTERVAL" '{interval:$i}')"
+	apex_event "$manager" "$(jq -nc --argjson i "$APEX_WATCH_INTERVAL" \
+		'{event:"watch-start", interval:$i}')"
+
+	while true; do
+		sleep "$APEX_WATCH_INTERVAL"
+		# Stop when the manager goes away or steps out of apex mode, so `stop`
+		# and a killed session both retire the watcher without extra plumbing.
+		tmux has-session -t "=$manager" 2>/dev/null || break
+		[[ $(_sopt "$manager" @apex_role) == manager ]] || break
+		_apex_watch_tick "$manager" >/dev/null 2>&1 || true
+	done
+	rm -f "$pidfile"
+}
+
 # ─── doctor (ping-delivery self-check) ───────────────────────────────
 
 # The manager's pings are delivered by Claude Code hooks calling
@@ -1810,8 +2094,23 @@ _cmd_doctor() {
 		if _apex_hook_wired "$e"; then present+=("$e"); else missing+=("$e"); fi
 	done
 
+	# The watcher is what turns those hooks from "fires on the manager's own
+	# turns" into "fires when a worker actually changes state" (issue #14).
+	# Advisory only: its absence is a latency problem, not a delivery one, so
+	# it does not change doctor's exit code.
+	local watch_line pid mgr
+	mgr=$(_cur_session 2>/dev/null)
+	if [[ -n $mgr ]] && pid=$(_apex_watch_running "$mgr" 2>/dev/null); then
+		watch_line="Fast poller: running (pid $pid, ${APEX_WATCH_INTERVAL}s)."
+	else
+		watch_line="Fast poller: NOT running — the manager will only notice member
+  transitions on its own turns. Start it with '${SELF} watch' (init does this
+  automatically; a resumed session restarts it on its first hook)."
+	fi
+
 	if (( ${#missing} == 0 )); then
 		$quiet || print "Ping delivery: all hooks wired (${(j:, :)present})."
+		$quiet || print "$watch_line"
 		return 0
 	fi
 
@@ -1828,6 +2127,7 @@ _cmd_doctor() {
 	done
 	print -u2 ""
 	print -u2 "  until then, run '${SELF} pending' by hand — it reports the same events."
+	print -u2 "$watch_line"
 	return 1
 }
 
@@ -1847,6 +2147,7 @@ case "${1:-}" in
 	event)    shift; _cmd_event "$@" ;;
 	status)   shift; _cmd_status "$@" ;;
 	pending)  shift; _cmd_pending "$@" ;;
+	watch)    shift; _cmd_watch "$@" ;;
 	reap)     shift; _cmd_reap "$@" ;;
 	profiles) shift; _cmd_profiles "$@" ;;
 	_settle)  shift; _cmd_settle "$@" ;;
@@ -1875,6 +2176,8 @@ case "${1:-}" in
 		print "                                 (the loop's termination signal) [--note TEXT]"
 		print "  status [--json]                state of every member"
 		print "  pending [--mark-delivered]     members not yet delivered to the manager"
+		print "  watch [--once|--status|--stop] background poller that nudges the manager"
+		print "                                 within ~1s of a member going idle/attention"
 		print "  reap [--yes]                   clean up finished/dead members"
 		print "  profiles                       list available spawn profiles"
 		print "  doctor                         check that ping-delivery hooks are wired"

@@ -466,6 +466,36 @@ The script exits immediately in any session that isn't an apex manager, so it is
 safe to install globally — which it must be, since the manager can be any
 session.
 
+All four hooks are still *manager-driven*: they fire on the manager's own turns,
+never on a worker's transition. So between two manager turns the manager is
+blind — a worker can go `attention` and sit there indefinitely while `pending`
+would have reported it correctly the whole time (issue #14). `tmux-apex.sh
+watch` closes that gap. It is a plain background process, not an agent turn:
+one tick reads the member state files and nothing else (no `git`, no `gh`), so
+it runs at ~1s, and it costs the manager nothing until there is something to
+deliver. When there is, it types one short nudge into the manager's pane, which
+fires `UserPromptSubmit`, which attaches the real `pending` output as context —
+so the watcher never formats or dedupes a ping itself.
+
+`init` starts it, `stop` retires it, and `relink` restarts it in a resumed
+session. `watch --status` / `--stop` drive it by hand, and `watch --once` runs a
+single tick and says what it decided.
+
+Writing into the manager's pane is exactly what the pull design refuses to do,
+so the watcher is guarded rather than trusted:
+
+| Guard | Why |
+|-------|-----|
+| pane must be running an agent | typing into a shell would *execute* the nudge |
+| unsent input defers the nudge | never clobber a human mid-draft (issue #5) |
+| a box unchanged for `APEX_WATCH_BOX_GRACE` is cleared anyway | a human typing moves the box within seconds; Claude Code's ghost autosuggestion never does (issue #10), and deferring to it forever would restore the very blindness this fixes |
+| one nudge per distinct pending set, re-sent at most every `APEX_WATCH_RENUDGE` | a nudge queued behind a long manager turn must not turn into one duplicate per second |
+
+Tunable with `APEX_WATCH_INTERVAL` (1s), `APEX_WATCH_BOX_GRACE` (15s) and
+`APEX_WATCH_RENUDGE` (60s). This deliberately is not `/loop 1s`: a `/loop` tick
+spends a full manager turn whether or not anything happened, which is why that
+fallback has to be slow. Here the polling is free and only the events cost.
+
 `scripts/install-agent-hooks.sh` writes all four (see Installation step 3), and
 `tmux-apex.sh doctor` reports which of them are actually wired, argument
 included; `init` runs the same check and warns if any are missing. Both halves
@@ -604,6 +634,7 @@ them when launching the agent:
 ```bash
 tests/apex-delivery.test.sh
 tests/apex-pair.test.sh
+tests/apex-watch.test.sh
 ```
 
 Covers apex ping delivery: which output channel `apex-manager-notify.sh` picks
@@ -626,6 +657,14 @@ It also pins the two halves together: `install-agent-hooks.sh` runs into a
 throwaway `$HOME` and `doctor` has to accept what it wrote, both from scratch and
 on top of a stale argument-less wiring. Those two drifting apart is what
 silently un-wires delivery on every machine at once.
+
+`apex-watch.test.sh` covers the fast poller: that the tick's gate stays cheap
+and matches `pending`'s predicate, that one event produces exactly one nudge,
+and — the part that makes writing into the manager's pane defensible — that a
+draft still being typed is never clobbered while a box frozen past the grace
+window still gets delivery. One tick is a pure function of the state files, the
+captured pane and its own saved state, so a fake `tmux` covers all of it; no
+daemon and no live agent are involved.
 
 ## Shell functions (gwt.zsh)
 
