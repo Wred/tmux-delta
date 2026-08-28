@@ -107,6 +107,45 @@ _pane_is_agent() {
 	(( ${allowed[(Ie)$cmd]} ))
 }
 
+# _apex_utf8_locale — name of a UTF-8 locale to run multibyte pattern matches
+# under, or "" if this machine has none.
+#
+# The box-drawing characters the prompt heuristic matches on are multibyte, and
+# under a single-byte locale (LC_ALL=C, which hooks and cron can hand us) a
+# bracket expression like [│┃|] matches individual *bytes* of them instead. The
+# result is not an error, it is a silently wrong answer: the caret check then
+# fails, every box reads as empty, and `send` quietly stops clearing before it
+# types. Pin the locale rather than inherit it.
+#
+# Cached in APEX_UTF8_LOCALE — `locale -a` is not free and this runs per member
+# in `status`.
+_apex_utf8_locale() {
+	if [[ -n ${APEX_UTF8_LOCALE+set} ]]; then
+		print -r -- "$APEX_UTF8_LOCALE"
+		return 0
+	fi
+	local cur=${LC_ALL:-${LC_CTYPE:-${LANG:-}}}
+	if [[ ${cur:l} == *utf(-|)8* ]]; then
+		APEX_UTF8_LOCALE=$cur
+		print -r -- "$APEX_UTF8_LOCALE"
+		return 0
+	fi
+	# Prefer C.UTF-8 (no collation surprises) over a language locale; take any
+	# UTF-8 locale over none. Naming differs by platform: glibc spells it
+	# "C.utf8", macOS ships only language locales.
+	local l first=""
+	APEX_UTF8_LOCALE=""
+	for l in ${(f)"$(locale -a 2>/dev/null)"}; do
+		case ${l:l} in
+			c.utf8|c.utf-8)             APEX_UTF8_LOCALE=$l; break ;;
+			en_us.utf8|en_us.utf-8)     APEX_UTF8_LOCALE=$l ;;
+			*utf8|*utf-8) [[ -z $first ]] && first=$l ;;
+		esac
+	done
+	[[ -z $APEX_UTF8_LOCALE ]] && APEX_UTF8_LOCALE=$first
+	print -r -- "$APEX_UTF8_LOCALE"
+}
+
 # _pane_input_line <pane> — the text currently sitting unsent in the agent's
 # input box, or "" if the box looks empty.
 #
@@ -136,6 +175,11 @@ _pane_is_agent() {
 #     frame to disambiguate with.
 _pane_input_line() {
 	setopt localoptions extendedglob
+	# Scoped to this function; zsh calls setlocale() on assignment, and the
+	# restore on return puts back whatever the caller had.
+	local -x LC_ALL
+	LC_ALL=$(_apex_utf8_locale)
+	[[ -z $LC_ALL ]] && unset LC_ALL
 	local pane="$1" cap line text
 	local boxed="" boxed_seen="" bare=""
 	[[ -n $pane ]] || return 1

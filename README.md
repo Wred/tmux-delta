@@ -454,6 +454,11 @@ that pane's input box:
   Enter would submit whatever the box happens to hold, which after a
   successful send is often a fresh autosuggestion, i.e. the very thing this
   is here to prevent.
+- **It pins the locale for the check.** The box edges it matches on are
+  multibyte, so under a single-byte locale (`LC_ALL=C`, which hooks and cron
+  hand it often enough) every box would read as empty and the clearing step
+  would quietly stop happening. It runs the match under a UTF-8 locale of its
+  own choosing, scoped to the call.
 
 `status` lists any unsent text it finds in member input boxes, with the caveat
 attached: it is usually the agent's own autosuggestion rather than a failed

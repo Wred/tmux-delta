@@ -270,5 +270,36 @@ _send_to_pane %1 "run the tests and report back" >/dev/null 2>&1 || rc=$?
 eq "retry survives a mid-paste-dropped Enter" 0 "$rc"
 unset PASTE_WINDOW DROP_FIRST_ENTER
 
+# ── locale ───────────────────────────────────────────────────────────
+# The box edges are multibyte. Under a single-byte locale a bracket expression
+# matches their individual bytes instead, the caret check then fails, and every
+# box reads as empty — so `send` silently stops clearing before it types. Hooks
+# and cron hand us LC_ALL=C often enough that this has to be pinned, not
+# inherited.
+print "\nlocale"
+
+unset DRAIN_AT_ENTER DRAIN_DELAY NO_CLEAR PASTE_WINDOW DROP_FIRST_ENTER
+export DRAIN_ON_ENTER=1
+
+pane '│ > mark ready for review              │'
+unset APEX_UTF8_LOCALE   # cold cache: the pick must happen under C too
+eq "reads the box under LC_ALL=C" "mark ready for review" \
+	"$(LC_ALL=C _pane_input_line %1)"
+
+pane '│ > mark ready for review              │'
+unset APEX_UTF8_LOCALE
+out=$(LC_ALL=C _send_to_pane %1 "run the tests first" 2>&1; print "rc=$?")
+contains "clears the box under LC_ALL=C" "C-u" "$(keys)"
+contains "still delivers under LC_ALL=C" "rc=0" "$out"
+
+# Pinning is scoped to the call: nothing else in the process gets re-localed.
+eq "leaves the caller's locale alone" "C" \
+	"$(LC_ALL=C; _pane_input_line %1 >/dev/null; print -r -- "$LC_ALL")"
+
+# A machine with no UTF-8 locale at all must degrade to inheriting, not break.
+pane '│ > mark ready for review              │'
+eq "no UTF-8 locale available: still runs" "mark ready for review" \
+	"$(APEX_UTF8_LOCALE= _pane_input_line %1)"
+
 print "\n$PASS passed, $FAIL failed"
 (( FAIL == 0 ))
