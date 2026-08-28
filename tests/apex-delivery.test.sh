@@ -229,9 +229,13 @@ crossed=$(fixture crossed "{\"hooks\":{
 out=$(doctor "$crossed")
 contains "verb from another event counts as missing" "PostToolBatch, Stop" "$out"
 
-# A verb that is a prefix of the real one must not match.
+# A verb that is a prefix of the real one must not match. Anchored to the
+# missing-line text, not to a bare "SessionStart": doctor names the event on
+# the "wired already" line too, so a looser needle passes even with the verb
+# check removed entirely — i.e. it could not fail for the bug it guards.
 prefix=$(fixture prefix "{\"hooks\":{\"SessionStart\":[$(entry session)]}}")
-contains "prefix of a verb does not match" "SessionStart" "$(doctor "$prefix")"
+contains "prefix of a verb does not match" \
+	"missing Claude Code hooks: UserPromptSubmit, SessionStart" "$(doctor "$prefix")"
 
 # Malformed JSON must not crash or read as wired.
 malformed=$(fixture malformed '{"hooks": {"Stop": [')
@@ -349,6 +353,14 @@ eq "installer is idempotent" "$before" "$(cat "$installed")"
 # repointing. That is the state every `tmux source` produces until the
 # installer fix lands, so the installer has to converge from it — rewriting
 # both entries to the same command would leave the hook firing twice.
+#
+# Three groups, because which group a foreign hook sits in decides what is at
+# risk. other-tool.sh shares a group with the entry collapse *keeps*, so it is
+# never in danger. keep-me.sh shares a group with a duplicate that collapse
+# *drops* — and once that duplicate is gone the group holds nothing collapse
+# owns, so an implementation that discards the group rather than pruning the
+# hook out of it silently eats somebody else's hook. That is the case worth
+# pinning; the first one passes even with no collapse pass at all.
 dup_home="$TMPROOT/home-dup"
 mkdir -p "$dup_home/.claude"
 cat > "$dup_home/.claude/settings.json" <<'JSON'
@@ -357,7 +369,10 @@ cat > "$dup_home/.claude/settings.json" <<'JSON'
 		{"matcher":"","hooks":[
 			{"type":"command","command":"/new/clone/scripts/apex-manager-notify.sh prompt","timeout":10},
 			{"type":"command","command":"/unrelated/other-tool.sh init"}]},
-		{"matcher":"","hooks":[{"type":"command","command":"/old/clone/scripts/apex-manager-notify.sh","timeout":10}]}
+		{"matcher":"","hooks":[{"type":"command","command":"/old/clone/scripts/apex-manager-notify.sh","timeout":10}]},
+		{"matcher":"","hooks":[
+			{"type":"command","command":"/old/clone/scripts/apex-manager-notify.sh","timeout":10},
+			{"type":"command","command":"/unrelated/keep-me.sh"}]}
 	]}}
 JSON
 HOME="$dup_home" "$SCRIPTS/install-agent-hooks.sh" >/dev/null 2>&1 || true
@@ -366,6 +381,8 @@ eq "duplicate notify entries collapse to one" 1 \
 	"$(jq '[.hooks.UserPromptSubmit[]?.hooks[]?.command? // "" | select(test("apex-manager-notify"))] | length' "$dup_installed")"
 eq "collapse keeps unrelated hooks on the same event" 1 \
 	"$(jq '[.hooks.UserPromptSubmit[]?.hooks[]?.command? // "" | select(test("other-tool"))] | length' "$dup_installed")"
+eq "collapse prunes the dropped duplicate's group instead of discarding it" 1 \
+	"$(jq '[.hooks.UserPromptSubmit[]?.hooks[]?.command? // "" | select(test("keep-me"))] | length' "$dup_installed")"
 dup_rc=0
 APEX_REPO="$TMPROOT/nonexistent" HOME="$dup_home" \
 	"$SCRIPTS/tmux-apex.sh" doctor >/dev/null 2>&1 || dup_rc=$?
