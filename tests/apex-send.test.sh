@@ -38,9 +38,15 @@ lacks() { if [[ $3 != *$2* ]]; then ok "$1"; else bad "$1" "expected NOT to cont
 #                   verify that reads the pane without waiting sees stale text
 #   NO_CLEAR        C-u does not empty the box (a cursor or multi-line draft
 #                   that a single kill-to-start cannot deal with)
+#   PASTE_WINDOW    an Enter arriving within this many seconds of the literal
+#                   send is dropped mid-paste — the codex behaviour the
+#                   settle sleep exists for
+#   DROP_FIRST_ENTER  the first Enter is swallowed outright, forcing the retry
+#                   loop to be the thing that delivers
 BIN="$TMPROOT/bin"; mkdir -p "$BIN"
 cat > "$BIN/tmux" <<'STUB'
-#!/usr/bin/env bash
+#!/usr/bin/env zsh
+zmodload zsh/datetime 2>/dev/null
 drain() {
 	if [ -n "${DRAIN_DELAY:-}" ]; then
 		( sleep "$DRAIN_DELAY"; printf '%s\n' "$EMPTY_BOX" > "$PANE_FILE" ) &
@@ -60,10 +66,17 @@ case "$1" in
 		case "$args" in
 			*"-l -- "*)
 				# A literal send lands in the input box, unsubmitted.
-				printf '\xe2\x94\x82 > %s   \xe2\x94\x82\n' "${args#*-l -- }" > "$PANE_FILE" ;;
+				printf '\xe2\x94\x82 > %s   \xe2\x94\x82\n' "${args#*-l -- }" > "$PANE_FILE"
+				printf '%s' "${EPOCHREALTIME:-0}" > "$PASTE_AT" ;;
 			*Enter*)
 				n=$(( $(cat "$ENTER_COUNT" 2>/dev/null || echo 0) + 1 ))
 				printf '%s' "$n" > "$ENTER_COUNT"
+				if [ -n "${PASTE_WINDOW:-}" ]; then
+					# Dropped if it landed inside the paste window.
+					since=$(( ${EPOCHREALTIME:-0} - $(cat "$PASTE_AT" 2>/dev/null || echo 0) ))
+					(( since < PASTE_WINDOW )) && exit 0
+				fi
+				[ -n "${DROP_FIRST_ENTER:-}" ] && [ "$n" -eq 1 ] && exit 0
 				if [ -n "${DRAIN_ON_ENTER:-}" ]; then
 					drain
 				elif [ -n "${DRAIN_AT_ENTER:-}" ] && [ "$n" -ge "$DRAIN_AT_ENTER" ]; then
@@ -79,7 +92,7 @@ STUB
 chmod +x "$BIN/tmux"
 export PATH="$BIN:$PATH"
 export PANE_FILE="$TMPROOT/pane" KEYS_LOG="$TMPROOT/keys"
-export ENTER_COUNT="$TMPROOT/enters"
+export ENTER_COUNT="$TMPROOT/enters" PASTE_AT="$TMPROOT/paste-at"
 export EMPTY_BOX='│ >                                    │'
 
 # Source the script under test. Its dispatch prints usage when called with no
@@ -241,6 +254,21 @@ rc=0
 _send_to_pane %1 "stuck message here" >/dev/null 2>&1 || rc=$?
 eq "box never drains: reports failure, not success" 2 "$rc"
 eq "box never drains: re-sends Enter three times" 4 "$(keys | grep -c Enter)"
+
+# ── the paste/Enter race, in the retry path too ──────────────────────
+# tmux wraps a literal send in bracketed paste and codex drops an Enter that
+# lands inside it. The first send sleeps for that; the retries have to as well,
+# or every retry is less likely to land than the attempt it is retrying and a
+# recoverable swallowed Enter turns into a hard `send: delivery unconfirmed`.
+print "\nmid-paste Enter"
+
+unset DRAIN_ON_ENTER DRAIN_AT_ENTER DRAIN_DELAY
+export DRAIN_ON_ENTER=1 PASTE_WINDOW=0.15 DROP_FIRST_ENTER=1
+pane "$EMPTY_BOX"
+rc=0
+_send_to_pane %1 "run the tests and report back" >/dev/null 2>&1 || rc=$?
+eq "retry survives a mid-paste-dropped Enter" 0 "$rc"
+unset PASTE_WINDOW DROP_FIRST_ENTER
 
 print "\n$PASS passed, $FAIL failed"
 (( FAIL == 0 ))

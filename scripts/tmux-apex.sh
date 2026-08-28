@@ -269,6 +269,11 @@ _send_to_pane() {
 		_box_pending "$left" "$text" || return 0
 		_clear_pane_input "$pane" >/dev/null
 		tmux send-keys -t "$pane" -l -- "$text" || return 1
+		# Hazard 2 applies to the retype exactly as it does to the first
+		# send: without this gap every retry fires its Enter mid-paste, and
+		# the retry loop is systematically less likely to land than the
+		# attempt it is retrying.
+		sleep 0.2
 		tmux send-keys -t "$pane" Enter || return 1
 	done
 	# The Enter above has had no time to land yet — wait before the verdict,
