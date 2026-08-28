@@ -102,7 +102,28 @@ install_claude_hooks() {
 				))
 			else
 				.hooks[$event] += [({matcher: $matcher, hooks: [({type:"command", command: $cmd} + $extra)]})]
-			end
+			end |
+			# Collapse the duplicates that rewrite can produce. $pat matches by
+			# script basename, so if one event carries two entries for the same
+			# script — which is what an older installer using a stricter pattern
+			# leaves behind, having appended rather than repointed — both get
+			# rewritten to the identical command and the hook would then run
+			# twice per event. Keep the first, drop the rest. This only ever
+			# removes entries whose command is exactly what the pass above just
+			# wrote, so a hook belonging to anything else is never touched.
+			.hooks[$event] = (reduce .hooks[$event][] as $g ([];
+				. as $out
+				| ($g.hooks // []) as $hs
+				| ([$out[].hooks[]? | select((.command? // "") == $cmd)] | length) as $already
+				| ($hs | to_entries | map(select((.value.command? // "") == $cmd) | .key)) as $owned
+				| if ($owned | length) == 0 then $out + [$g]
+				  else
+				  	(if $already > 0 then -1 else $owned[0] end) as $keep
+				  	| ($hs | to_entries
+				  	   | map(select(((.value.command? // "") != $cmd) or (.key == $keep)) | .value)) as $kept
+				  	| if ($kept | length) == 0 then $out else $out + [$g | .hooks = $kept] end
+				  end
+			))
 		' "$settings" > "$tmp"
 		if $DRY_RUN; then
 			if diff -q "$settings" "$tmp" >/dev/null; then

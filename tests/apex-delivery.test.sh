@@ -343,6 +343,34 @@ before=$(cat "$installed")
 HOME="$inst_home" "$SCRIPTS/install-agent-hooks.sh" >/dev/null 2>&1 || true
 eq "installer is idempotent" "$before" "$(cat "$installed")"
 
+# A machine that ran the *old* installer after this one had already run ends
+# up with two notify entries on the same event: the correct one, plus an
+# argument-less duplicate the old stricter pattern appended instead of
+# repointing. That is the state every `tmux source` produces until the
+# installer fix lands, so the installer has to converge from it — rewriting
+# both entries to the same command would leave the hook firing twice.
+dup_home="$TMPROOT/home-dup"
+mkdir -p "$dup_home/.claude"
+cat > "$dup_home/.claude/settings.json" <<'JSON'
+{"hooks":{
+	"UserPromptSubmit":[
+		{"matcher":"","hooks":[
+			{"type":"command","command":"/new/clone/scripts/apex-manager-notify.sh prompt","timeout":10},
+			{"type":"command","command":"/unrelated/other-tool.sh init"}]},
+		{"matcher":"","hooks":[{"type":"command","command":"/old/clone/scripts/apex-manager-notify.sh","timeout":10}]}
+	]}}
+JSON
+HOME="$dup_home" "$SCRIPTS/install-agent-hooks.sh" >/dev/null 2>&1 || true
+dup_installed="$dup_home/.claude/settings.json"
+eq "duplicate notify entries collapse to one" 1 \
+	"$(jq '[.hooks.UserPromptSubmit[]?.hooks[]?.command? // "" | select(test("apex-manager-notify"))] | length' "$dup_installed")"
+eq "collapse keeps unrelated hooks on the same event" 1 \
+	"$(jq '[.hooks.UserPromptSubmit[]?.hooks[]?.command? // "" | select(test("other-tool"))] | length' "$dup_installed")"
+dup_rc=0
+APEX_REPO="$TMPROOT/nonexistent" HOME="$dup_home" \
+	"$SCRIPTS/tmux-apex.sh" doctor >/dev/null 2>&1 || dup_rc=$?
+eq "doctor accepts the collapsed result" 0 "$dup_rc"
+
 # ── summary ──────────────────────────────────────────────────────────
 print "\n$PASS passed, $FAIL failed"
 (( FAIL == 0 ))
