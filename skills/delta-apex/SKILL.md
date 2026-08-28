@@ -235,7 +235,8 @@ So:
   text actually left the input box before claiming success.
 - Do not submit it. It is a guess about what someone might type next, not an
   instruction from anyone.
-- `send` clears the box before it types, and tells you what it cleared (on
+- `send` clears the box before it types where it can, and tells you what it
+  cleared — including when the box refused to clear (on
   stderr and as `cleared_input` on the `send` event in `status --json`), so the
   next delivery cannot be spliced onto it. Set `APEX_SEND_CLEAR=0` to keep the
   old append-anyway behaviour if you ever need it.

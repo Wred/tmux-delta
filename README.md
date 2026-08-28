@@ -438,16 +438,22 @@ The manager's own pane is never typed into, but `send` still delivers into a
 *member's* pane with `send-keys`, so it has to cope with whatever is already in
 that pane's input box:
 
-- **It clears the box first.** An idle Claude Code box is not reliably empty —
-  it paints predictive autosuggestion text into it — and appending to that
-  would hand the worker one spliced line. Whatever was cleared is reported on
-  stderr and stored as `cleared_input` on the `send` event, so nothing
-  disappears silently. `APEX_SEND_CLEAR=0` restores the old append-anyway
-  behaviour.
+- **It tries to clear the box first.** An idle Claude Code box is not reliably
+  empty — it paints predictive autosuggestion text into it — and appending to
+  that would hand the worker one spliced line. Whatever was cleared is
+  reported on stderr and stored as `cleared_input` on the `send` event, so
+  nothing disappears silently. Clearing is best effort and verified rather
+  than assumed: if the box will not drain, `send` says so on stderr and
+  splices rather than claiming a clear it did not achieve.
+  `APEX_SEND_CLEAR=0` restores the old append-anyway behaviour.
 - **It verifies delivery.** tmux wraps a literal send in bracketed paste and
   some agent TUIs drop an Enter that lands mid-paste, so `send` reads the pane
-  back, re-sends Enter up to three times, and fails loudly (`send-unsubmitted`
-  event) rather than reporting a delivery that never happened.
+  back, retries up to three times, and fails loudly (`send-unsubmitted` event,
+  which records the text) rather than reporting a delivery that never
+  happened. Retries clear and retype rather than firing a bare Enter — a bare
+  Enter would submit whatever the box happens to hold, which after a
+  successful send is often a fresh autosuggestion, i.e. the very thing this
+  is here to prevent.
 
 `status` lists any unsent text it finds in member input boxes, with the caveat
 attached: it is usually the agent's own autosuggestion rather than a failed

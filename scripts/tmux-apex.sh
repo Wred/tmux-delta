@@ -123,23 +123,84 @@ _pane_is_agent() {
 # predicts a plausible next input and paints it into the empty box, which
 # looks identical here (issue #10). Callers must phrase what they report
 # accordingly: "unsent input", never "someone typed this".
+#
+# Two things keep the heuristic from firing on ordinary agent output, which
+# is full of lines that begin with a caret (shell transcripts, markdown
+# blockquotes, diffs):
+#
+#   - Only the bottom of the *visible* pane is read, never scrollback. The
+#     input box lives there; a wider window is all false-positive surface.
+#   - A framed prompt wins over an unframed one. If the pane draws a box at
+#     all, an unframed caret line is output rather than pending input. Panes
+#     with no box at all (a bare `❯ ` prompt) still work, they just have no
+#     frame to disambiguate with.
 _pane_input_line() {
 	setopt localoptions extendedglob
-	local pane="$1" cap line text found=""
+	local pane="$1" cap line text
+	local boxed="" boxed_seen="" bare=""
 	[[ -n $pane ]] || return 1
-	cap=$(tmux capture-pane -p -t "$pane" -S -12 2>/dev/null) || return 1
-	for line in ${(f)cap}; do
-		# Strip a leading box edge, then require a prompt caret.
-		text=${line#[│┃|]}
+	cap=$(tmux capture-pane -p -t "$pane" 2>/dev/null) || return 1
+	local -a lines=(${(f)cap})
+	(( ${#lines} > 12 )) && lines=(${lines[-12,-1]})
+	for line in $lines; do
+		local edge=""
+		[[ $line == [[:space:]]#[│┃\|]* ]] && edge=1
+		# Strip a leading box edge, then require a prompt caret. Note "$" is
+		# NOT a caret here: no agent TUI uses it, but agent output prints
+		# "$ some-command" constantly.
+		text=${line##[[:space:]]#[│┃|]}
 		text=${${text##[[:space:]]##}%%[[:space:]]##}
-		[[ $text == [\>❯\$][[:space:]]* ]] || continue
-		text=${text#[\>❯\$]}
+		[[ $text == [\>❯][[:space:]]* ]] || continue
+		text=${text#[\>❯]}
 		# Strip the trailing box edge and padding.
 		text=${text%[│┃|]}
 		text=${${text##[[:space:]]##}%%[[:space:]]##}
-		found=$text
+		if [[ -n $edge ]]; then
+			boxed=$text; boxed_seen=1
+		else
+			bare=$text
+		fi
 	done
-	print -r -- "$found"
+	if [[ -n $boxed_seen ]]; then
+		print -r -- "$boxed"
+	else
+		print -r -- "$bare"
+	fi
+}
+
+# _clear_pane_input <pane> — empty the agent's input box, best effort.
+# Echoes whatever is still in the box afterwards ("" on success).
+#
+# C-u alone is not enough. It kills to the start of the line, so it leaves
+# anything to the right of the cursor — and an autosuggestion is painted
+# *ahead* of a cursor sitting at column 0, which is exactly the case this
+# needs to handle, where C-u on its own is a no-op. C-e first, then C-u,
+# kills a whole line; repeat for a multi-line draft, and verify.
+_clear_pane_input() {
+	local pane="$1" still i
+	for i in 1 2 3; do
+		tmux send-keys -t "$pane" C-e
+		tmux send-keys -t "$pane" C-u
+		sleep 0.1
+		still=$(_pane_input_line "$pane" 2>/dev/null)
+		[[ -z $still ]] && break
+	done
+	print -r -- "$still"
+}
+
+# _box_pending <box-line> <sent-text> — is <box-line> our own line still
+# sitting unsent, rather than something else the pane has since drawn?
+#
+# True when the box shows the whole line or the leading part of it. Prefix,
+# not suffix: a line wider than the box soft-wraps and _pane_input_line only
+# ever returns the caret line, so the tail of a long message is not visible
+# there at all and matching on it would pass unconditionally, checking
+# nothing. Anything else in the box is somebody else's text — a repainted
+# suggestion, a human's draft — which means ours is gone.
+_box_pending() {
+	local left="$1" sent="$2"
+	[[ -n $left ]] || return 1
+	[[ $sent == "$left"* ]]
 }
 
 # _send_to_pane <pane> <text> — one line, literal, then Enter.
@@ -152,16 +213,18 @@ _pane_input_line() {
 #      into an idle box on its own (issue #10). So clear the box first — and
 #      say what was cleared, on stderr and in the event log, so nothing
 #      vanishes silently and the operator isn't left guessing whether they
-#      lost real typing.
+#      lost real typing. Clearing is best effort and verified, not assumed;
+#      if the box will not drain, say so and splice rather than lie.
 #   2. tmux wraps a literal send in bracketed-paste; firing Enter in the same
 #      instant lands mid-paste and gets dropped by some agent TUIs (observed
 #      with codex — the message sits unsubmitted until a later, separate
 #      Enter arrives). Give the pane a tick to finish processing the paste.
 #   3. Even after that tick the Enter can be swallowed. Verify from the pane
-#      that the box drained, and re-send Enter a bounded number of times if
-#      our own text is still sitting there.
+#      that the box drained, and retry a bounded number of times if our own
+#      text is still sitting there.
 #
 # Sets APEX_SEND_CLEARED to the pre-existing input it discarded ("" if none).
+# Returns 0 delivered, 1 refused/tmux failure, 2 typed but never submitted.
 _send_to_pane() {
 	local pane="$1" text="$2"
 	text=${text//$'\n'/ }
@@ -174,8 +237,12 @@ _send_to_pane() {
 		print -u2 "  ${APEX_SEND_CLEARED}"
 		print -u2 "  (often the agent's own autosuggestion ghost text rather than typed"
 		print -u2 "   input — see issue #10; recorded in the apex event log either way)"
-		tmux send-keys -t "$pane" C-u
-		sleep 0.1
+		local unclearable
+		unclearable=$(_clear_pane_input "$pane")
+		if [[ -n $unclearable ]]; then
+			print -u2 "tmux-apex: pane $pane input box did not clear; delivery will be"
+			print -u2 "  appended to: ${unclearable}"
+		fi
 	elif [[ -n $APEX_SEND_CLEARED ]]; then
 		# APEX_SEND_CLEAR=0: report, but leave the box alone and let the
 		# splice happen rather than destroying input the operator may want.
@@ -187,18 +254,28 @@ _send_to_pane() {
 	sleep 0.2
 	tmux send-keys -t "$pane" Enter || return 1
 
-	# Submitted means our text is no longer in the box. Match on the tail so a
-	# soft-wrapped or truncated render still matches.
-	local tail_probe=${text[-24,-1]} left i
+	# Submitted means our own line is no longer pending in the box.
+	#
+	# Retries never fire a bare Enter. After a successful submit the agent
+	# frequently repaints an autosuggestion of its own; if that ghost ever
+	# fooled _box_pending, a bare Enter would submit the agent's guess as a
+	# real instruction — the issue #10 failure mode, reintroduced by the fix
+	# for it. Clear and retype instead, so the worst case is our own message
+	# delivered twice rather than the agent's guess delivered once.
+	local left i
 	for i in 1 2 3; do
 		sleep 0.2
 		left=$(_pane_input_line "$pane" 2>/dev/null)
-		[[ -z $left || $left != *${tail_probe}* ]] && return 0
-		tmux send-keys -t "$pane" Enter
+		_box_pending "$left" "$text" || return 0
+		_clear_pane_input "$pane" >/dev/null
+		tmux send-keys -t "$pane" -l -- "$text" || return 1
+		tmux send-keys -t "$pane" Enter || return 1
 	done
-	# Still unsent after the retries: report it rather than claiming delivery.
+	# The Enter above has had no time to land yet — wait before the verdict,
+	# or a send that succeeded on the last retry gets reported as a failure.
+	sleep 0.2
 	left=$(_pane_input_line "$pane" 2>/dev/null)
-	[[ -n $left && $left == *${tail_probe}* ]] && return 2
+	_box_pending "$left" "$text" && return 2
 	return 0
 }
 
@@ -242,9 +319,17 @@ _cur_member() {
 
 # ─── facts about a member session ────────────────────────────────────
 
-# _member_facts <session> — emits a JSON object of live, derived state.
+# _member_facts <session> [--with-pane-input] — a JSON object of live,
+# derived state.
+#
+# pane_input costs a capture-pane per member and only `status` displays it, so
+# it is opt-in: `pending` runs on every agent hook and does not need it.
 _member_facts() {
 	local session="$1" wt branch pr_number pr_state pr_draft icons ahead dirty alive
+	local want_pane_input=false a
+	for a in "${@[2,-1]}"; do
+		[[ $a == --with-pane-input ]] && want_pane_input=true
+	done
 	alive=false
 	_member_alive "$session" && alive=true
 
@@ -272,7 +357,7 @@ _member_facts() {
 	fi
 
 	local pane_input=""
-	if $alive; then
+	if $want_pane_input && $alive; then
 		local mpane
 		mpane=$(_agent_pane "$session" 2>/dev/null)
 		[[ -n $mpane ]] && pane_input=$(_pane_input_line "$mpane" 2>/dev/null)
@@ -707,9 +792,16 @@ _cmd_send() {
 		(( rc == 1 )) && _die "send: delivery failed"
 		if (( rc == 2 )); then
 			print -u2 "tmux-apex: send: text was typed into $pane but never submitted"
-			print -u2 "  (Enter re-sent 3x and it is still sitting in the input box)"
+			print -u2 "  (re-typed and Enter re-sent 3x; still in the input box)"
+			# Record the text: it *is* in the member's pane now and may yet be
+			# submitted by a stray Enter. Without it the log says a send failed
+			# but not what is sitting there, which is the one thing an operator
+			# needs to decide whether to submit it or clear it.
 			[[ -n $manager ]] && apex_event "$manager" "$(jq -nc \
-				--arg s "$target" '{event:"send-unsubmitted", session:$s}')"
+				--arg s "$target" --arg from "$from" --arg text "$text" \
+				--arg cleared "${APEX_SEND_CLEARED:-}" \
+				'{event:"send-unsubmitted", session:$s, from:$from, text:$text}
+				 + (if $cleared != "" then {cleared_input:$cleared} else {} end)')"
 			_die "send: delivery unconfirmed"
 		fi
 	fi
@@ -825,7 +917,7 @@ _cmd_status() {
 	local s facts stored merged
 	for s in ${(f)"$(apex_members "$manager")"}; do
 		[[ -z $s ]] && continue
-		facts=$(_member_facts "$s")
+		facts=$(_member_facts "$s" --with-pane-input)
 		stored=$(cat "$(apex_member_file "$manager" "$s")" 2>/dev/null)
 		[[ -z $stored ]] && stored='{}'
 		merged=$(printf '%s\n%s\n' "$stored" "$facts" | jq -s '.[0] * .[1]')

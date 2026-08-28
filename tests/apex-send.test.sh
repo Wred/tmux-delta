@@ -28,22 +28,49 @@ lacks() { if [[ $3 != *$2* ]]; then ok "$1"; else bad "$1" "expected NOT to cont
        actual                 : ${(qqq)3}"; fi }
 
 # ── fake tmux ────────────────────────────────────────────────────────
-# $PANE_FILE is the rendered pane. $KEYS_LOG records send-keys calls. If
-# $DRAIN_ON_ENTER is set, an Enter empties the box the way a real TUI would.
+# $PANE_FILE is the rendered pane. $KEYS_LOG records send-keys calls. The
+# knobs let a test pick which TUI misbehaviour to model:
+#
+#   DRAIN_ON_ENTER  every Enter empties the box, i.e. a well-behaved TUI
+#   DRAIN_AT_ENTER  only the Nth Enter empties it — a swallowed Enter that
+#                   the retry loop eventually gets through
+#   DRAIN_DELAY     the box empties this many seconds *after* the Enter, so a
+#                   verify that reads the pane without waiting sees stale text
+#   NO_CLEAR        C-u does not empty the box (a cursor or multi-line draft
+#                   that a single kill-to-start cannot deal with)
 BIN="$TMPROOT/bin"; mkdir -p "$BIN"
 cat > "$BIN/tmux" <<'STUB'
 #!/usr/bin/env bash
+drain() {
+	if [ -n "${DRAIN_DELAY:-}" ]; then
+		( sleep "$DRAIN_DELAY"; printf '%s\n' "$EMPTY_BOX" > "$PANE_FILE" ) &
+	else
+		printf '%s\n' "$EMPTY_BOX" > "$PANE_FILE"
+	fi
+}
 case "$1" in
 	capture-pane) cat "$PANE_FILE" ;;
 	send-keys)
 		shift
-		printf '%s\n' "$*" >> "$KEYS_LOG"
-		case "$*" in
+		# Join first: ${*#pat} applies the pattern to each positional
+		# separately, so stripping off "$*" directly leaves tmux's own flags
+		# in the fixture.
+		args="$*"
+		printf '%s\n' "$args" >> "$KEYS_LOG"
+		case "$args" in
 			*"-l -- "*)
 				# A literal send lands in the input box, unsubmitted.
-				printf '\xe2\x94\x82 > %s   \xe2\x94\x82\n' "${*#*-l -- }" > "$PANE_FILE" ;;
-			*Enter*) [ -n "${DRAIN_ON_ENTER:-}" ] && printf '%s\n' "$EMPTY_BOX" > "$PANE_FILE" ;;
-			*C-u*)   printf '%s\n' "$EMPTY_BOX" > "$PANE_FILE" ;;
+				printf '\xe2\x94\x82 > %s   \xe2\x94\x82\n' "${args#*-l -- }" > "$PANE_FILE" ;;
+			*Enter*)
+				n=$(( $(cat "$ENTER_COUNT" 2>/dev/null || echo 0) + 1 ))
+				printf '%s' "$n" > "$ENTER_COUNT"
+				if [ -n "${DRAIN_ON_ENTER:-}" ]; then
+					drain
+				elif [ -n "${DRAIN_AT_ENTER:-}" ] && [ "$n" -ge "$DRAIN_AT_ENTER" ]; then
+					drain
+				fi ;;
+			*C-u*)
+				[ -z "${NO_CLEAR:-}" ] && printf '%s\n' "$EMPTY_BOX" > "$PANE_FILE" ;;
 		esac
 		;;
 esac
@@ -52,13 +79,15 @@ STUB
 chmod +x "$BIN/tmux"
 export PATH="$BIN:$PATH"
 export PANE_FILE="$TMPROOT/pane" KEYS_LOG="$TMPROOT/keys"
+export ENTER_COUNT="$TMPROOT/enters"
 export EMPTY_BOX='│ >                                    │'
 
 # Source the script under test. Its dispatch prints usage when called with no
 # arguments and does not exit, so suppressing stdout is enough.
 source "$SCRIPTS/tmux-apex.sh" >/dev/null 2>&1
 
-pane() { print -r -- "$*" > "$PANE_FILE"; : > "$KEYS_LOG" }
+pane() { print -r -- "$*" > "$PANE_FILE"; : > "$KEYS_LOG"; : > "$ENTER_COUNT" }
+panel() { print -l -- "$@" > "$PANE_FILE"; : > "$KEYS_LOG"; : > "$ENTER_COUNT" }
 keys() { cat "$KEYS_LOG" 2>/dev/null }
 
 # ── reading the input box ────────────────────────────────────────────
@@ -80,8 +109,49 @@ eq "takes the last prompt line, not an earlier one" "the live one" "$(_pane_inpu
 print -r -- '❯ half-typed' > "$PANE_FILE"
 eq "handles a bare caret with no box" "half-typed" "$(_pane_input_line %1)"
 
+# Agent output is full of lines that open with a caret. A framed box beats an
+# unframed caret line, so a shell transcript scrolling past an idle box does
+# not read as pending input (finding: "$" matched ordinary output).
+panel '$ npm test' '  3 passed' "$EMPTY_BOX"
+eq "shell transcript above an empty box reads as empty" "" "$(_pane_input_line %1)"
+
+panel '> a markdown blockquote' "$EMPTY_BOX"
+eq "blockquote above an empty box reads as empty" "" "$(_pane_input_line %1)"
+
+panel '$ npm test' '  3 passed'
+eq "\$ is not a prompt caret" "" "$(_pane_input_line %1)"
+
+panel '│ > real pending text                  │' '$ npm test'
+eq "framed box beats an unframed caret below it" "real pending text" "$(_pane_input_line %1)"
+
+# Only the bottom of the visible pane is read; anything higher is history.
+panel '│ > scrolled off the window            │' \
+	'l1' 'l2' 'l3' 'l4' 'l5' 'l6' 'l7' 'l8' 'l9' 'l10' 'l11' 'l12'
+eq "prompt line above the 12-line window is ignored" "" "$(_pane_input_line %1)"
+
 print -r -- 'no prompt on this line at all' > "$PANE_FILE"
 eq "no prompt line reads as empty" "" "$(_pane_input_line %1)"
+
+# ── is our own line still pending? ───────────────────────────────────
+# Prefix, not suffix: a message wider than the box wraps and only its leading
+# part is readable, so a tail match would pass without checking anything.
+print "\n_box_pending"
+
+_box_pending "run the tests and rep" "run the tests and report back when done" \
+	&& ok "wrapped message: leading part counts as still pending" \
+	|| bad "wrapped message: leading part counts as still pending" "returned false"
+_box_pending "run tests first" "run tests first" \
+	&& ok "whole line present counts as still pending" \
+	|| bad "whole line present counts as still pending" "returned false"
+_box_pending "mark ready for review" "run tests first" \
+	&& bad "someone else's text means ours is gone" "returned true" \
+	|| ok "someone else's text means ours is gone"
+_box_pending "run tests first and then some" "run tests first" \
+	&& bad "text beyond ours means ours is gone" "returned true" \
+	|| ok "text beyond ours means ours is gone"
+_box_pending "" "run tests first" \
+	&& bad "empty box is not pending" "returned true" \
+	|| ok "empty box is not pending"
 
 # ── delivery ─────────────────────────────────────────────────────────
 print "\ndelivery"
@@ -102,7 +172,8 @@ pane '│ > mark ready for review              │'
 out=$(_send_to_pane %1 "run the tests first" 2>&1; print "rc=$?")
 contains "occupied box: succeeds" "rc=0" "$out"
 contains "occupied box: clears before typing" "C-u" "$(keys)"
-contains "occupied box: clears first, types second" "C-u" "$(keys | head -1)"
+eq "occupied box: clears first, types second" "clear-first" \
+	"$(keys | awk '/ -l -- /{print (c?"clear-first":"typed-first"); exit} /C-u/{c=1}')"
 contains "occupied box: warns on stderr" "had unsent input" "$out"
 contains "occupied box: names the autosuggestion explanation" "autosuggestion" "$out"
 
@@ -125,6 +196,39 @@ contains "APEX_SEND_CLEAR=0: says it will splice" "appended to" "$out"
 rc=0
 _send_to_pane %1 "" >/dev/null 2>&1 || rc=$?
 eq "empty message is refused" 1 "$rc"
+
+# C-u kills to the start of the line, so it leaves anything right of the
+# cursor and clears one line of a multi-line draft. Saying "cleared" when the
+# box did not drain is worse than the old honest append, so say what happened.
+export NO_CLEAR=1
+pane '│ > mark ready for review               │'
+out=$(_send_to_pane %1 "run tests first" 2>&1; print "rc=$?")
+contains "box refuses to clear: still delivers" "rc=0" "$out"
+contains "box refuses to clear: says so" "did not clear" "$out"
+contains "box refuses to clear: names what it will splice onto" "mark ready for review" "$out"
+unset NO_CLEAR
+
+# ── retries must not submit whatever the box happens to hold ─────────
+# A bare Enter as a retry submits the box's current contents. After a
+# successful send that is often a *fresh* autosuggestion, so a bare retry can
+# deliver the agent's own guess as an instruction — the issue #10 failure mode
+# caused by the fix for it. Retries clear and retype instead.
+print "\nretries"
+
+unset DRAIN_ON_ENTER
+pane '│ > stuck message here                 │'
+_send_to_pane %1 "stuck message here" >/dev/null 2>&1 || true
+eq "retry re-types rather than firing a bare Enter" 4 "$(keys | grep -c ' -l -- ')"
+eq "retry clears the box before each re-type" 4 "$(keys | grep -c 'C-u')"
+
+# The verdict must not race the last retry's Enter: a send that lands on the
+# third retry is a success, not a "send-unsubmitted".
+export DRAIN_AT_ENTER=4 DRAIN_DELAY=0.05
+pane '│ > slow to drain                      │'
+rc=0
+_send_to_pane %1 "slow to drain" >/dev/null 2>&1 || rc=$?
+eq "drains on the last retry: reported as delivered" 0 "$rc"
+unset DRAIN_AT_ENTER DRAIN_DELAY
 
 # ── unconfirmed submission ───────────────────────────────────────────
 # A TUI that swallows Enter leaves the text sitting in the box. Retrying is
