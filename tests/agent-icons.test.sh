@@ -36,6 +36,9 @@ lacks() {
 IDLE=$'\U000F06A9'
 WORKING=$'\U000F16A3'
 ATTENTION=$'\U000F169F'
+IDLE_O=$'\U000F167A'
+WORKING_O=$'\U000F16A4'
+ATTENTION_O=$'\U000F16A0'
 
 BIN="$TMPROOT/bin"
 mkdir -p "$BIN"
@@ -57,6 +60,7 @@ case "$1" in
 	refresh-client) exit 0 ;;
 esac
 case "$*" in
+	*@agent_icons_outline*)  printf '%s\n' "$STUB_PREV_OUTLINE" ;;
 	*@agent_icons*)          printf '%s\n' "$STUB_PREV" ;;
 	*@agent_needs_attention*) printf '%s\n' "$STUB_SESS_ATTENTION" ;;
 	*@agent_working*)        printf '%s\n' "$STUB_SESS_WORKING" ;;
@@ -67,7 +71,7 @@ chmod +x "$BIN/tmux"
 
 export PATH="$BIN:$PATH" TMUX=fake-socket LC_ALL=en_US.UTF-8
 export STUB_LOG="$TMPROOT/tmux.log"
-export STUB_SESSION=work STUB_SESSIONS=work STUB_PREV=""
+export STUB_SESSION=work STUB_SESSIONS=work STUB_PREV="" STUB_PREV_OUTLINE=""
 export STUB_SESS_WORKING="" STUB_SESS_ATTENTION=""
 
 # icons <panes...> — runs the script and prints the @agent_icons value written
@@ -77,8 +81,18 @@ icons() {
 	export STUB_PANES="${(F)@}"
 	"$SCRIPTS/agent-icons-refresh.sh" work >/dev/null 2>&1
 	local line
-	line=$(grep '@agent_icons' "$STUB_LOG" | tail -1)
+	line=$(grep '@agent_icons ' "$STUB_LOG" | tail -1)
 	print -r -- "${line#*@agent_icons }"
+}
+
+# outline <panes...> — same, for the selected-pill variant.
+outline() {
+	: > "$STUB_LOG"
+	export STUB_PANES="${(F)@}"
+	"$SCRIPTS/agent-icons-refresh.sh" work >/dev/null 2>&1
+	local line
+	line=$(grep '@agent_icons_outline' "$STUB_LOG" | tail -1)
+	print -r -- "${line#*@agent_icons_outline }"
 }
 
 # ── one icon per agent pane ──────────────────────────────────────────
@@ -134,6 +148,34 @@ out=$(icons '%1|worker|1||')
 lacks "pane state takes precedence over the session aggregate" "$ATTENTION" "$out"
 STUB_SESS_ATTENTION=""
 
+# ── outline variants for the selected pill ───────────────────────────
+# The pill for the active session is drawn from a different branch of
+# status-format[0] and must use md-*_outline glyphs, per issue #15.
+print "outline variants"
+
+out=$(outline '%1|worker|1||' '%2|worker|1|1|' '%3|worker|1||1')
+contains "idle uses md-robot_outline"             "$IDLE_O"      "$out"
+contains "working uses md-robot_excited_outline"  "$WORKING_O"   "$out"
+contains "blocked uses md-robot_confused_outline" "$ATTENTION_O" "$out"
+lacks "no filled idle glyph leaks in"    "$IDLE"      "$out"
+lacks "no filled working glyph leaks in" "$WORKING"   "$out"
+lacks "no filled attention glyph leaks in" "$ATTENTION" "$out"
+
+# Same count, same order, same state colours — only the glyphs differ.
+filled=$(icons '%1|worker|1||' '%2|worker|1|1|')
+out=$(outline '%1|worker|1||' '%2|worker|1|1|')
+eq "outline keeps the same glyph count" \
+	"$(print -r -- "$filled" | grep -o "$IDLE\|$WORKING" | grep -c .)" \
+	"$(print -r -- "$out" | grep -o "$IDLE_O\|$WORKING_O" | grep -c .)"
+
+# Idle grey is unreadable on the selected pill's mauve background.
+contains "selected-pill idle uses the dark foreground" "#11111b" "$out"
+
+STUB_SESS_WORKING=1
+out=$(outline '%1||||')
+contains "the session-level fallback has an outline variant too" "$WORKING_O" "$out"
+STUB_SESS_WORKING=""
+
 # ── truncation ───────────────────────────────────────────────────────
 print "truncation"
 
@@ -147,11 +189,18 @@ contains "the rest collapse into a counter" "+2" "$out"
 print "change detection"
 
 STUB_PREV=$(icons '%1|worker|1||')
+STUB_PREV_OUTLINE=$(outline '%1|worker|1||')
 : > "$STUB_LOG"
 export STUB_PANES='%1|worker|1||'
 "$SCRIPTS/agent-icons-refresh.sh" work >/dev/null 2>&1
 eq "unchanged icons are not re-written" "" "$(grep -c '@agent_icons' "$STUB_LOG" | grep -v '^0$' || true)"
-STUB_PREV=""
+
+# A changed outline variant alone still triggers a write.
+STUB_PREV_OUTLINE="stale"
+: > "$STUB_LOG"
+"$SCRIPTS/agent-icons-refresh.sh" work >/dev/null 2>&1
+contains "a stale outline variant is rewritten" "@agent_icons_outline" "$(cat "$STUB_LOG")"
+STUB_PREV="" STUB_PREV_OUTLINE=""
 
 # ── ack clears attention everywhere ──────────────────────────────────
 print "ack"

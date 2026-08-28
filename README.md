@@ -84,11 +84,15 @@ does it for you:
 in apex mode, forwards worker transitions to the manager. It takes one of three
 verbs:
 
-| Verb | Meaning | Icon for that agent |
-|------|---------|---------------------|
-| `set` | agent is working | green 󱚣 |
-| `notify` | agent is blocked on you | peach 󱚟 |
-| `clear` | agent is idle | muted 󰚩 |
+| Verb | Meaning | Unselected pill | Selected pill |
+|------|---------|-----------------|---------------|
+| `set` | agent is working | green 󱚣 `md-robot_excited` | 󱚤 `md-robot_excited_outline` |
+| `notify` | agent is blocked on you | peach 󱚟 `md-robot_confused` | 󱚠 `md-robot_confused_outline` |
+| `clear` | agent is idle | muted 󰚩 `md-robot` | 󱙺 `md-robot_outline` |
+
+The pill for the **selected** session draws the outline variant of whichever
+glyph is showing (and the dark pill foreground for idle, since the muted grey is
+unreadable on mauve).
 
 The icons are **per agent**, not per session: one glyph per pane that hosts an
 agent, each in its own state, so a worktree running a worker and a reviewer
@@ -96,8 +100,8 @@ shows two. Presence is what puts a glyph in the pill — an idle agent still
 shows — and it is independent of the apex marker, so a manager session that
 also runs an agent shows both. Beyond four agents the rest collapse into `+N`.
 
-`scripts/agent-icons-refresh.sh` builds that string into the per-session
-`@agent_icons` option (tmux formats can iterate sessions but not the panes
+`scripts/agent-icons-refresh.sh` builds both strings into the per-session
+`@agent_icons` / `@agent_icons_outline` options (tmux formats can iterate sessions but not the panes
 inside one, so the walk has to happen in a script). It runs on every hook
 event, on focus change, and on apex member registration.
 
@@ -247,6 +251,7 @@ set -g @tmux_delta_color_pr_sky    '#89dceb'
 set -g @tmux_delta_color_agent_idle      '#6c7086'
 set -g @tmux_delta_color_agent_working   '#a6e3a1'
 set -g @tmux_delta_color_agent_attention '#fab387'
+set -g @tmux_delta_color_agent_idle_active '#11111b'
 
 # Segment separators (only used when catppuccin/tmux is not loaded)
 set -g @tmux_delta_separator_left  ''
@@ -304,6 +309,10 @@ diff the worker commits.
 # Glyph marking the manager session in its pill. Separate from the per-agent
 # icons, which are drawn next to it.
 set -g @tmux_delta_apex_icon '󱇖'
+
+# Variant used on the selected pill. Material Design ships no outline form of
+# md-strategy, so it defaults to the same glyph.
+set -g @tmux_delta_apex_icon_outline '󱇖'
 
 # Pane commands tmux-apex.sh is allowed to send-keys into. Allowlist, not
 # denylist — a shell pane must never receive a message, it would execute it.
@@ -684,6 +693,7 @@ them when launching the agent:
 | `@agent_present` | agent panes (pane-scoped) | `1` once a hook has fired there |
 | `@agent_working` / `@agent_needs_attention` | agent panes + session aggregate | `1` |
 | `@agent_icons` | any session | rendered per-agent icon string |
+| `@agent_icons_outline` | any session | same, outline glyphs, for the selected pill |
 
 ## Tests
 

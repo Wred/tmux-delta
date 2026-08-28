@@ -22,6 +22,12 @@
 #   @agent_working          mid-turn               U+F16A3 (green)
 #   neither                 idle but present       U+F06A9 (muted)
 #
+# Two strings are written per session, because the pill for the *selected*
+# session is drawn from a different branch of status-format[0] and uses the
+# outline variant of whichever glyph is showing:
+#   @agent_icons          filled glyphs, for unselected pills
+#   @agent_icons_outline  md-*_outline glyphs, for the selected pill
+#
 # Usage:
 #   agent-icons-refresh.sh                 refresh the current session
 #   agent-icons-refresh.sh <session>       refresh one session by name
@@ -36,24 +42,34 @@ set -u
 ICON_IDLE='󰚩'       # U+F06A9 nf-md-robot
 ICON_WORKING='󱚣'    # U+F16A3 nf-md-robot_excited
 ICON_ATTENTION='󱚟'  # U+F169F nf-md-robot_confused
+# Outline counterparts, for the selected pill.
+ICON_IDLE_OUTLINE='󱙺'       # U+F167A nf-md-robot_outline
+ICON_WORKING_OUTLINE='󱚤'    # U+F16A4 nf-md-robot_excited_outline
+ICON_ATTENTION_OUTLINE='󱚠'  # U+F16A0 nf-md-robot_confused_outline
 
 # Colors — overridable via @tmux_delta_color_agent_*; tmux-delta.tmux seeds
 # them from catppuccin's active flavor when catppuccin/tmux is loaded.
 COLOR_IDLE=$(tmux show-option -gqv @tmux_delta_color_agent_idle 2>/dev/null)
 COLOR_WORKING=$(tmux show-option -gqv @tmux_delta_color_agent_working 2>/dev/null)
 COLOR_ATTENTION=$(tmux show-option -gqv @tmux_delta_color_agent_attention 2>/dev/null)
-: "${COLOR_IDLE:=#6c7086}"       # overlay0
-: "${COLOR_WORKING:=#a6e3a1}"    # green
-: "${COLOR_ATTENTION:=#fab387}"  # peach
+# The selected pill has a mauve background, on which the muted idle grey is
+# unreadable; it gets the pill's own dark foreground instead. Working and
+# attention keep their hues, which stay legible on mauve.
+COLOR_IDLE_ACTIVE=$(tmux show-option -gqv @tmux_delta_color_agent_idle_active 2>/dev/null)
+: "${COLOR_IDLE:=#6c7086}"        # overlay0
+: "${COLOR_WORKING:=#a6e3a1}"     # green
+: "${COLOR_ATTENTION:=#fab387}"   # peach
+: "${COLOR_IDLE_ACTIVE:=#11111b}" # crust
 
 # More agents than this in one session and the rest collapse into a +N counter,
 # so a busy apex session can't push the pills off the status line.
 MAX_ICONS=4
 
-# icons_for <session> — prints the icon string for one session (may be empty).
+# icons_for <session> — prints the filled icon string, a TAB, then the outline
+# icon string for one session. Either may be empty.
 icons_for() {
 	local session="$1" line pane role present working attention
-	local icons="" shown=0 extra=0
+	local icons="" outline="" shown=0 extra=0
 
 	while IFS='|' read -r pane role present working attention; do
 		[ -n "$pane" ] || continue
@@ -63,13 +79,19 @@ icons_for() {
 			extra=$((extra + 1))
 			continue
 		fi
-		[ "$shown" -gt 0 ] && icons+=" "
+		if [ "$shown" -gt 0 ]; then
+			icons+=" "
+			outline+=" "
+		fi
 		if [ -n "$attention" ]; then
 			icons+="#[fg=${COLOR_ATTENTION}]${ICON_ATTENTION}"
+			outline+="#[fg=${COLOR_ATTENTION}]${ICON_ATTENTION_OUTLINE}"
 		elif [ -n "$working" ]; then
 			icons+="#[fg=${COLOR_WORKING}]${ICON_WORKING}"
+			outline+="#[fg=${COLOR_WORKING}]${ICON_WORKING_OUTLINE}"
 		else
 			icons+="#[fg=${COLOR_IDLE}]${ICON_IDLE}"
+			outline+="#[fg=${COLOR_IDLE_ACTIVE}]${ICON_IDLE_OUTLINE}"
 		fi
 		shown=$((shown + 1))
 	done <<-EOF
@@ -87,24 +109,34 @@ icons_for() {
 		working=$(tmux show-option -t "$session" -qv @agent_working 2>/dev/null || true)
 		if [ -n "$attention" ]; then
 			icons="#[fg=${COLOR_ATTENTION}]${ICON_ATTENTION}"
+			outline="#[fg=${COLOR_ATTENTION}]${ICON_ATTENTION_OUTLINE}"
 		elif [ -n "$working" ]; then
 			icons="#[fg=${COLOR_WORKING}]${ICON_WORKING}"
+			outline="#[fg=${COLOR_WORKING}]${ICON_WORKING_OUTLINE}"
 		fi
 	fi
 
-	[ "$extra" -gt 0 ] && icons+=" #[fg=${COLOR_IDLE}]+${extra}"
-	printf '%s' "$icons"
+	if [ "$extra" -gt 0 ]; then
+		icons+=" #[fg=${COLOR_IDLE}]+${extra}"
+		outline+=" #[fg=${COLOR_IDLE_ACTIVE}]+${extra}"
+	fi
+	# TAB-separated: neither variant can contain one.
+	printf '%s\t%s' "$icons" "$outline"
 }
 
 # refresh <session> — recompute and store, writing only on change so tmux
 # doesn't repaint the whole status line on every hook tick.
 refresh() {
-	local session="$1" icons prev
+	local session="$1" both icons outline prev prev_outline
 	[ -n "$session" ] || return 0
-	icons=$(icons_for "$session")
+	both=$(icons_for "$session")
+	icons="${both%%	*}"
+	outline="${both#*	}"
 	prev=$(tmux show-option -t "$session" -qv @agent_icons 2>/dev/null || true)
-	[ "$icons" = "$prev" ] && return 0
+	prev_outline=$(tmux show-option -t "$session" -qv @agent_icons_outline 2>/dev/null || true)
+	[ "$icons" = "$prev" ] && [ "$outline" = "$prev_outline" ] && return 0
 	tmux set-option -t "$session" @agent_icons "$icons" 2>/dev/null || true
+	tmux set-option -t "$session" @agent_icons_outline "$outline" 2>/dev/null || true
 	tmux refresh-client -S 2>/dev/null || true
 }
 
