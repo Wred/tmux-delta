@@ -41,21 +41,47 @@ install_claude_hooks() {
 	# Parallel arrays: event, matcher, command, pattern (matches existing
 	# entries so they get repointed in place instead of duplicated), extra
 	# jq object merged into the hook entry (e.g. timeout).
-	local events=(PreToolUse Notification Stop UserPromptSubmit SessionStart)
-	local matchers=("" "" "" "" "startup|resume")
-	local cmds=("$STATUS_SH set" "$STATUS_SH notify" "$STATUS_SH clear" "$NOTIFY_SH" "$NOTIFY_SH")
+	#
+	# apex-manager-notify.sh takes the delivery point as a required argument,
+	# one per event, and the argument is not cosmetic: it selects the output
+	# channel, and plain stdout only reaches the agent on UserPromptSubmit and
+	# SessionStart. Wired without it — as this installer did before — the
+	# script has no way to know which channel to use, so it delivers nothing
+	# and (deliberately) consumes nothing. PostToolBatch and Stop are what make
+	# an unattended manager notice a worker at all; UserPromptSubmit alone only
+	# ever fires on a human message. See issue #7 and `tmux-apex.sh doctor`,
+	# which checks for exactly the wiring this function writes.
+	local events=(PreToolUse Notification Stop UserPromptSubmit SessionStart PostToolBatch Stop)
+	local matchers=("" "" "" "" "startup|resume" "" "")
+	local cmds=(
+		"$STATUS_SH set"
+		"$STATUS_SH notify"
+		"$STATUS_SH clear"
+		"$NOTIFY_SH prompt"
+		"$NOTIFY_SH session-start"
+		"$NOTIFY_SH post-tools"
+		"$NOTIFY_SH stop"
+	)
 	# Matched by script basename only (not the trailing verb) so a hook
 	# left wired to the wrong verb — e.g. Notification still pointing at
-	# "clear" — gets corrected in place instead of getting a duplicate
-	# second entry alongside the stale one.
+	# "clear", or apex-manager-notify.sh wired with no verb at all — gets
+	# corrected in place instead of getting a duplicate second entry alongside
+	# the stale one.
+	#
+	# Stop carries one entry per script, and the two patterns are disjoint
+	# (different basenames), so upserting either leaves the other alone: a
+	# session is both its own worker, reporting idle via agent-tmux-status.sh,
+	# and possibly a manager collecting pings via apex-manager-notify.sh.
 	local pats=(
 		'(^|/)agent-tmux-status\.sh( |$)'
 		'(^|/)agent-tmux-status\.sh( |$)'
 		'(^|/)agent-tmux-status\.sh( |$)'
-		'(^|/)apex-manager-notify\.sh$'
-		'(^|/)apex-manager-notify\.sh$'
+		'(^|/)apex-manager-notify\.sh( |$)'
+		'(^|/)apex-manager-notify\.sh( |$)'
+		'(^|/)apex-manager-notify\.sh( |$)'
+		'(^|/)apex-manager-notify\.sh( |$)'
 	)
-	local extras=("{}" "{}" "{}" '{"timeout":10}' '{"timeout":10}')
+	local extras=("{}" "{}" "{}" '{"timeout":10}' '{"timeout":10}' '{"timeout":10}' '{"timeout":10}')
 
 	local i event matcher cmd pat extra tmp
 	for i in "${!events[@]}"; do
@@ -76,7 +102,28 @@ install_claude_hooks() {
 				))
 			else
 				.hooks[$event] += [({matcher: $matcher, hooks: [({type:"command", command: $cmd} + $extra)]})]
-			end
+			end |
+			# Collapse the duplicates that rewrite can produce. $pat matches by
+			# script basename, so if one event carries two entries for the same
+			# script — which is what an older installer using a stricter pattern
+			# leaves behind, having appended rather than repointed — both get
+			# rewritten to the identical command and the hook would then run
+			# twice per event. Keep the first, drop the rest. This only ever
+			# removes entries whose command is exactly what the pass above just
+			# wrote, so a hook belonging to anything else is never touched.
+			.hooks[$event] = (reduce .hooks[$event][] as $g ([];
+				. as $out
+				| ($g.hooks // []) as $hs
+				| ([$out[].hooks[]? | select((.command? // "") == $cmd)] | length) as $already
+				| ($hs | to_entries | map(select((.value.command? // "") == $cmd) | .key)) as $owned
+				| if ($owned | length) == 0 then $out + [$g]
+				  else
+				  	(if $already > 0 then -1 else $owned[0] end) as $keep
+				  	| ($hs | to_entries
+				  	   | map(select(((.value.command? // "") != $cmd) or (.key == $keep)) | .value)) as $kept
+				  	| if ($kept | length) == 0 then $out else $out + [$g | .hooks = $kept] end
+				  end
+			))
 		' "$settings" > "$tmp"
 		if $DRY_RUN; then
 			if diff -q "$settings" "$tmp" >/dev/null; then

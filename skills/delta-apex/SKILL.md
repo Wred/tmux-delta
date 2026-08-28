@@ -39,6 +39,12 @@ relink`) — so `--continue` in the same directory picks back up as manager or
 worker without re-running `init`/`spawn`, and a manager you `stop`'d stays
 stopped rather than silently coming back.
 
+`init` also checks that the ping-delivery hooks are installed and warns on
+stderr if any are missing (`tmux-apex.sh doctor` re-runs that check alone). If
+it warns, say so to the human with the fix it printed, and until it is fixed
+treat yourself as having no automatic delivery at all: poll `tmux-apex.sh
+pending` yourself every time you would otherwise have waited for a ping.
+
 Report state to the human after `init`, then wait for direction.
 
 ## Planning work
@@ -133,11 +139,12 @@ completion, state blockers instead of waiting, never merge or close.
 A worker's hooks report every transition, but nothing is ever typed into this
 pane for it — that used to happen and it collided with whatever you were
 typing (or, at least once, with a shell autosuggestion that was never your
-typing at all). Delivery is pull-based instead: a hook on your own session
-checks for anything undelivered before each of your turns, and again if this
-session restarts (`--continue` in the same directory picks up what it
-missed). When there's something new, it shows up as context ahead of your
-next reply — you didn't type it and neither did the human — looking like:
+typing at all). Delivery is pull-based instead: hooks on your own session check
+for anything undelivered before each human message, after each batch of your
+tool calls, at the end of each of your turns, and again if this session
+restarts (`--continue` in the same directory picks up what it missed). When
+there's something new, it shows up as context ahead of your next reply — you
+didn't type it and neither did the human — looking like:
 
 ```
 [apex] session=tmux-delta-fix-pills-issue-42 role=worker task=issue:42 status=idle — branch=fix-pills-issue-42 pr=#17(draft) commits_ahead=3. Full state: …/tmux-apex.sh status --json
@@ -204,6 +211,13 @@ the work should have taken, check `tmux-apex.sh status` — dead sessions show
 as `dead`. For long unattended runs you can `/loop 20m` over a status check
 yourself as a fallback heartbeat between deliveries; it is not needed in
 normal operation.
+
+The other reason to hear nothing is that delivery was never wired up on your
+side. Run `tmux-apex.sh doctor` — it names the missing hooks and prints the
+settings to add. Suspect this specifically when the human tells you a worker
+finished some time ago and you had no idea: a manager with no hooks installed
+looks entirely normal from the inside, because `pending` keeps returning the
+right answer whenever you ask it by hand.
 
 ## Reporting to the human
 
