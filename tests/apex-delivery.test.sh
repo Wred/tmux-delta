@@ -276,6 +276,73 @@ out=$(APEX_REPO="$none" HOME="$bare_home" XDG_CONFIG_HOME="$bare_home/.config" \
 	"$SCRIPTS/tmux-apex.sh" doctor 2>&1 || true)
 contains "fix hint falls back to the running copy" "$SCRIPTS/apex-manager-notify.sh prompt" "$out"
 
+# ── installer contract ──────────────────────────────────────────────
+# scripts/install-agent-hooks.sh runs backgrounded on every plugin load, so
+# whatever it writes is what most machines actually get. If its arrays drift
+# from what apex-manager-notify.sh requires, it silently un-wires delivery
+# everywhere — which is how the argument-less wiring got there in the first
+# place. Assert the two agree by running the installer into a throwaway HOME
+# and pointing `doctor` at the result.
+print "\ninstaller contract"
+
+inst_home="$TMPROOT/home-installer"
+mkdir -p "$inst_home/.claude"
+
+# Seed the pre-fix wiring: right script, no argument. The installer must
+# repoint these in place, not leave them and not duplicate them.
+cat > "$inst_home/.claude/settings.json" <<JSON
+{"hooks":{
+	"UserPromptSubmit":[{"matcher":"","hooks":[{"type":"command","command":"/old/clone/scripts/apex-manager-notify.sh","timeout":10}]}],
+	"SessionStart":[{"matcher":"startup|resume","hooks":[{"type":"command","command":"/old/clone/scripts/apex-manager-notify.sh","timeout":10}]}],
+	"Stop":[{"matcher":"","hooks":[{"type":"command","command":"/old/clone/scripts/agent-tmux-status.sh clear"}]}]
+}}
+JSON
+
+HOME="$inst_home" "$SCRIPTS/install-agent-hooks.sh" >/dev/null 2>&1 || true
+installed="$inst_home/.claude/settings.json"
+
+eq "installer leaves valid JSON" 0 "$(jq -e . "$installed" >/dev/null 2>&1; print $?)"
+
+# The contract test: doctor must accept what the installer wrote.
+inst_rc=0
+APEX_REPO="$TMPROOT/nonexistent" HOME="$inst_home" \
+	"$SCRIPTS/tmux-apex.sh" doctor >/dev/null 2>&1 || inst_rc=$?
+eq "doctor accepts what the installer wrote" 0 "$inst_rc"
+
+# Per-event verb, read back out of the file the installer produced.
+for event verb in UserPromptSubmit prompt SessionStart session-start PostToolBatch post-tools Stop stop; do
+	got=$(jq -r --arg e "$event" '
+		[.hooks[$e][]?.hooks[]?.command? // ""
+		 | select(test("apex-manager-notify"))]
+		| join(",")' "$installed")
+	contains "installer wires $event with '$verb'" "apex-manager-notify.sh $verb" "$got"
+	eq "installer wires exactly one notify entry on $event" 1 "$(print -r -- $got | tr ',' '\n' | grep -c apex-manager-notify)"
+done
+
+# Repointing must not have duplicated the stale argument-less entries.
+eq "no argument-less notify entry survives" 0 "$(jq '[.. | .command? // empty | select(test("apex-manager-notify\\.sh$"))] | length' "$installed")"
+eq "old clone path is gone" 0 "$(jq '[.. | .command? // empty | select(test("^/old/clone/"))] | length' "$installed")"
+
+# Stop keeps both scripts: this session's own idle record, and pings from
+# members it manages.
+stop_cmds=$(jq -r '[.hooks.Stop[]?.hooks[]?.command? // ""] | join(" | ")' "$installed")
+contains "Stop keeps agent-tmux-status.sh clear" "agent-tmux-status.sh clear" "$stop_cmds"
+contains "Stop gains apex-manager-notify.sh stop" "apex-manager-notify.sh stop" "$stop_cmds"
+
+# Same contract from nothing at all, not just from a stale wiring.
+fresh_home="$TMPROOT/home-fresh"
+mkdir -p "$fresh_home"
+HOME="$fresh_home" "$SCRIPTS/install-agent-hooks.sh" >/dev/null 2>&1 || true
+fresh_rc=0
+APEX_REPO="$TMPROOT/nonexistent" HOME="$fresh_home" \
+	"$SCRIPTS/tmux-apex.sh" doctor >/dev/null 2>&1 || fresh_rc=$?
+eq "doctor accepts a from-scratch install" 0 "$fresh_rc"
+
+# Re-running must be a no-op, since it runs on every plugin load.
+before=$(cat "$installed")
+HOME="$inst_home" "$SCRIPTS/install-agent-hooks.sh" >/dev/null 2>&1 || true
+eq "installer is idempotent" "$before" "$(cat "$installed")"
+
 # ── summary ──────────────────────────────────────────────────────────
 print "\n$PASS passed, $FAIL failed"
 (( FAIL == 0 ))

@@ -93,9 +93,23 @@ verbs:
 Delivery into the *manager's own* pane is pull-based, not pushed: `set`/
 `notify`/`clear` only ever write durable state (`~/.cache/tmux-delta/apex/`),
 debounced through `APEX_QUIET_SECS` for `clear`. `scripts/apex-manager-notify.sh`,
-wired to the manager's own `UserPromptSubmit` and `SessionStart` hooks, is what
-actually surfaces pending events — it prepends them to the manager's next turn
-(or on resume), so nothing ever gets typed into a live pane out from under you.
+wired to four of the manager's own hooks, is what actually surfaces pending
+events — it prepends them to the manager's next turn, so nothing ever gets typed
+into a live pane out from under you. It takes the delivery point as a required
+argument, one per event, because each event needs a different output channel:
+
+| Verb | Hook | Delivers |
+|------|------|----------|
+| `prompt` | `UserPromptSubmit` | before every human message |
+| `session-start` | `SessionStart` | catch-up on startup/resume |
+| `post-tools` | `PostToolBatch` | mid-turn, before the next model call |
+| `stop` | `Stop` | at the end of an assistant turn |
+
+The last two are what make an *unattended* manager work: `UserPromptSubmit` only
+fires on a human message, so without them a manager spawning and polling on its
+own goes many turns with no delivery point at all (see
+[How reporting works](#how-reporting-works)).
+
 That script also self-heals `@apex_role`/`@apex_session` after a session
 restart (see `tmux-apex.sh relink`), so it needs to run for every session, not
 just managers.
@@ -115,39 +129,17 @@ troubleshooting or hand-editing.
       { "matcher": "", "hooks": [{ "type": "command", "command": "~/.tmux/plugins/tmux-delta/scripts/agent-tmux-status.sh notify" }] }
     ],
     "Stop": [
-      { "matcher": "", "hooks": [{ "type": "command", "command": "~/.tmux/plugins/tmux-delta/scripts/agent-tmux-status.sh clear" }] }
+      { "matcher": "", "hooks": [{ "type": "command", "command": "~/.tmux/plugins/tmux-delta/scripts/agent-tmux-status.sh clear" }] },
+      { "matcher": "", "hooks": [{ "type": "command", "command": "~/.tmux/plugins/tmux-delta/scripts/apex-manager-notify.sh stop", "timeout": 10 }] }
     ],
     "UserPromptSubmit": [
-      { "matcher": "", "hooks": [{ "type": "command", "command": "~/.tmux/plugins/tmux-delta/scripts/apex-manager-notify.sh", "timeout": 10 }] }
+      { "matcher": "", "hooks": [{ "type": "command", "command": "~/.tmux/plugins/tmux-delta/scripts/apex-manager-notify.sh prompt", "timeout": 10 }] }
     ],
     "SessionStart": [
-      { "matcher": "startup|resume", "hooks": [{ "type": "command", "command": "~/.tmux/plugins/tmux-delta/scripts/apex-manager-notify.sh", "timeout": 10 }] }
-    ]
-  }
-}
-```
-
-Those three cover the *worker* half of apex reporting. The *manager* half needs
-`apex-manager-notify.sh` wired to four more events — without it, a manager
-records nothing into its own context and only learns a worker finished when you
-tell it. See [How reporting works](#how-reporting-works) for what each event
-covers, and run `tmux-apex.sh doctor` to check the wiring:
-
-```json
-{
-  "hooks": {
-    "UserPromptSubmit": [
-      { "matcher": "", "hooks": [{ "type": "command", "command": "~/.tmux/plugins/tmux-delta/scripts/apex-manager-notify.sh prompt" }] }
-    ],
-    "SessionStart": [
-      { "matcher": "", "hooks": [{ "type": "command", "command": "~/.tmux/plugins/tmux-delta/scripts/apex-manager-notify.sh session-start" }] }
+      { "matcher": "startup|resume", "hooks": [{ "type": "command", "command": "~/.tmux/plugins/tmux-delta/scripts/apex-manager-notify.sh session-start", "timeout": 10 }] }
     ],
     "PostToolBatch": [
-      { "matcher": "", "hooks": [{ "type": "command", "command": "~/.tmux/plugins/tmux-delta/scripts/apex-manager-notify.sh post-tools" }] }
-    ],
-    "Stop": [
-      { "matcher": "", "hooks": [{ "type": "command", "command": "~/.tmux/plugins/tmux-delta/scripts/agent-tmux-status.sh clear" }] },
-      { "matcher": "", "hooks": [{ "type": "command", "command": "~/.tmux/plugins/tmux-delta/scripts/apex-manager-notify.sh stop" }] }
+      { "matcher": "", "hooks": [{ "type": "command", "command": "~/.tmux/plugins/tmux-delta/scripts/apex-manager-notify.sh post-tools", "timeout": 10 }] }
     ]
   }
 }
@@ -161,9 +153,10 @@ The argument is required and must match the event: it picks the output channel,
 and the channels are not interchangeable (plain stdout only reaches the agent on
 `UserPromptSubmit` and `SessionStart`). Wired with the wrong argument, or none,
 the script delivers nothing — deliberately, rather than writing to a channel
-nobody reads — and `doctor` reports that event as missing. Use a path that will
-outlive the moment, too: hooks are global config, so a worktree path here breaks
-silently once the worktree is gone.
+nobody reads — and `tmux-apex.sh doctor` reports that event as missing. Use a
+path that will outlive the moment, too: hooks are global config, so a worktree
+path here breaks silently once the worktree is gone. The installer handles both
+concerns; `doctor` is how you check whatever is actually on disk.
 
 **pi** — symlink the shipped extension, which wires `agent_start` → `set` and
 `agent_settled` → `clear`:
@@ -418,10 +411,15 @@ The script exits immediately in any session that isn't an apex manager, so it is
 safe to install globally — which it must be, since the manager can be any
 session.
 
-`tmux-apex.sh doctor` reports which of the four are wired, argument included;
-`init` runs the same check and warns if any are missing. A manager with no wiring looks perfectly
-healthy from the inside — `pending` keeps answering correctly for anyone who
-asks by hand — so the check is the only thing that makes the failure visible.
+`scripts/install-agent-hooks.sh` writes all four (see Installation step 3), and
+`tmux-apex.sh doctor` reports which of them are actually wired, argument
+included; `init` runs the same check and warns if any are missing. Both halves
+are worth having: the installer is what gets a fresh machine working, and
+`doctor` is what catches an installer that has drifted from what the script
+requires — the state this repo was in when the wiring existed but carried no
+argument. A manager with no working wiring looks perfectly healthy from the
+inside — `pending` keeps answering correctly for anyone who asks by hand — so
+the check is the only thing that makes the failure visible.
 Records on disk are the source of truth either way: `tmux-apex.sh status --json`
 and `events.jsonl`.
 
@@ -506,6 +504,11 @@ per event, that an invocation which cannot deliver also does not *consume*
 files — correctly wired, unwired, wired without the argument, wired with another
 event's argument, and malformed JSON. `tmux` and `tmux-apex.sh` are stubbed, so
 it needs neither a live agent nor a tmux server.
+
+It also pins the two halves together: `install-agent-hooks.sh` runs into a
+throwaway `$HOME` and `doctor` has to accept what it wrote, both from scratch and
+on top of a stale argument-less wiring. Those two drifting apart is what
+silently un-wires delivery on every machine at once.
 
 ## Shell functions (gwt.zsh)
 

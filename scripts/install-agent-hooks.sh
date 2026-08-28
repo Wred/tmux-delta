@@ -41,21 +41,47 @@ install_claude_hooks() {
 	# Parallel arrays: event, matcher, command, pattern (matches existing
 	# entries so they get repointed in place instead of duplicated), extra
 	# jq object merged into the hook entry (e.g. timeout).
-	local events=(PreToolUse Notification Stop UserPromptSubmit SessionStart)
-	local matchers=("" "" "" "" "startup|resume")
-	local cmds=("$STATUS_SH set" "$STATUS_SH notify" "$STATUS_SH clear" "$NOTIFY_SH" "$NOTIFY_SH")
+	#
+	# apex-manager-notify.sh takes the delivery point as a required argument,
+	# one per event, and the argument is not cosmetic: it selects the output
+	# channel, and plain stdout only reaches the agent on UserPromptSubmit and
+	# SessionStart. Wired without it — as this installer did before — the
+	# script has no way to know which channel to use, so it delivers nothing
+	# and (deliberately) consumes nothing. PostToolBatch and Stop are what make
+	# an unattended manager notice a worker at all; UserPromptSubmit alone only
+	# ever fires on a human message. See issue #7 and `tmux-apex.sh doctor`,
+	# which checks for exactly the wiring this function writes.
+	local events=(PreToolUse Notification Stop UserPromptSubmit SessionStart PostToolBatch Stop)
+	local matchers=("" "" "" "" "startup|resume" "" "")
+	local cmds=(
+		"$STATUS_SH set"
+		"$STATUS_SH notify"
+		"$STATUS_SH clear"
+		"$NOTIFY_SH prompt"
+		"$NOTIFY_SH session-start"
+		"$NOTIFY_SH post-tools"
+		"$NOTIFY_SH stop"
+	)
 	# Matched by script basename only (not the trailing verb) so a hook
 	# left wired to the wrong verb — e.g. Notification still pointing at
-	# "clear" — gets corrected in place instead of getting a duplicate
-	# second entry alongside the stale one.
+	# "clear", or apex-manager-notify.sh wired with no verb at all — gets
+	# corrected in place instead of getting a duplicate second entry alongside
+	# the stale one.
+	#
+	# Stop carries one entry per script, and the two patterns are disjoint
+	# (different basenames), so upserting either leaves the other alone: a
+	# session is both its own worker, reporting idle via agent-tmux-status.sh,
+	# and possibly a manager collecting pings via apex-manager-notify.sh.
 	local pats=(
 		'(^|/)agent-tmux-status\.sh( |$)'
 		'(^|/)agent-tmux-status\.sh( |$)'
 		'(^|/)agent-tmux-status\.sh( |$)'
-		'(^|/)apex-manager-notify\.sh$'
-		'(^|/)apex-manager-notify\.sh$'
+		'(^|/)apex-manager-notify\.sh( |$)'
+		'(^|/)apex-manager-notify\.sh( |$)'
+		'(^|/)apex-manager-notify\.sh( |$)'
+		'(^|/)apex-manager-notify\.sh( |$)'
 	)
-	local extras=("{}" "{}" "{}" '{"timeout":10}' '{"timeout":10}')
+	local extras=("{}" "{}" "{}" '{"timeout":10}' '{"timeout":10}' '{"timeout":10}' '{"timeout":10}')
 
 	local i event matcher cmd pat extra tmp
 	for i in "${!events[@]}"; do
