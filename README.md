@@ -477,6 +477,15 @@ deliver. When there is, it types one short nudge into the manager's pane, which
 fires `UserPromptSubmit`, which attaches the real `pending` output as context —
 so the watcher never formats or dedupes a ping itself.
 
+The tick's one job is to answer the same question `pending` answers, cheaply.
+That predicate is not just "went idle": a pair escalation is reported on its own
+merit regardless of the `status` it forces (see the pairing section), so a
+terminal `READY FOR HUMAN REVIEW` can land while the member still reads as
+`working`. The gate mirrors that — including the one-shot `seq`/`pinged_seq`
+ledger — from a single `jq` definition spliced into both its slurped path and
+its per-file fallback, so the two cannot drift apart and quietly disagree with
+`pending` about the handoff that most wants a human.
+
 `init` starts it, `stop` retires it, and `relink` restarts it — on *every*
 manager hook, not just after a session restart, so a watcher that died for any
 other reason (a crash, an OOM kill, a stray `kill`) comes back on the manager's

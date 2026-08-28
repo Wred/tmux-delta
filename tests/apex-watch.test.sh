@@ -74,10 +74,11 @@ MGR=fake-manager
 # the stub answers every show-option with "", so point it at the pane directly.
 _agent_pane() { print -r -- "$MGR_PANE" }
 
-member() {  # member <id> <status> <seq> <pinged_seq>
+member() {  # member <id> <status> <seq> <pinged_seq> [pair_message]
 	apex_init_dirs "$MGR"
-	jq -nc --arg st "$2" --argjson seq "$3" --argjson p "$4" \
-		'{status:$st, seq:$seq, pinged_seq:$p}' > "$(apex_member_file "$MGR" "$1")"
+	jq -nc --arg st "$2" --argjson seq "$3" --argjson p "$4" --arg pm "${5-}" \
+		'{status:$st, seq:$seq, pinged_seq:$p, pair_message:$pm}' \
+		> "$(apex_member_file "$MGR" "$1")"
 }
 reset() {
 	rm -rf "$(apex_dir "$MGR")"; apex_init_dirs "$MGR"
@@ -119,6 +120,28 @@ reset
 member 'b:%9' attention 1 -1
 member 'a:%8' idle 2 -1
 eq "several members are reported in a stable order" "a:%8#2,b:%9#1" "$(_apex_pending_sig "$MGR")"
+
+# `pending` reports a pair escalation on its own merit rather than through the
+# `status` it forces, so a terminal "READY FOR HUMAN REVIEW" can arrive while
+# the member reads as working. The gate has to agree, or the poller stays quiet
+# through exactly the handoff that most wants a human.
+reset
+member 'w:%7' working 4 3 'READY FOR HUMAN REVIEW'
+eq "a pair escalation is reported even mid-turn" "w:%7#4!" "$(_apex_pending_sig "$MGR")"
+
+# The `!` is not decoration: without it a pair message landing on a member that
+# was already reported idle at the same seq would fingerprint identically, and
+# the debounce would swallow the escalation as a duplicate.
+member 'w:%7' idle 4 3
+eq "the escalation marker distinguishes the fingerprint" "w:%7#4" "$(_apex_pending_sig "$MGR")"
+
+# Still one-shot. seq is the delivery ledger for escalations too, so a message
+# left in the record after delivery must not re-report forever.
+member 'w:%7' working 4 4 'READY FOR HUMAN REVIEW'
+eq "a delivered escalation is not re-reported" "" "$(_apex_pending_sig "$MGR")"
+
+member 'w:%7' working 4 3 ''
+eq "an empty pair message is not an escalation" "" "$(_apex_pending_sig "$MGR")"
 
 # ── nudging ──────────────────────────────────────────────────────────
 print "_apex_watch_tick"
@@ -270,6 +293,15 @@ print -r -- '{ truncated' > "$(apex_member_file "$MGR" 'bad:%9')"
 eq "a corrupt member only loses itself" "good:%8#4" "$(_apex_pending_sig "$MGR" 2>/dev/null)"
 contains "and the degradation is recorded" "watch-degraded" \
 	"$(cat "$(apex_events_file "$MGR")" 2>/dev/null)"
+
+# The fallback reads each file with a second copy of the predicate. It is the
+# same jq definition spliced into a different call site, so it gets the same
+# escalation case to keep the two from drifting apart unnoticed.
+reset
+member 'good:%8' working 4 3 'READY FOR HUMAN REVIEW'
+print -r -- '{ truncated' > "$(apex_member_file "$MGR" 'bad:%9')"
+eq "the fallback honours escalations too" "good:%8#4!" \
+	"$(_apex_pending_sig "$MGR" 2>/dev/null)"
 
 # ── a comma in a session name ────────────────────────────────────────
 # tmux allows it (`tmux new-session -s a,b` succeeds), so the names cannot ride

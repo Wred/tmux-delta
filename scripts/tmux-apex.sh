@@ -1810,6 +1810,19 @@ _apex_watch_statefile() { printf '%s/watch-state.json' "$(apex_dir "$1")"; }
 # The seq is part of the fingerprint, not just the session: a worker that
 # settles, gets pinged, wakes and settles again is a new event to deliver,
 # and keying on session alone would swallow it as a duplicate.
+# The cheap gate has to answer the same question `_cmd_pending` does, or the
+# poller goes blind to whatever the two disagree about. Kept as one jq
+# definition spliced into both the slurped path and the per-file fallback so
+# they cannot drift apart. Mirrors _cmd_pending: a member is reportable when
+# its seq has moved past pinged_seq AND it is either resting (idle/attention)
+# or carrying a pair escalation — which `pending` reports on its own merit,
+# regardless of the `status` the escalation forces.
+_APEX_REPORTABLE_JQ='def reportable:
+	((.seq // 0) != (.pinged_seq // -1))
+	and (((.pair_message // "") != "")
+	     or .status == "idle" or .status == "attention");
+'
+
 _apex_pending_sig() {
 	local manager="$1" dir
 	dir=$(apex_members_dir "$manager")
@@ -1826,13 +1839,12 @@ _apex_pending_sig() {
 	# legal), which would split one name into two and misalign every name after
 	# it, but they cannot contain a newline.
 	local sig rc=0
-	sig=$(jq -rs --arg names "${(pj:\n:)names}" '
+	sig=$(jq -rs --arg names "${(pj:\n:)names}" "$_APEX_REPORTABLE_JQ"'
 		($names | split("\n")) as $n
 		| [ range(0; length) as $i
 		    | .[$i]
-		    | select((.status == "idle" or .status == "attention")
-		             and ((.seq // 0) != (.pinged_seq // -1)))
-		    | "\($n[$i])#\(.seq // 0)" ]
+		    | select(reportable)
+		    | "\($n[$i])#\(.seq // 0)\(if (.pair_message // "") != "" then "!" else "" end)" ]
 		| sort | join(",")' "${files[@]}" 2>/dev/null) || rc=$?
 	if (( rc == 0 )); then
 		print -r -- "$sig"
@@ -1850,10 +1862,10 @@ _apex_pending_sig() {
 	local -a out=()
 	local i one
 	for (( i = 1; i <= ${#files}; i++ )); do
-		one=$(jq -r '
-			select((.status == "idle" or .status == "attention")
-			       and ((.seq // 0) != (.pinged_seq // -1)))
-			| "#\(.seq // 0)"' "${files[$i]}" 2>/dev/null) || continue
+		one=$(jq -r "$_APEX_REPORTABLE_JQ"'
+			select(reportable)
+			| "#\(.seq // 0)\(if (.pair_message // "") != "" then "!" else "" end)"
+			' "${files[$i]}" 2>/dev/null) || continue
 		[[ -n $one ]] && out+=("${names[$i]}${one}")
 	done
 	print -r -- "${(j:,:)${(o)out}}"
