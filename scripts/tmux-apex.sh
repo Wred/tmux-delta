@@ -555,13 +555,22 @@ _cmd_stop() {
 # UserPromptSubmit/SessionStart hooks) — ahead of that script's `pending`
 # call, since determining whether this session is even a manager is the
 # whole point. No-op for a session that already has a role, or that matches
-# no durable state at all.
+# no durable state at all — except for one thing it always does: a manager
+# that already has its role still gets its watcher restarted, since relink is
+# the one code path that reliably runs in a resumed manager (and on every one
+# of its turns), and a watcher can die for reasons a session restart is not —
+# a crash, an OOM kill, a stray `kill`. `_apex_watch_start` is a pidfile read
+# and a `kill -0` when one is already running, so paying it per hook is fine.
 _cmd_relink() {
 	local session pane
 	session=$(_cur_session) || return 0
 	pane="$TMUX_PANE"
 
-	[[ $(_sopt "$session" @apex_role) == manager ]] && return 0   # manager already linked
+	if [[ $(_sopt "$session" @apex_role) == manager ]]; then
+		# Already linked — but the watcher may not be (see the header above).
+		_apex_watch_start "$session"
+		return 0
+	fi
 	[[ -n $pane ]] && [[ -n $(tmux show-option -p -t "$pane" -qv @apex_role 2>/dev/null) ]] && return 0   # member already linked
 
 	# Manager? Only if the most recent manager-init/manager-stop event for
@@ -578,8 +587,6 @@ _cmd_relink() {
 			tmux set-option -t "$session" @apex_role manager
 			[[ -n $repo ]] && tmux set-option -t "$session" @apex_repo "$repo"
 			tmux refresh-client -S 2>/dev/null
-			# A restarted session has no watcher; relink is the one place that
-			# reliably runs in a resumed manager, so restart it here too.
 			_apex_watch_start "$session"
 			return 0
 		fi
@@ -1769,8 +1776,24 @@ _cmd_profiles() {
 # APEX_WATCH_RENUDGE (60s).
 
 APEX_WATCH_INTERVAL=${APEX_WATCH_INTERVAL:-1}
-APEX_WATCH_BOX_GRACE=${APEX_WATCH_BOX_GRACE:-15}
+APEX_WATCH_BOX_GRACE=${APEX_WATCH_BOX_GRACE:-60}
 APEX_WATCH_RENUDGE=${APEX_WATCH_RENUDGE:-60}
+
+# _apex_watch_check_knobs — refuse to start on a knob that isn't a number.
+#
+# Not pedantry. A non-numeric interval makes `sleep` fail instantly, and the
+# loop has no way to tell that from a slept second: it would spin a core
+# running full ticks forever. The same value also blows up `--argjson` when the
+# daemon records itself, and a failed `jq` there used to leave an empty state
+# file behind, which is its own failure mode (see _apex_watch_save). Catch it
+# once, at the door, rather than three times downstream.
+_apex_watch_check_knobs() {
+	local k v
+	for k in APEX_WATCH_INTERVAL APEX_WATCH_BOX_GRACE APEX_WATCH_RENUDGE; do
+		v=${(P)k}
+		[[ $v =~ '^[0-9]+(\.[0-9]+)?$' ]] || _die "watch: $k must be a number, got '$v'"
+	done
+}
 
 _apex_watch_pidfile()   { printf '%s/watch.pid' "$(apex_dir "$1")"; }
 _apex_watch_statefile() { printf '%s/watch-state.json' "$(apex_dir "$1")"; }
@@ -1794,18 +1817,46 @@ _apex_pending_sig() {
 	(( ${#files} )) || return 0
 	local f
 	for f in "${files[@]}"; do names+=("${${f:t}:r}"); done
-	# Member ids are "<session>:<pane_id>" and can hold neither a comma nor a
-	# newline, so one joined --arg is enough to line the names up with the
-	# slurped documents. jq's --args cannot be used for this: it would swallow
-	# the file list as positional arguments and leave jq reading stdin.
-	jq -rs --arg names "${(j:,:)names}" '
-		($names | split(",")) as $n
+
+	# One slurped jq over every member file is the cheap path. Names travel as a
+	# single newline-joined --arg to line up with the slurped documents: jq's
+	# --args cannot be used for this, it would swallow the file list as
+	# positional arguments and leave jq reading stdin. Newline and not comma —
+	# tmux session names may contain a comma (`tmux new-session -s a,b` is
+	# legal), which would split one name into two and misalign every name after
+	# it, but they cannot contain a newline.
+	local sig rc=0
+	sig=$(jq -rs --arg names "${(pj:\n:)names}" '
+		($names | split("\n")) as $n
 		| [ range(0; length) as $i
 		    | .[$i]
 		    | select((.status == "idle" or .status == "attention")
 		             and ((.seq // 0) != (.pinged_seq // -1)))
 		    | "\($n[$i])#\(.seq // 0)" ]
-		| sort | join(",")' "${files[@]}" 2>/dev/null
+		| sort | join(",")' "${files[@]}" 2>/dev/null) || rc=$?
+	if (( rc == 0 )); then
+		print -r -- "$sig"
+		return 0
+	fi
+
+	# A slurp aborts on the first unparseable document, so one truncated member
+	# file would otherwise return "" for the whole set — a poller that reports
+	# itself healthy in `doctor` and `watch --status` and will never fire again,
+	# while `_cmd_pending` (which reads each file on its own) keeps answering
+	# correctly. Degrade per file instead, so a corrupt record only ever loses
+	# its own member, and say so in the event log rather than silently.
+	apex_event "$manager" "$(jq -nc '{event:"watch-degraded",
+		reason:"unparseable member state; falling back to per-file reads"}')"
+	local -a out=()
+	local i one
+	for (( i = 1; i <= ${#files}; i++ )); do
+		one=$(jq -r '
+			select((.status == "idle" or .status == "attention")
+			       and ((.seq // 0) != (.pinged_seq // -1)))
+			| "#\(.seq // 0)"' "${files[$i]}" 2>/dev/null) || continue
+		[[ -n $one ]] && out+=("${names[$i]}${one}")
+	done
+	print -r -- "${(j:,:)${(o)out}}"
 }
 
 # _apex_watch_state <manager> <key> / _apex_watch_save <manager> <patch-json>
@@ -1821,18 +1872,66 @@ _apex_watch_state() {
 	jq -r --arg k "$2" '.[$k] // "" | tostring' "$f" 2>/dev/null
 }
 
+# _apex_watch_repair <manager> — if the state file exists but does not parse,
+# replace it with an empty object. Returns 1 when it had to.
+#
+# Not cosmetic: every key read out of an unparseable file comes back "", and ""
+# is not a safe default anywhere in the tick. It makes the debounce compare
+# against an empty last-signature (so every tick looks like a brand-new event)
+# and the grace window start at the epoch (so every box looks stale). At a 1s
+# cadence that is a nudge per second, each one clearing the manager's input box
+# — the exact hazard this path is guarded against. So the tick repairs the file
+# and skips its own turn rather than acting on nothing.
+_apex_watch_repair() {
+	local f
+	f=$(_apex_watch_statefile "$1")
+	[[ -f $f ]] || return 0
+	jq -e . "$f" >/dev/null 2>&1 && return 0
+	apex_write_atomic "$f" '{}'
+	return 1
+}
+
+# Every read of the base goes through jq rather than `cat`, and a failure is
+# reported rather than written. Without that, one bad merge writes an empty
+# state file, every later save reads the empty base and fails identically, and
+# the file never recovers: `_apex_watch_state` then answers "" for every key,
+# which does not fail closed — it makes the debounce stop debouncing and the
+# grace window expire instantly, so the daemon types a nudge per second into
+# the manager's pane, clearing whatever is in the box each time. That is the
+# precise hazard this whole path is guarded against.
 _apex_watch_save() {
-	local manager="$1" patch="$2" f base
+	local manager="$1" patch="$2" f base merged
+	[[ -n $patch ]] || return 1
 	f=$(_apex_watch_statefile "$manager")
-	base='{}'
-	[[ -f $f ]] && base=$(cat "$f")
-	apex_write_atomic "$f" "$(printf '%s\n%s\n' "$base" "$patch" | jq -s '.[0] * .[1]')"
+	base=$(jq -c . "$f" 2>/dev/null) || base='{}'
+	[[ -n $base ]] || base='{}'
+	merged=$(printf '%s\n%s\n' "$base" "$patch" | jq -s '.[0] * .[1]') || return 1
+	[[ -n $merged ]] || return 1
+	apex_write_atomic "$f" "$merged"
+}
+
+# _apex_client_activity <manager> — epoch seconds of the most recent input from
+# any client attached to <manager>'s session, or "" if nobody is attached.
+#
+# Deliberately client_activity and not session_activity: the latter also moves
+# on pane *output*, which an agent produces constantly, so it would read as
+# "human present" forever.
+_apex_client_activity() {
+	local t
+	t=$(tmux list-clients -t "=$1" -F '#{client_activity}' 2>/dev/null \
+		| sort -rn | head -n 1)
+	[[ $t =~ '^[0-9]+$' ]] || return 0
+	print -r -- "$t"
 }
 
 # _apex_watch_tick <manager> — one poll. Prints a line per action taken so
 # `watch --once` is inspectable by hand; silent when there is nothing to do.
 _apex_watch_tick() {
 	local manager="$1" sig now
+	if ! _apex_watch_repair "$manager"; then
+		print -r -- "watch state was unreadable; reset and skipping this tick"
+		return 0
+	fi
 	sig=$(_apex_pending_sig "$manager")
 	now=$(date +%s)
 
@@ -1858,27 +1957,59 @@ _apex_watch_tick() {
 
 	if [[ -n $box ]]; then
 		if [[ $box != $last_box ]]; then
+			# Every early return below must survive its own save failing, and
+			# "defer" is the safe direction: a tick that cannot remember what it
+			# saw must not conclude the box is stale and clear it.
 			_apex_watch_save "$manager" \
-				"$(jq -nc --arg b "$box" --argjson t "$now" '{box:$b, box_since:$t}')"
+				"$(jq -nc --arg b "$box" --argjson t "$now" '{box:$b, box_since:$t}')" \
+				|| print -u2 -- "watch: could not record input-box state; deferring"
 			print -r -- "manager input box busy; deferring"
 			return 0
 		fi
-		if (( now - box_since < APEX_WATCH_BOX_GRACE )); then
-			print -r -- "manager input box unchanged for $(( now - box_since ))s; deferring"
+		# A missing box_since means the state file could not be read. Treat it
+		# as "first seen now" rather than epoch 0, so an unreadable state file
+		# defers instead of expiring the grace window instantly.
+		if [[ -z $box_since || $box_since == 0 ]]; then
+			_apex_watch_save "$manager" \
+				"$(jq -nc --arg b "$box" --argjson t "$now" '{box:$b, box_since:$t}')" || true
+			print -r -- "manager input box busy; deferring"
 			return 0
 		fi
-		# Sat identical past the grace window: ghost text or an abandoned
-		# draft. _send_to_pane clears it, and says what it cleared on stderr
-		# and in the event log.
+		# The grace window is really asking "is a human present?", and a timer
+		# is only a proxy for it. tmux answers it directly: client_activity is
+		# the last time an attached client sent input, and ghost text is painted
+		# with no client activity at all. So let recent client activity push the
+		# clock forward — someone using the session keeps their draft safe for
+		# as long as they keep using it — while an unattended pane still expires
+		# on schedule. Bounded either way: the window still closes once they
+		# stop, so ghost text delays delivery, it never blocks it.
+		local since=$(( now - box_since )) act
+		act=$(_apex_client_activity "$manager")
+		[[ -n $act ]] && (( now - act < since )) && since=$(( now - act ))
+		if (( since < APEX_WATCH_BOX_GRACE )); then
+			print -r -- "manager input box in use ${since}s ago; deferring"
+			return 0
+		fi
+		# Quiet past the grace window: ghost text or an abandoned draft.
+		# _send_to_pane clears it, and says what it cleared on stderr and in
+		# the event log.
 	else
 		[[ -n $last_box ]] && _apex_watch_save "$manager" '{"box":"","box_since":0}'
 	fi
 
 	local last_sig last_nudge
 	last_sig=$(_apex_watch_state "$manager" sig)
-	last_nudge=$(_apex_watch_state "$manager" nudged_at); [[ -z $last_nudge ]] && last_nudge=0
-	if [[ $sig == $last_sig ]] && (( now - last_nudge < APEX_WATCH_RENUDGE )); then
-		return 0
+	last_nudge=$(_apex_watch_state "$manager" nudged_at)
+	if [[ $sig == $last_sig ]]; then
+		# An unreadable nudged_at cannot be read as "nudged at the epoch" —
+		# that makes the debounce silently stop debouncing, which at a 1s
+		# cadence is a nudge per second. Same fingerprint and no usable
+		# timestamp means we have already sent this one: hold.
+		if [[ -z $last_nudge || $last_nudge == 0 ]]; then
+			print -u2 -- "watch: no readable nudge timestamp; holding to avoid duplicates"
+			return 0
+		fi
+		(( now - last_nudge < APEX_WATCH_RENUDGE )) && return 0
 	fi
 
 	local rc=0
@@ -1901,12 +2032,27 @@ _apex_watch_tick() {
 }
 
 # _apex_watch_running <manager> — pid of a live watcher, or nothing.
+#
+# `kill -0` alone is not enough. The pidfile lives under $XDG_CACHE_HOME and
+# survives reboots, after which the pid has very likely been reassigned — and
+# then `kill -0` says "running", which both stops `init` from starting a real
+# poller (while `doctor` cheerfully reports a healthy one) and points
+# `watch --stop` at somebody else's process. So check the command line too, and
+# treat a mismatch as not-running, unlinking the stale pidfile on the way out.
 _apex_watch_running() {
-	local f pid
+	local f pid cmd
 	f=$(_apex_watch_pidfile "$1")
 	[[ -f $f ]] || return 1
 	pid=$(cat "$f" 2>/dev/null)
-	[[ -n $pid ]] && kill -0 "$pid" 2>/dev/null || return 1
+	if [[ ! $pid =~ '^[0-9]+$' ]] || ! kill -0 "$pid" 2>/dev/null; then
+		rm -f "$f"
+		return 1
+	fi
+	cmd=$(ps -o command= -p "$pid" 2>/dev/null)
+	if [[ $cmd != *tmux-apex* ]]; then
+		rm -f "$f"
+		return 1
+	fi
 	print -r -- "$pid"
 }
 
@@ -1917,7 +2063,13 @@ _apex_watch_running() {
 _apex_watch_start() {
 	local manager="$1"
 	_apex_watch_running "$manager" >/dev/null && return 0
-	tmux run-shell -b "${SELF} watch --daemon ${(q)manager}" 2>/dev/null
+	# run-shell executes in the *tmux server's* environment, not the caller's,
+	# so the knobs have to travel on the command line or the daemon silently
+	# ignores every one of them and the documented tunables are inert.
+	tmux run-shell -b "APEX_WATCH_INTERVAL=${(q)APEX_WATCH_INTERVAL} \
+APEX_WATCH_BOX_GRACE=${(q)APEX_WATCH_BOX_GRACE} \
+APEX_WATCH_RENUDGE=${(q)APEX_WATCH_RENUDGE} \
+${(q)SELF} watch --daemon ${(q)manager}" 2>/dev/null
 }
 
 _apex_watch_stop() {
@@ -1929,9 +2081,10 @@ _apex_watch_stop() {
 }
 
 _cmd_watch() {
-	local mode=loop manager="" a
+	local mode=start manager="" a
 	for a in "$@"; do
 		case "$a" in
+			--start)  mode=start ;;
 			--once)   mode=once ;;
 			--stop)   mode=stop ;;
 			--status) mode=status ;;
@@ -1940,18 +2093,31 @@ _cmd_watch() {
 			*)        manager="$a" ;;
 		esac
 	done
-	[[ -z $manager ]] && manager=$(_require_manager)
+
+	if [[ -z $manager ]]; then
+		manager=$(_require_manager)
+	else
+		# An explicitly named session is validated like every other command's
+		# target (cf. `stop`). Without this, `watch typo` happily creates
+		# $APEX_ROOT/typo/members/ and spins up a loop that immediately breaks.
+		[[ $(_sopt "$manager" @apex_role) == manager ]] \
+			|| _die "watch: session '$manager' is not an apex manager"
+	fi
 	APEX_SESSION="$manager"
 
 	local pid
 	case $mode in
 		status)
 			if pid=$(_apex_watch_running "$manager"); then
-				# The interval the *daemon* was started with, not this process's
-				# default — they are different knobs read in different shells.
-				local iv
-				iv=$(_apex_watch_state "$manager" interval); [[ -z $iv ]] && iv='?'
-				print "watch: running (pid $pid, interval ${iv}s) for $manager"
+				# The knobs the *daemon* was started with, not this process's
+				# defaults — they are different values read in different shells,
+				# and the daemon's are the ones actually in force.
+				local iv gr rn
+				iv=$(_apex_watch_state "$manager" interval);  [[ -z $iv ]] && iv='?'
+				gr=$(_apex_watch_state "$manager" box_grace); [[ -z $gr ]] && gr='?'
+				rn=$(_apex_watch_state "$manager" renudge);   [[ -z $rn ]] && rn='?'
+				print "watch: running (pid $pid) for $manager"
+				print "  interval=${iv}s box-grace=${gr}s re-nudge=${rn}s"
 			else
 				print "watch: not running for $manager"
 				return 1
@@ -1965,33 +2131,87 @@ _cmd_watch() {
 			fi
 			return 0 ;;
 		once)
+			_apex_watch_check_knobs
 			_apex_watch_tick "$manager"
+			return 0 ;;
+		start)
+			# The default has to return. `watch` is something an agent runs in a
+			# tool call, and a blocking loop there hangs the manager's own turn
+			# until the harness times out — the one session in the system that
+			# must stay responsive. A human typing it loses their terminal to a
+			# process that prints nothing. So the default hands off to the tmux
+			# server and reports; `--daemon` is the loop itself.
+			_apex_watch_check_knobs
+			if pid=$(_apex_watch_running "$manager"); then
+				print "watch: already running (pid $pid) for $manager"
+				return 0
+			fi
+			_apex_watch_start "$manager"
+			local i
+			for i in 1 2 3 4 5 6 7 8 9 10; do
+				sleep 0.1
+				pid=$(_apex_watch_running "$manager") && break
+			done
+			if [[ -n $pid ]]; then
+				print "watch: started (pid $pid, interval ${APEX_WATCH_INTERVAL}s) for $manager"
+			else
+				print -u2 "watch: could not start a poller for $manager"
+				return 1
+			fi
 			return 0 ;;
 	esac
 
-	# daemon / loop: one per manager.
-	if pid=$(_apex_watch_running "$manager"); then
-		print "watch: already running (pid $pid) for $manager"
-		return 0
-	fi
+	# --daemon: the loop. One per manager.
+	_apex_watch_check_knobs
 	apex_init_dirs "$manager"
 	local pidfile
 	pidfile=$(_apex_watch_pidfile "$manager")
-	printf '%d\n' "$$" > "$pidfile"
-	trap 'rm -f "$pidfile"; exit 0' EXIT INT TERM
-	_apex_watch_save "$manager" "$(jq -nc --argjson i "$APEX_WATCH_INTERVAL" '{interval:$i}')"
+
+	# Claim the pidfile with noclobber rather than checking-then-writing: two
+	# concurrent starts both pass a prior `_apex_watch_running` check, and the
+	# second `>` would overwrite the first daemon's pid, orphaning a loop with
+	# nothing left able to stop it. An existing file whose pid is dead or not
+	# ours is stale — `_apex_watch_running` unlinks those — so retry once.
+	local claimed=false
+	local i
+	for i in 1 2; do
+		if ( set -o noclobber; printf '%d\n' "$$" > "$pidfile" ) 2>/dev/null; then
+			claimed=true
+			break
+		fi
+		if pid=$(_apex_watch_running "$manager"); then
+			print "watch: already running (pid $pid) for $manager"
+			return 0
+		fi
+	done
+	if ! $claimed; then
+		print -u2 "watch: could not claim $pidfile"
+		return 1
+	fi
+
+	# Only remove the pidfile if it is still ours; a successor that claimed it
+	# after us must not be unlinked on our way out.
+	trap 'if [[ $(cat "$pidfile" 2>/dev/null) == $$ ]]; then rm -f "$pidfile"; fi; exit 0' EXIT INT TERM
+
+	_apex_watch_save "$manager" "$(jq -nc \
+		--argjson i "$APEX_WATCH_INTERVAL" \
+		--argjson g "$APEX_WATCH_BOX_GRACE" \
+		--argjson r "$APEX_WATCH_RENUDGE" \
+		'{interval:$i, box_grace:$g, renudge:$r}')"
 	apex_event "$manager" "$(jq -nc --argjson i "$APEX_WATCH_INTERVAL" \
 		'{event:"watch-start", interval:$i}')"
 
 	while true; do
-		sleep "$APEX_WATCH_INTERVAL"
+		# A failing sleep is indistinguishable from a slept second to the loop,
+		# so it would spin a core running full ticks. Retire instead.
+		sleep "$APEX_WATCH_INTERVAL" || break
 		# Stop when the manager goes away or steps out of apex mode, so `stop`
 		# and a killed session both retire the watcher without extra plumbing.
 		tmux has-session -t "=$manager" 2>/dev/null || break
 		[[ $(_sopt "$manager" @apex_role) == manager ]] || break
 		_apex_watch_tick "$manager" >/dev/null 2>&1 || true
 	done
-	rm -f "$pidfile"
+	# The EXIT trap unlinks the pidfile, and only if it is still ours.
 }
 
 # ─── doctor (ping-delivery self-check) ───────────────────────────────
@@ -2098,14 +2318,18 @@ _cmd_doctor() {
 	# turns" into "fires when a worker actually changes state" (issue #14).
 	# Advisory only: its absence is a latency problem, not a delivery one, so
 	# it does not change doctor's exit code.
-	local watch_line pid mgr
-	mgr=$(_cur_session 2>/dev/null)
+	# Resolve like every other command rather than using the current session, so
+	# that running doctor from a worker pane reports the *manager's* poller
+	# instead of claiming there isn't one.
+	local watch_line pid mgr iv
+	mgr=$(_resolve_manager 2>/dev/null) || mgr=""
 	if [[ -n $mgr ]] && pid=$(_apex_watch_running "$mgr" 2>/dev/null); then
-		watch_line="Fast poller: running (pid $pid, ${APEX_WATCH_INTERVAL}s)."
+		iv=$(_apex_watch_state "$mgr" interval); [[ -z $iv ]] && iv='?'
+		watch_line="Fast poller: running (pid $pid, ${iv}s) for $mgr."
 	else
-		watch_line="Fast poller: NOT running — the manager will only notice member
-  transitions on its own turns. Start it with '${SELF} watch' (init does this
-  automatically; a resumed session restarts it on its first hook)."
+		watch_line="Fast poller: NOT running${mgr:+ for $mgr} — the manager will only
+  notice member transitions on its own turns. Start it with '${SELF} watch'
+  (init does this automatically, and relink restarts it on every manager hook)."
 	fi
 
 	if (( ${#missing} == 0 )); then
@@ -2176,8 +2400,9 @@ case "${1:-}" in
 		print "                                 (the loop's termination signal) [--note TEXT]"
 		print "  status [--json]                state of every member"
 		print "  pending [--mark-delivered]     members not yet delivered to the manager"
-		print "  watch [--once|--status|--stop] background poller that nudges the manager"
-		print "                                 within ~1s of a member going idle/attention"
+		print "  watch [--status|--stop|--once] start the background poller that nudges the"
+		print "                                 manager ~1s after a member goes idle/attention"
+		print "                                 (returns immediately; --once runs one tick)"
 		print "  reap [--yes]                   clean up finished/dead members"
 		print "  profiles                       list available spawn profiles"
 		print "  doctor                         check that ping-delivery hooks are wired"

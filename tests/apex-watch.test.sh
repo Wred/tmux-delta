@@ -38,6 +38,8 @@ cat > "$BIN/tmux" <<'STUB'
 case "$1" in
 	capture-pane) cat "$PANE_FILE" ;;
 	list-panes)   printf '%s\n' "$MGR_PANE" ;;
+	list-clients) [ -n "${CLIENT_ACTIVITY:-}" ] && printf '%s\n' "$CLIENT_ACTIVITY" ;;
+	has-session)  exit 0 ;;
 	display-message) printf '%s\n' "${PANE_CMD:-node}" ;;
 	show-option)  printf '%s\n' "" ;;
 	send-keys)
@@ -210,6 +212,132 @@ out=$(tick)
 contains "a non-agent pane is refused" "no agent pane" "$out"
 eq "and nothing is typed into it" "" "$(keys)"
 PANE_CMD=node
+
+# ── surviving a damaged state file ───────────────────────────────────
+# Every "" the state reader can return has to fail *closed*. Read as
+# "never nudged" and "box first seen at the epoch", an unreadable state file
+# turns the 1s daemon into a nudge per second, each one running
+# _clear_pane_input over whatever the human is typing — the exact hazard the
+# guards above exist to prevent. The old code did precisely that, and the
+# suite missed it because it only ever exercised a healthy file.
+print "damaged state file"
+
+reset
+member 'w:%7' idle 3 -1
+tick >/dev/null                          # one legitimate nudge
+: > "$KEYS_LOG"
+print -r -- 'not json at all' > "$(_apex_watch_statefile "$MGR")"
+repeat 5 { tick >/dev/null }
+# The file is reset and that tick skipped, so the worst case is one duplicate
+# nudge for an event already delivered — not one per tick, which is what an
+# unguarded "" default produced (five ticks, five nudges).
+n=$(grep -c -- '-l -- \[apex\]' "$KEYS_LOG" 2>/dev/null) || n=0
+if (( n <= 1 )); then ok "garbage state costs at most one duplicate nudge, not one per tick"
+else bad "garbage state costs at most one duplicate nudge, not one per tick" "nudges: $n"; fi
+
+# ...and a save must repair the file rather than leaving it wedged: the old
+# `cat` base meant one bad merge emptied it and every later save failed
+# identically, with no recovery short of deleting it by hand.
+_apex_watch_save "$MGR" '{"box":"","box_since":0}'
+eq "a save over garbage restores parseable state" "0" "$(_apex_watch_state "$MGR" box_since)"
+
+# A draft in the box must still be safe when the state file is unreadable.
+reset
+member 'w:%7' idle 3 -1
+print -r -- '│ > a draft I am still writing         │' > "$PANE_FILE"
+print -r -- 'not json at all' > "$(_apex_watch_statefile "$MGR")"
+: > "$KEYS_LOG"
+repeat 5 { tick >/dev/null }
+lacks "an unreadable state file never clears a draft" "C-u" "$(keys)"
+
+# ── one bad member file must not blind the rest ───────────────────────
+# The cheap gate slurps every member file in one jq, and a slurp aborts on the
+# first unparseable document. Returning "" for the whole set would leave a
+# poller that reports itself healthy in `doctor` and `watch --status` and will
+# never fire again, while `pending` keeps answering correctly.
+print "malformed member file"
+
+reset
+member 'good:%8' idle 4 -1
+print -r -- '{ truncated' > "$(apex_member_file "$MGR" 'bad:%9')"
+eq "a corrupt member only loses itself" "good:%8#4" "$(_apex_pending_sig "$MGR" 2>/dev/null)"
+contains "and the degradation is recorded" "watch-degraded" \
+	"$(cat "$(apex_events_file "$MGR")" 2>/dev/null)"
+
+# ── a comma in a session name ────────────────────────────────────────
+# tmux allows it (`tmux new-session -s a,b` succeeds), so the names cannot ride
+# alongside the slurped documents on a comma — one name would split into two
+# and misalign every name after it, attaching the wrong seq to the wrong
+# member.
+reset
+member 'has,comma:%3' idle 9 -1
+member 'plain:%4' idle 1 -1
+eq "a comma in a session name does not misalign names" \
+	"has,comma:%3#9,plain:%4#1" "$(_apex_pending_sig "$MGR")"
+
+# ── client activity, not just a timer ────────────────────────────────
+# The grace window is really asking "is a human present?". tmux answers it
+# directly: client_activity moves only on client *input*, and ghost text is
+# painted with none at all. So a present human keeps their draft while an
+# unattended pane still expires on schedule.
+print "client activity"
+
+reset
+member 'w:%7' idle 3 -1
+print -r -- '│ > mid-sentence                       │' > "$PANE_FILE"
+tick >/dev/null                          # records the box
+export CLIENT_ACTIVITY=$(date +%s)
+APEX_WATCH_BOX_GRACE=0
+: > "$KEYS_LOG"
+# GRACE=0 would otherwise deliver immediately; recent client input must not.
+APEX_WATCH_BOX_GRACE=5
+out=$(tick)
+contains "recent client input keeps deferring" "deferring" "$out"
+eq "and clears nothing" "" "$(keys)"
+
+# Nobody attached: the timer is all there is, and it still fires.
+export CLIENT_ACTIVITY=""
+APEX_WATCH_BOX_GRACE=0
+: > "$KEYS_LOG"
+tick >/dev/null
+contains "an unattended stale box still gets delivery" "[apex] a member just changed state" "$(keys)"
+APEX_WATCH_BOX_GRACE=60
+
+# ── pidfile ownership ────────────────────────────────────────────────
+# The pidfile outlives reboots under $XDG_CACHE_HOME, after which the pid has
+# very likely been reassigned. Trusting `kill -0` alone both blocks `init` from
+# starting a real poller and points `watch --stop` at somebody else's process.
+print "pidfile ownership"
+
+reset
+print -r -- "$$" > "$(_apex_watch_pidfile "$MGR")"
+if _apex_watch_running "$MGR" >/dev/null 2>&1; then
+	bad "a live pid that is not a watcher reads as not running" "reported running"
+else
+	ok "a live pid that is not a watcher reads as not running"
+fi
+[[ -f $(_apex_watch_pidfile "$MGR") ]] \
+	&& bad "and the stale pidfile is unlinked" "still present" \
+	|| ok "and the stale pidfile is unlinked"
+
+reset
+print -r -- 'not-a-pid' > "$(_apex_watch_pidfile "$MGR")"
+if _apex_watch_running "$MGR" >/dev/null 2>&1; then
+	bad "a garbage pidfile reads as not running" "reported running"
+else
+	ok "a garbage pidfile reads as not running"
+fi
+
+# ── knob validation ──────────────────────────────────────────────────
+# A non-numeric interval makes `sleep` fail instantly, which the loop cannot
+# tell from a slept second — it would spin a core running full ticks forever.
+print "knob validation"
+
+_die() { print -u2 -- "die: $*"; return 1 }
+out=$(APEX_WATCH_INTERVAL=1s _apex_watch_check_knobs 2>&1) || true
+contains "a non-numeric interval is refused" "APEX_WATCH_INTERVAL must be a number" "$out"
+out=$(APEX_WATCH_INTERVAL=0.5 _apex_watch_check_knobs 2>&1) || true
+eq "a fractional interval is accepted" "" "$out"
 
 # ── summary ──────────────────────────────────────────────────────────
 print ""

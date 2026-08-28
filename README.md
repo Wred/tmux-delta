@@ -477,9 +477,16 @@ deliver. When there is, it types one short nudge into the manager's pane, which
 fires `UserPromptSubmit`, which attaches the real `pending` output as context —
 so the watcher never formats or dedupes a ping itself.
 
-`init` starts it, `stop` retires it, and `relink` restarts it in a resumed
-session. `watch --status` / `--stop` drive it by hand, and `watch --once` runs a
-single tick and says what it decided.
+`init` starts it, `stop` retires it, and `relink` restarts it — on *every*
+manager hook, not just after a session restart, so a watcher that died for any
+other reason (a crash, an OOM kill, a stray `kill`) comes back on the manager's
+next turn. `watch --status` / `--stop` drive it by hand, and `watch --once` runs
+a single tick and says what it decided.
+
+`watch` returns as soon as the poller is up; the blocking loop is `watch
+--daemon`, which is what `run-shell` invokes. That split matters because `watch`
+is something the manager agent runs in a tool call, and a blocking loop there
+hangs the manager's own turn until the harness times out.
 
 Writing into the manager's pane is exactly what the pull design refuses to do,
 so the watcher is guarded rather than trusted:
@@ -488,13 +495,29 @@ so the watcher is guarded rather than trusted:
 |-------|-----|
 | pane must be running an agent | typing into a shell would *execute* the nudge |
 | unsent input defers the nudge | never clobber a human mid-draft (issue #5) |
-| a box unchanged for `APEX_WATCH_BOX_GRACE` is cleared anyway | a human typing moves the box within seconds; Claude Code's ghost autosuggestion never does (issue #10), and deferring to it forever would restore the very blindness this fixes |
+| a box quiet for `APEX_WATCH_BOX_GRACE` is cleared anyway | Claude Code's ghost autosuggestion (issue #10) never moves, and deferring to it forever would restore the very blindness this fixes |
 | one nudge per distinct pending set, re-sent at most every `APEX_WATCH_RENUDGE` | a nudge queued behind a long manager turn must not turn into one duplicate per second |
+| an unparseable state file is reset and the tick skipped | every key then reads `""`, and `""` is not a safe default anywhere: it makes the debounce stop debouncing and the grace window expire instantly, i.e. a nudge per second that clears the box each time |
+| one unparseable *member* file only loses its own member | the cheap gate slurps every member file in one `jq`, and a slurp aborts on the first bad document — returning "nothing pending" for the whole set, from a poller that keeps reporting itself healthy |
 
-Tunable with `APEX_WATCH_INTERVAL` (1s), `APEX_WATCH_BOX_GRACE` (15s) and
-`APEX_WATCH_RENUDGE` (60s). This deliberately is not `/loop 1s`: a `/loop` tick
-spends a full manager turn whether or not anything happened, which is why that
-fallback has to be slow. Here the polling is free and only the events cost.
+"Quiet" is not only a timer. `client_activity` is the last time an attached
+client sent *input* (unlike `session_activity`, which also moves on pane
+output), and ghost text is painted with no client activity at all — so a human
+using the session keeps their draft for as long as they keep using it, while an
+unattended pane still expires on schedule. The window closes either way, so
+ghost text delays delivery; it never blocks it.
+
+Tunable with `APEX_WATCH_INTERVAL` (1s), `APEX_WATCH_BOX_GRACE` (60s) and
+`APEX_WATCH_RENUDGE` (60s); all three are validated as numbers before the loop
+starts, because a non-numeric interval makes `sleep` fail instantly and the loop
+cannot tell that from a slept second. They travel on the `run-shell` command
+line, since it executes in the *tmux server's* environment rather than the
+caller's, and the daemon records the values it actually started with so
+`watch --status` and `doctor` report those rather than the reader's own defaults.
+
+This deliberately is not `/loop 1s`: a `/loop` tick spends a full manager turn
+whether or not anything happened, which is why that fallback has to be slow.
+Here the polling is free and only the events cost.
 
 `scripts/install-agent-hooks.sh` writes all four (see Installation step 3), and
 `tmux-apex.sh doctor` reports which of them are actually wired, argument
@@ -665,6 +688,13 @@ draft still being typed is never clobbered while a box frozen past the grace
 window still gets delivery. One tick is a pure function of the state files, the
 captured pane and its own saved state, so a fake `tmux` covers all of it; no
 daemon and no live agent are involved.
+
+It also pins the degraded paths, which is where a poller fails *silently*: a
+garbage state file must cost at most one duplicate nudge rather than one per
+tick and must never clear a draft, one unparseable member file must not hide
+every other member's pending event, a comma in a session name must not misalign
+names against documents, and a stale pidfile whose pid now belongs to something
+else must read as not-running rather than as a healthy watcher.
 
 ## Shell functions (gwt.zsh)
 
