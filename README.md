@@ -432,6 +432,28 @@ to poll it rather than being woken.
 Manager designation is a tmux *session* option, so it does not survive a tmux
 server restart. The on-disk state does; re-run `init` to re-adopt it.
 
+### Sending into a member's pane
+
+The manager's own pane is never typed into, but `send` still delivers into a
+*member's* pane with `send-keys`, so it has to cope with whatever is already in
+that pane's input box:
+
+- **It clears the box first.** An idle Claude Code box is not reliably empty —
+  it paints predictive autosuggestion text into it — and appending to that
+  would hand the worker one spliced line. Whatever was cleared is reported on
+  stderr and stored as `cleared_input` on the `send` event, so nothing
+  disappears silently. `APEX_SEND_CLEAR=0` restores the old append-anyway
+  behaviour.
+- **It verifies delivery.** tmux wraps a literal send in bracketed paste and
+  some agent TUIs drop an Enter that lands mid-paste, so `send` reads the pane
+  back, re-sends Enter up to three times, and fails loudly (`send-unsubmitted`
+  event) rather than reporting a delivery that never happened.
+
+`status` lists any unsent text it finds in member input boxes, with the caveat
+attached: it is usually the agent's own autosuggestion rather than a failed
+delivery or stray injection, which is otherwise impossible to tell apart from
+outside the pane (issue #10).
+
 ### Spawn profiles
 
 `--profile NAME` is shorthand for a named `{agent, model, agent_flags}`

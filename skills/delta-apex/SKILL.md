@@ -219,6 +219,31 @@ finished some time ago and you had no idea: a manager with no hooks installed
 looks entirely normal from the inside, because `pending` keeps returning the
 right answer whenever you ask it by hand.
 
+## Unsent text in a member's input box
+
+`status` may report unsent text sitting in a member's input box. **That is
+almost always the agent's own autosuggestion, not a bug.** Claude Code predicts
+a plausible next input and paints it into an idle, empty box — `mark ready for
+review` and similar. From outside the pane it is indistinguishable from
+something having been typed there or injected by mistake, which has already
+cost real diagnosis time (issue #10).
+
+So:
+
+- Do not treat it as evidence that a `send` failed or leaked into the wrong
+  pane. `send` reports its own delivery, and verifies from the pane that the
+  text actually left the input box before claiming success.
+- Do not submit it. It is a guess about what someone might type next, not an
+  instruction from anyone.
+- `send` clears the box before it types, and tells you what it cleared (on
+  stderr and as `cleared_input` on the `send` event in `status --json`), so the
+  next delivery cannot be spliced onto it. Set `APEX_SEND_CLEAR=0` to keep the
+  old append-anyway behaviour if you ever need it.
+
+A `send-unsubmitted` event means the opposite and does matter: the text was
+typed into the pane, Enter was re-sent three times, and it is still unsent.
+Look at that pane.
+
 ## Reporting to the human
 
 Keep it short and factual, one line per member: what it is working on, where the
