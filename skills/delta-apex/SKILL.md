@@ -75,6 +75,29 @@ tmux-apex.sh spawn --issue 44 --profile hard --agent-flags bypassPermissions
 tmux-apex.sh spawn --review-pr 17 --role monitor --profile hard
 ```
 
+### Linked pairs — do not relay reviews by hand
+
+Once a worker has a draft PR and you have spawned a reviewer on it, link them
+and stay out of the way:
+
+```bash
+tmux-apex.sh status                                  # copy the two member keys
+tmux-apex.sh link --worker <session:%pane> --reviewer <session:%pane>
+```
+
+After that the reviewer's findings go straight to the worker, the worker's
+pushes re-invoke the reviewer, and you are pinged **once** — either because the
+reviewer signed off (PR flipped out of draft, human's merge call) or because the
+loop is stuck. Do not read the review thread and re-send it yourself; that is
+the round-trip the link exists to remove.
+
+Add `--max-rounds N` (default 5) if a PR deserves more or fewer attempts before
+it escalates as "not converging". `tmux-apex.sh unlink <member>` drops the
+pairing if you want to drive it manually again.
+
+If you spawn a reviewer and *don't* link it, you own every round-trip. Only do
+that for a one-shot review you have no intention of iterating on.
+
 Choose a tier per task and say out loud why you chose it — trivial/easy for
 mechanical, well-specified work; standard (sonnet) for most everyday issue
 work; hard (opus) for design work, tricky refactors, and reviews; extreme
@@ -173,7 +196,12 @@ Then pick one:
 - **Stuck or asking a question you can answer** → `tmux-apex.sh send <session>
   "<instruction>"`. Be specific; the worker cannot see your context.
 - **Done but unreviewed and worth reviewing** → spawn a reviewer with
-  `--review-pr`.
+  `--review-pr`, then `link` the pair (below) so you are not the relay.
+- **A linked pair's loop terminated** → the ping says which. "READY FOR HUMAN
+  REVIEW" means the reviewer signed off and the PR is out of draft: report it to
+  the human, do not merge it. "PAIRED REVIEW STUCK" means the loop could not
+  finish on its own — read `status --json`, fix the cause, then
+  `tmux-apex.sh pair-resume <member>` or take over by hand.
 - **Idle with nothing pushed and no blocker** → it probably stopped early.
   Send it a nudge naming what is still missing.
 - **A question only the human can answer** (product decisions, tradeoffs,
