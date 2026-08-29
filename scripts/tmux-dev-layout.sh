@@ -32,29 +32,30 @@ agent_role=$(tmux show-environment -t "$session" CODING_AGENT_ROLE 2>/dev/null |
 apex_session=$(tmux show-environment -t "$session" CODING_AGENT_APEX_SESSION 2>/dev/null | cut -d= -f2-)
 coding_agent=$(tmux show-environment -t "$session" CODING_AGENT 2>/dev/null | cut -d= -f2-)
 
-# Managed-worker instructions, when this session was spawned by an apex manager.
-local managed_prompt=""
-if [[ -n $agent_role && -n $apex_session ]]; then
-	managed_prompt="You are a managed ${agent_role} agent under tmux-delta apex mode. \
-A manager agent in tmux session '${apex_session}' spawned you and tracks your progress. \
-Work autonomously to completion. Do not wait on the human: if you hit a blocking decision or \
-an ambiguous acceptance criterion, state the blocker plainly in your final message and stop — \
-your manager is notified when you go idle and will send follow-up instructions into this pane. \
-Never merge a pull request and never close an issue; that is the human's call. \
-Push your work and open a draft PR so the manager can see it."
+# A session should only ever carry one of these. It can end up carrying both
+# when a session name is reused for a second task (the picker sets its own env
+# var but used not to clear the other one) — and then this script builds a
+# nonsense task like "issue:12pr:34" and registers one pane as both, which is
+# exactly the corruption reported in issue #18. The picker now clears the other
+# var; refuse to trust a session that still has both rather than concatenating.
+if [[ -n $issue && -n $pr ]]; then
+	print -u2 "tmux-dev-layout: session '$session' has both CODING_AGENT_ISSUE=$issue and"
+	print -u2 "  CODING_AGENT_PR=$pr set; using the PR and ignoring the issue. One of them is"
+	print -u2 "  stale — a reused session name (see issue #18)."
+	issue=""
 fi
 
+# Prompt text is shared with `tmux-apex.sh recover`, which has to be able to
+# rebuild this exact launch — see lib/agent-prompts.sh.
+source "${SELF:h}/lib/agent-prompts.sh"
+
+# Managed-worker instructions, when this session was spawned by an apex manager.
+local managed_prompt
+managed_prompt=$(delta_managed_prompt "$agent_role" "$apex_session")
+
 # The initial prompt. Empty means "resume the last session in this directory".
-local prompt=""
-if [[ -n $issue ]]; then
-	if [[ $mode == "autonomous" ]]; then
-		prompt="GitHub issue #${issue}. Read it with: gh issue view ${issue} --json title,body,labels,url,comments. Assign the issue to yourself with gh issue edit ${issue} --add-assignee @me and comment that you have started working on it. Then work it end-to-end: implement, test, commit on the current branch, push, and open a draft PR with gh pr create --draft. If acceptance criteria are ambiguous or you hit a blocking decision, stop and ask rather than guessing."
-	else
-		prompt="GitHub issue #${issue}. Read it with: gh issue view ${issue} --json title,body,labels,url,comments. Summarize it back to me, then ask if I want to assign the issue to myself and start working on it."
-	fi
-elif [[ -n $pr ]]; then
-	prompt="/my-pr-review ${pr}"
-fi
+local prompt
+prompt=$(delta_task_prompt "$issue" "$pr" "$mode")
 
 # Split: agent on the right (50% width)
 # Capture PWD now so the split pane uses the correct dir regardless of how
@@ -75,7 +76,8 @@ inner=$(delta_agent_launch_cmd '${CODING_AGENT:-claude}' "$agent_model" "$agent_
 # -P -F publishes the agent pane id so other sessions (and tmux-apex.sh) can
 # address this agent with send-keys.
 local agent_pane
-agent_pane=$(tmux split-window -h -p 50 -c "$project_dir" -P -F '#{pane_id}' \
+agent_pane=$(tmux split-window -h -p $DELTA_AGENT_PANE_PCT_NEW \
+	-c "$project_dir" -P -F '#{pane_id}' \
 	"direnv exec ${(q)project_dir} zsh -ic ${(q)inner}")
 [[ -n $agent_pane ]] && tmux set-option -t "$session" @agent_pane "$agent_pane"
 

@@ -409,6 +409,9 @@ tmux-apex.sh send <session> "rebase on main, CI is red"
 tmux-apex.sh link --worker wt:%3 --reviewer wt:%7   # automatic fix/re-review loop
 tmux-apex.sh status                  # or --json
 tmux-apex.sh reap --yes              # remove finished/dead members
+tmux-apex.sh reap --yes --force      # ...including ones with unpushed work
+tmux-apex.sh recover                 # dry run: what a tmux crash took out
+tmux-apex.sh recover --yes           # recreate those panes, resuming their conversations
 tmux-apex.sh stop
 ```
 
@@ -727,6 +730,64 @@ them when launching the agent:
 | `@agent_icons` | any session | rendered per-agent icon string |
 | `@agent_icons_outline` | any session | same, outline glyphs, for the selected pill |
 
+### Crash recovery
+
+Members are pane-scoped, so a tmux server crash (or `kill-server`) takes every
+worker with it while the durable member records under
+`$XDG_CACHE_HOME/tmux-delta/apex/<manager>/members/` survive. `recover` walks
+those records, and for each one whose pane is gone it recreates the session and
+pane and restarts the agent **on its original conversation** rather than from a
+blank context.
+
+It can do that because registration records an `agent_session_id` field: the
+Claude Code conversation id, discovered from the transcript under
+`~/.claude/projects/<mangled-worktree>/<id>.jsonl` by matching `cwd` plus the
+opening task prompt (a worker and its reviewer share a worktree, so the prompt
+is the only thing that tells them apart — hence the single copy of that text in
+`scripts/lib/agent-prompts.sh`). A slash command is stored expanded rather than
+verbatim, so a reviewer's `/my-pr-review 17` is folded back from its
+`<command-name>`/`<command-args>` form before matching. The marker has to be
+followed by end-of-line or a space: `/my-pr-review 4` is a prefix of
+`/my-pr-review 43`, and resuming the wrong PR's review looks like it worked. The
+id only exists after the member's first turn, so it is filled in on the member's
+first `event` call, not at spawn.
+
+The record is a cache; the transcript is the authority. `recover` re-resolves the
+id every time and says so when a recorded one no longer resolves, so a record
+that went stale (or was written empty because nothing resolved) self-heals rather
+than pinning recovery to a dead conversation. Registration writes the field
+unconditionally — a member is born there, so there is nothing to inherit from a
+recycled pane id. When registration does find a stale record on a pane id tmux
+reused, it replaces it and writes a `stale-record-replaced` entry to
+`events.jsonl`: the real call sites redirect stderr to `/dev/null`, so a warning
+alone would never be seen.
+
+**Run `recover` before `reap`, never the other way round.** `reap` force-removes
+the worktree and deletes the branch, so a crashed member's uncommitted or
+unpushed work is gone for good — and `recover` cannot help afterwards, because it
+skips members whose worktree is missing. `reap` therefore holds back any member
+with uncommitted changes or commits no remote has, printing `HOLD:` and the
+reason instead of taking it; `--force` overrides that. The check asks
+`git rev-list --count HEAD --not --remotes` rather than reading `commits_ahead`,
+because a branch that was never pushed has no upstream and so reports zero
+commits ahead — exactly the member whose work is at stake.
+
+`--force` genuinely takes a dirty worktree: `gwtrm`'s `-f` used to skip only the
+first confirmation and prompt again for uncommitted changes, which with no tty
+failed into an "Aborted." path that returned success for a worktree it had not
+removed. `-f` now covers both prompts (the picker shows the dirty-file warning
+itself, so an interactive delete loses nothing), the picker reports a worktree
+that survived, and `reap` removes the worktree *before* deleting the member
+record — so if cleanup fails anyway it says `worktree survived cleanup` and
+keeps the record, which is the only thing `recover` can act on.
+
+`recover` is a dry run by default, like `reap`; `--yes` acts. Pass member keys
+to limit it. It skips members whose worktree is gone, and members whose task is
+already live in a pane. When no conversation can be resumed it says so and
+starts a fresh one on the same task. Non-claude agents always restart fresh —
+their thread ids are recorded but not yet wired to a resume flag.
+
+
 ## Tests
 
 ```bash
@@ -734,11 +795,12 @@ tests/apex-delivery.test.sh
 tests/apex-send.test.sh
 tests/apex-pair.test.sh
 tests/apex-watch.test.sh
+tests/apex-recover.test.sh
 tests/agent-icons.test.sh
 tests/status-format.test.sh
 ```
 
-All six stub `tmux`, so none of them needs a tmux server or a live agent.
+All seven stub `tmux`, so none of them needs a tmux server or a live agent.
 
 Covers apex ping delivery: which output channel `apex-manager-notify.sh` picks
 per event, that an invocation which cannot deliver also does not *consume*
@@ -785,6 +847,16 @@ urgency colour, and that `--ack` reaches the current window's panes only.
 used in a format string is actually assigned (an unset one expands to nothing in
 tmux and silently unstyles a pill), and both icon slots are present in both
 pill branches.
+
+`tests/apex-recover.test.sh` covers crash recovery: picking a worker's own
+conversation out of a worktree it shares with its reviewer, `--resume` argv
+construction and its fresh-start fallback, `recover`'s dry run / `--yes` /
+idempotency, a recycled pane id neither faking a live member nor corrupting an
+existing member's record, one
+task per member (never `issue:42pr:43`), and an apex spawn into a session that
+already has a member landing in its own new pane without rewriting that
+session's `CODING_AGENT_*` env, and colliding task numbers (PR 4 vs 43, issue 4
+vs 42) not matching each other's transcripts. `tmux`, `gh` and `git` are stubbed.
 
 ## Shell functions (gwt.zsh)
 

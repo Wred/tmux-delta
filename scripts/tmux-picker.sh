@@ -575,17 +575,6 @@ _report_spawn() {
 	printf 'apex-session\t%s\t%s\n' "$1" "$2"
 }
 
-# Does any pane in <session> already have a registered apex member on it?
-# Used to tell "this session already belongs to some other apex member" (the
-# collision from github issue #8) apart from a plain, apex-untracked session.
-_session_has_apex_member() {
-	local p
-	for p in ${(f)"$(tmux list-panes -t "$1" -F '#{pane_id}' 2>/dev/null)"}; do
-		[[ -n $(tmux show-option -p -t "$p" -qv @apex_role 2>/dev/null) ]] && return 0
-	done
-	return 1
-}
-
 # _add_agent_pane <session> <worktree> <role> <task> <manager> <model> <perm> <mode> <agent> <prompt> <issue> <pr>
 #
 # Adds an EXTRA agent pane to a session some other apex member already owns,
@@ -612,11 +601,19 @@ _add_agent_pane() {
 
 	local adapter="${SCRIPTS}/lib/agent-adapter.sh"
 	source "${SCRIPTS}/lib/agent-launch.sh"
+	source "${SCRIPTS}/lib/agent-prompts.sh"
+	# An extra pane is as managed as a first pane: without the appended system
+	# prompt it waits on a human who isn't coming, and it will happily merge its
+	# own PR. tmux-dev-layout.sh gives the first pane in a fresh session exactly
+	# this; this path used to pass an empty system prompt.
+	local system
+	system=$(delta_managed_prompt "$role" "$manager")
 	local inner
-	inner=$(delta_agent_launch_cmd "${(q)agent}" "$model" "$perm" "" "$prompt" "$worktree" "$adapter")
+	inner=$(delta_agent_launch_cmd "${(q)agent}" "$model" "$perm" "$system" "$prompt" "$worktree" "$adapter")
 
 	local pane
-	pane=$(tmux split-window -t "$session" -h -p 33 -c "$worktree" -P -F '#{pane_id}' \
+	pane=$(tmux split-window -t "$session" -h -p $DELTA_AGENT_PANE_PCT_EXTRA \
+		-c "$worktree" -P -F '#{pane_id}' \
 		"direnv exec ${(q)worktree} zsh -ic ${(q)inner}")
 	if [[ -z $pane ]]; then
 		echo "Error: failed to create agent pane in session '$session'"
@@ -712,6 +709,15 @@ _delete_wt() {
 	fi
 	local wt_path="${raw#wt:}"
 	local branch=$(git -C "$wt_path" symbolic-ref --short HEAD 2>/dev/null)
+	# gwtrm -f no longer prompts a second time for a dirty worktree, so the
+	# uncommitted-changes warning it used to give a human belongs here, in the
+	# one confirmation this path still shows.
+	local dirty=$(git -C "$wt_path" status --porcelain 2>/dev/null)
+	if [[ -n $dirty ]]; then
+		echo "Warning: worktree has uncommitted changes:"
+		git -C "$wt_path" status --short
+		echo
+	fi
 	if ! _confirm "Remove worktree '${wt_path:t}' and delete branch '$branch'?"; then
 		echo "Aborted."
 		sleep 0.5
@@ -719,7 +725,9 @@ _delete_wt() {
 	fi
 	local session_name=$(basename "$wt_path" | tr . _)
 	gwtrm -f "$wt_path"
-	if [[ -f $_HIST_FILE ]]; then
+	local rc=$?
+	# Only forget the worktree if it is actually gone.
+	if [[ ! -d $wt_path && -f $_HIST_FILE ]]; then
 		local -a lines=()
 		while IFS= read -r line; do
 			[[ $line == $wt_path ]] && continue
@@ -732,6 +740,14 @@ _delete_wt() {
 		echo "Session '$session_name' killed."
 		sleep 0.5
 	fi
+	# Report the truth to non-interactive callers: gwtrm can return 0 having
+	# removed nothing, and a caller that then discards its own bookkeeping
+	# (tmux-apex.sh's `reap`) orphans the worktree it thinks it deleted.
+	if [[ -d $wt_path ]]; then
+		echo "Worktree still present: $wt_path"
+		return 1
+	fi
+	return $rc
 }
 
 # ─── Session handlers ───────────────────────────────────────────────
@@ -741,21 +757,8 @@ _delete_wt() {
 # Falls back gracefully: non-git sessions or the main worktree keep their
 # full name so the status-format conditional stays correct.
 _set_session_label() {
-	local session_name="$1" session_path="$2" pr_number="${3:-}"
-	local main_tree
-	main_tree=$(git -C "$session_path" worktree list 2>/dev/null | awk 'NR==1{print $1}')
-	[[ -z $main_tree ]] && return
-	local repo_prefix short_label
-	repo_prefix=$(basename "$main_tree" | tr . _)
-	short_label=${session_name#${repo_prefix}-}
-	if [[ -n $pr_number ]]; then
-		local max_len=20
-		if (( ${#short_label} > max_len )); then
-			short_label="${short_label:0:$max_len}…"
-		fi
-		short_label="${pr_number}: ${short_label}"
-	fi
-	tmux set-option -t "$session_name" @session_label "$short_label"
+	source "${SCRIPTS}/lib/session-label.sh"
+	delta_session_label "$@"
 }
 
 _switch_session() {
@@ -902,7 +905,13 @@ _open_pr_review() {
 	local selected_name=$(basename "$selected" | tr . _)
 	local tmux_running=$(pgrep tmux)
 
+	# Clear the other task var: a session name is derived from the worktree, so
+	# the same name gets reused for a worker's issue and later for a review of
+	# the PR that worker opened. Leaving CODING_AGENT_ISSUE set alongside
+	# CODING_AGENT_PR made tmux-dev-layout.sh build the concatenated
+	# "issue:Npr:M" task and register one pane as both roles (issue #18).
 	_set_pr_env() {
+		tmux set-environment -u -t "$selected_name" CODING_AGENT_ISSUE 2>/dev/null
 		tmux set-environment -t "$selected_name" CODING_AGENT_PR "$pr_number"
 		tmux set-environment -t "$selected_name" CODING_AGENT_MODE "review"
 		_apply_spawn_env "$selected_name"
@@ -917,11 +926,24 @@ _open_pr_review() {
 		exit 0
 	fi
 
-	# Some other apex member already owns a pane in this session (e.g. a
-	# worker mid-task on this exact branch) — github issue #8. Used to
-	# collide by overwriting that member's env instead of starting an
-	# independent reviewer; add a new pane here instead.
-	if tmux has-session -t="$selected_name" 2>/dev/null && _session_has_apex_member "$selected_name"; then
+	# An apex spawn into a session that ALREADY EXISTS always gets its own new
+	# pane. Two separate failures made that necessary (github issues #8, #18):
+	#
+	#   - The old code only took this branch when the session still had a
+	#     registered apex member on some pane, and otherwise fell through to the
+	#     path below, which only runs tmux-dev-layout.sh for a *newly created*
+	#     session. So spawning a reviewer into an existing session with no live
+	#     registration (the normal state after a tmux-server crash, where pane
+	#     options are gone) reported success and started no agent at all — while
+	#     rewriting the session's CODING_AGENT_* env underneath whatever was
+	#     there.
+	#   - Rewriting that env is itself the collision: the next dev-layout run in
+	#     that session picks it up and re-registers an existing pane under the
+	#     new task/role.
+	#
+	# Gated on _APEX_SPAWN: a human picking a PR whose session is already open
+	# wants to switch to it, not to accumulate a pane per keypress.
+	if [[ -n $_APEX_SPAWN ]] && tmux has-session -t="$selected_name" 2>/dev/null; then
 		local role=worker manager="" model="" perm="" agent=claude kv
 		for kv in "${_spawn_env[@]}"; do
 			case "$kv" in
@@ -932,8 +954,11 @@ _open_pr_review() {
 				CODING_AGENT=*)                  agent="${kv#*=}" ;;
 			esac
 		done
+		source "${SCRIPTS}/lib/agent-prompts.sh"
+		_set_session_label "$selected_name" "$selected" "$pr_number"
 		_add_agent_pane "$selected_name" "$selected" "$role" "pr:${pr_number}" "$manager" \
-			"$model" "$perm" review "$agent" "/my-pr-review ${pr_number}" "" "$pr_number"
+			"$model" "$perm" review "$agent" \
+			"$(delta_task_prompt "" "$pr_number" review)" "" "$pr_number"
 		return
 	fi
 
@@ -1037,7 +1062,10 @@ _open_issue() {
 	local selected_name=$(basename "$selected" | tr . _)
 	local tmux_running=$(pgrep tmux)
 
+	# Mirror of _set_pr_env: clear the other task var so a reused session name
+	# can't leave both set (issue #18).
 	_set_issue_env() {
+		tmux set-environment -u -t "$selected_name" CODING_AGENT_PR 2>/dev/null
 		tmux set-environment -t "$selected_name" CODING_AGENT_ISSUE "$issue_number"
 		tmux set-environment -t "$selected_name" CODING_AGENT_MODE "$mode"
 		_apply_spawn_env "$selected_name"
@@ -1051,6 +1079,30 @@ _open_issue() {
 		tmux send-keys -t "$selected_name" "${SCRIPTS}/tmux-dev-layout.sh" Enter
 		_report_spawn "$selected_name" "$selected"
 		exit 0
+	fi
+
+	# Same rule as _open_pr_review: an apex spawn into an already-existing
+	# session gets its own pane rather than rewriting the session's task env and
+	# (for a session that isn't newly created) launching nothing at all. See the
+	# comment there for the two failure modes this closes (issues #8, #18).
+	if [[ -n $_APEX_SPAWN ]] && tmux has-session -t="$selected_name" 2>/dev/null; then
+		local role=worker manager="" model="" perm="" agent=claude kv
+		for kv in "${_spawn_env[@]}"; do
+			case "$kv" in
+				CODING_AGENT_ROLE=*)             role="${kv#*=}" ;;
+				CODING_AGENT_APEX_SESSION=*)     manager="${kv#*=}" ;;
+				CODING_AGENT_MODEL=*)            model="${kv#*=}" ;;
+				CODING_AGENT_PERMISSION_MODE=*)  perm="${kv#*=}" ;;
+				CODING_AGENT=*)                  agent="${kv#*=}" ;;
+			esac
+		done
+		source "${SCRIPTS}/lib/agent-prompts.sh"
+		_set_session_label "$selected_name" "$selected"
+		[[ $do_switch == switch ]] && tmux switch-client -t "$selected_name"
+		_add_agent_pane "$selected_name" "$selected" "$role" "issue:${issue_number}" "$manager" \
+			"$model" "$perm" "$mode" "$agent" \
+			"$(delta_task_prompt "$issue_number" "" "$mode")" "$issue_number" ""
+		return
 	fi
 
 	local newly_created=false

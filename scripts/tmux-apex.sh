@@ -19,8 +19,8 @@
 # poller, not an agent turn, that watches durable state at ~1s and nudges the
 # manager's pane only when `pending` has something — see `watch`.
 #
-# Subcommands: init stop relink spawn send event status pending reap profiles
-#              watch doctor
+# Subcommands: init stop relink recover spawn send event status pending reap
+#              profiles watch doctor
 
 SELF="${0:A}"
 SCRIPTS="${SELF:h}"
@@ -93,7 +93,11 @@ _session_alive() { tmux has-session -t="$1" 2>/dev/null; }
 # in may host other members too, so session liveness alone isn't enough.
 _member_alive() {
 	if _is_member "$1"; then
-		tmux list-panes -a -F '#{pane_id}' 2>/dev/null | grep -qxF "$(_member_pane "$1")"
+		# Session-scoped on purpose. Pane ids are recycled across a tmux server
+		# restart, so matching a bare pane id finds "%7" alive in some unrelated
+		# session and reports a dead member as healthy — which made `recover`
+		# skip exactly the members it exists to recover (issue #18).
+		tmux list-panes -a -F '#{session_name}:#{pane_id}' 2>/dev/null | grep -qxF "$1"
 	else
 		_session_alive "$1"
 	fi
@@ -619,7 +623,9 @@ _cmd_relink() {
 	local -a matches=()
 	for f in "$APEX_ROOT"/*/members/"${session}:"*.json(N); do
 		wt=$(jq -r '.worktree // empty' "$f" 2>/dev/null)
-		[[ -n $wt && $wt != "$PWD" ]] && continue
+		# Compare resolved paths: the recorded worktree and $PWD can be the same
+		# directory spelled differently (symlinked /tmp, doubled slashes).
+		[[ -n $wt && ${wt:A} != ${PWD:A} ]] && continue
 		matches+=("$f")
 	done
 	(( ${#matches} == 1 )) || return 0
@@ -630,7 +636,16 @@ _cmd_relink() {
 	role=$(jq -r '.role // "worker"' "$f" 2>/dev/null)
 	issue=$(jq -r '.issue // empty' "$f" 2>/dev/null)
 	review_pr=$(jq -r '.review_pr // empty' "$f" 2>/dev/null)
-	task="${issue:+issue:$issue}${review_pr:+pr:$review_pr}"
+	# One task per member. Concatenating both when a corrupted record carries
+	# both is how "issue:12pr:34" got onto a live pane's @apex_task (issue #18);
+	# the record is already wrong at that point, so pick one and stay legible.
+	if [[ -n $review_pr ]]; then
+		task="pr:$review_pr"
+	elif [[ -n $issue ]]; then
+		task="issue:$issue"
+	else
+		task=""
+	fi
 
 	tmux set-option -p -t "$pane" @apex_session "$manager"
 	tmux set-option -p -t "$pane" @apex_role "$role"
@@ -751,11 +766,11 @@ _cmd_spawn() {
 #     created — tmux-dev-layout.sh for the first pane in a fresh session,
 #     tmux-picker.sh's _add_agent_pane for an extra pane in an existing one)
 #
-# _register-member <pane_id> <manager> <role> <task> <worktree> [model] [perm] [mode] [agent] [profile] [issue] [pr]
+# _register-member <pane_id> <manager> <role> <task> <worktree> [model] [perm] [mode] [agent] [profile] [issue] [pr] [agent_session_id]
 _cmd_register_member() {
 	local pane_id="$1" manager="$2" role="$3" task="$4" worktree="$5"
 	local model="$6" perm="$7" mode="$8" agent="${9:-claude}" profile="${10}"
-	local issue="${11}" pr="${12}"
+	local issue="${11}" pr="${12}" agent_session="${13}"
 	[[ -z $pane_id || -z $manager ]] && _die "_register-member: need <pane_id> <manager>"
 
 	local session member
@@ -767,18 +782,59 @@ _cmd_register_member() {
 	tmux set-option -p -t "$pane_id" @apex_session "$manager"
 	[[ -n $task ]] && tmux set-option -p -t "$pane_id" @apex_task "$task"
 
-	# Recorded durably (not just as the transient CODING_AGENT env var used to
-	# pick an adapter at layout time) so `send` can later tell which agents
-	# have a native session-message API — see _send_native.
+	# Pane ids are recycled: a restarted tmux server hands out %0, %1, … again,
+	# so a durable member file for "<session>:<pane>" can be a *different*
+	# member's record from before the restart. Merging a new registration onto it
+	# is what produced the corrupted member reported in issue #18 — role reading
+	# `monitor` while `issue` still named the old worker's task, and a task
+	# string of "issue:Npr:M". Registration is the birth of a member, so when the
+	# record already on that key describes another task, replace it rather than
+	# merge into it.
+	local stale
+	stale=$(apex_member_file "$manager" "$member")
+	if [[ -f $stale ]]; then
+		local old_issue old_pr
+		old_issue=$(jq -r '.issue // ""' "$stale" 2>/dev/null)
+		old_pr=$(jq -r '.review_pr // ""' "$stale" 2>/dev/null)
+		if [[ $old_issue != "$issue" || $old_pr != "$pr" ]]; then
+			print -u2 "tmux-apex: _register-member: replacing a stale record on $member"
+			print -u2 "  (was issue='${old_issue}' pr='${old_pr}', now issue='${issue}' pr='${pr}')"
+			print -u2 "  — recycled pane id after a tmux restart; see issue #18"
+			# Both real callers redirect this to /dev/null (tmux-picker.sh's
+			# _add_agent_pane, tmux-dev-layout.sh), so stderr alone means the
+			# diagnostic is only ever visible from the test harness. Record it
+			# where `status` and the event log can still show it.
+			apex_event "$manager" "$(jq -nc --arg s "$member" \
+				--arg oi "$old_issue" --arg op "$old_pr" \
+				--arg ni "$issue" --arg np "$pr" \
+				'{event:"stale-record-replaced", session:$s,
+				  was:{issue:$oi, review_pr:$op}, now:{issue:$ni, review_pr:$np}}')"
+			rm -f "$stale"
+		fi
+	fi
+
+	# `agent` is recorded durably (not just as the transient CODING_AGENT env var
+	# used to pick an adapter at layout time) so `send` can later tell which
+	# agents have a native session-message API — see _send_native.
+	#
+	# agent_session_id is written unconditionally, empty included. Registration
+	# is the birth of a member, so there is nothing legitimate to inherit: a
+	# record already sitting on this key belongs to a pane id the tmux server
+	# recycled, and merging its conversation id through would point a brand-new
+	# agent at a dead agent's conversation — the same class of bug as the stale
+	# record above. Writing empty is also how `recover` clears an id it could
+	# not resume; _record_agent_session then re-resolves it on the next turn.
 	apex_member_merge "$manager" "$member" "$(jq -nc \
 		--arg role "${role:-worker}" --arg wt "$worktree" --arg model "$model" \
 		--arg perm "$perm" --arg mode "$mode" --arg agent "$agent" \
 		--arg profile "$profile" --arg issue "$issue" --arg pr "$pr" \
+		--arg sid "$agent_session" \
 		--argjson t "$(date +%s)" \
 		'{role:$role, worktree:$wt, model:$model, permission_mode:$perm,
 		  mode:$mode, agent:$agent, profile:$profile, issue:$issue, review_pr:$pr,
 		  status:"starting", seq:0, pinged_seq:-1,
-		  spawned_at:$t, updated_at:$t}')"
+		  spawned_at:$t, updated_at:$t}
+		 + {agent_session_id:$sid}')"
 
 	apex_event "$manager" "$(jq -nc --arg s "$member" --arg role "${role:-worker}" \
 		--arg issue "$issue" --arg pr "$pr" \
@@ -807,6 +863,133 @@ _codex_thread_for() {
 		return 0
 	done
 	return 1
+}
+
+# _claude_project_dirs <worktree> — candidate Claude Code transcript directories
+# for <worktree>, most likely first.
+#
+# Claude Code stores one transcript per conversation as
+# ~/.claude/projects/<mangled-cwd>/<session-id>.jsonl, where <mangled-cwd> is the
+# absolute path with every non-alphanumeric character replaced by "-"
+# (verified against live transcript dirs: "/Users/a.b/.config/x" becomes
+# "-Users-a-b--config-x"). That mangling is lossy and not a documented contract,
+# so the exact name is only a fast path: a second candidate keeps "_" (in case
+# it is preserved), and _claude_session_for verifies the directory it lands in by
+# reading the cwd each transcript records for itself.
+_claude_project_dirs() {
+	local wt="$1" root="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/projects"
+	[[ -n $wt && -d $root ]] || return 1
+	local a="${wt//[^a-zA-Z0-9]/-}" b="${wt//[^a-zA-Z0-9_]/-}"
+	[[ -d "$root/$a" ]] && print -r -- "$root/$a"
+	[[ $b != "$a" && -d "$root/$b" ]] && print -r -- "$root/$b"
+	return 0
+}
+
+# _claude_normalize_prompt <first-user-message> — the message as the human typed
+# it. Claude Code does not store a slash command verbatim: it records the
+# expanded form
+#
+#   <command-message>my-pr-review</command-message>
+#   <command-name>/my-pr-review</command-name>
+#   <command-args>17</command-args>
+#
+# so a reviewer's transcript never begins with the literal "/my-pr-review 17"
+# apex launched it with, and every reviewer would fail to match and be recovered
+# with a blank context. Fold that shape back into "/name args" here, in one
+# place, so the marker stays the string the launcher actually used.
+_claude_normalize_prompt() {
+	local m="$1" name args
+	[[ $m == *"<command-name>"* ]] || { print -r -- "$m"; return 0; }
+	name=${${m#*<command-name>}%%</command-name>*}
+	if [[ $m == *"<command-args>"* ]]; then
+		args=${${m#*<command-args>}%%</command-args>*}
+	else
+		args=""
+	fi
+	print -r -- "${name}${args:+ $args}"
+}
+
+# _claude_session_for <worktree> <task-marker> — the Claude Code session id of
+# the conversation started in <worktree> whose first user message begins with
+# <task-marker>, newest first; or nothing.
+#
+# The marker is what makes this usable at all. A worker and its reviewer share a
+# worktree (pane-scoped members, a0bcf64), so "newest transcript for this
+# directory" is a coin flip between the two — and resuming the wrong one is
+# worse than not resuming, because it looks like it worked. The opening prompt is
+# the only thing that distinguishes them, and it is a known string: apex spawned
+# it (lib/agent-prompts.sh, delta_task_marker). With an empty marker this falls
+# back to plain newest-for-this-directory, which is right for a member whose
+# prompt apex didn't author.
+_claude_session_for() {
+	local wt="$1" marker="$2" d f cwd first
+	local -a dirs
+	dirs=(${(f)"$(_claude_project_dirs "$wt")"})
+	(( ${#dirs} )) || return 1
+	for d in $dirs; do
+		for f in "$d"/*.jsonl(Nom); do
+			# Cheapest disqualifier first: the recorded cwd. Transcripts run to
+			# megabytes, so every read here is streaming + head, never slurped.
+			cwd=$(jq -r 'select(.cwd != null) | .cwd' "$f" 2>/dev/null | head -n1)
+			[[ ${cwd:A} == ${wt:A} ]] || continue
+			if [[ -n $marker ]]; then
+				# gsub before head: an expanded slash command spans three lines,
+				# and `head -n1` on raw output would keep only the first of them.
+				first=$(jq -r 'select(.type=="user" and (.message.content|type=="string"))
+					| (.message.content | gsub("\n"; " "))' "$f" 2>/dev/null | head -n1)
+				first=$(_claude_normalize_prompt "$first")
+				# End of string or a space, never a bare prefix: "/my-pr-review 4"
+				# prefixes "/my-pr-review 43", and resuming the wrong PR's review
+				# looks like it worked.
+				[[ $first == "$marker" || $first == "$marker "* ]] || continue
+			fi
+			print -r -- "${f:t:r}"
+			return 0
+		done
+	done
+	return 1
+}
+
+# _agent_session_for <agent> <worktree> <issue> <pr> — the agent-native
+# conversation id to resume, for whichever agents expose one.
+_agent_session_for() {
+	local agent="${1:-claude}" wt="$2" issue="$3" pr="$4"
+	case "${agent:t}" in
+		claude|"")
+			source "${SCRIPTS}/lib/agent-prompts.sh"
+			_claude_session_for "$wt" "$(delta_task_marker "$issue" "$pr")"
+			;;
+		codex)    _codex_thread_for "$wt" ;;
+		opencode) _opencode_session_for "$wt" ;;
+		*)        return 1 ;;
+	esac
+}
+
+# _record_agent_session <manager> <member> — resolve and durably record this
+# member's agent conversation id, once.
+#
+# Why not at registration time: the id does not exist yet. The pane has only
+# just been split, the agent process is still starting, and nothing hands the id
+# to the launching process — Claude Code's own transcript is what publishes it,
+# and that file appears after the first turn. So this runs from the member's own
+# hooks instead (`event`), which is the first moment the answer exists. Guarded
+# on "already recorded" so it costs one transcript scan per member for the
+# lifetime of that member, not one per turn.
+_record_agent_session() {
+	local manager="$1" member="$2" have agent wt issue pr id
+	have=$(apex_member_get "$manager" "$member" agent_session_id 2>/dev/null)
+	[[ -n $have ]] && return 0
+	agent=$(apex_member_get "$manager" "$member" agent 2>/dev/null)
+	wt=$(apex_member_get "$manager" "$member" worktree 2>/dev/null)
+	[[ -n $wt && -d $wt ]] || return 0
+	issue=$(apex_member_get "$manager" "$member" issue 2>/dev/null)
+	pr=$(apex_member_get "$manager" "$member" review_pr 2>/dev/null)
+	id=$(_agent_session_for "$agent" "$wt" "$issue" "$pr") || return 0
+	[[ -n $id ]] || return 0
+	apex_member_merge "$manager" "$member" \
+		"$(jq -nc --arg id "$id" '{agent_session_id:$id}')"
+	apex_event "$manager" "$(jq -nc --arg s "$member" --arg id "$id" \
+		'{event:"agent-session", session:$s, agent_session_id:$id}')"
 }
 
 # _opencode_session_for <worktree> — most recently updated opencode session
@@ -1473,6 +1656,11 @@ _cmd_event() {
 	[[ -n $manager ]] || return 0            # not an apex member; nothing to do
 	APEX_SESSION="$manager"
 
+	# First chance to learn this member's agent conversation id — see
+	# _record_agent_session. Cheap after the first success, and it has to happen
+	# here rather than at registration because the id does not exist yet then.
+	_record_agent_session "$manager" "$session"
+
 	local seq st
 	seq=$(apex_member_bump_seq "$manager" "$session")
 
@@ -1682,29 +1870,118 @@ _cmd_pending() {
 
 # ─── reap ────────────────────────────────────────────────────────────
 
+# _reap_risk <facts> — one line saying why reaping this member unattended would
+# destroy work, or nothing if it is safe to take.
+#
+# `reap` force-removes the worktree and deletes the branch (gwtrm -f, with
+# TMUX_DELTA_ASSUME_YES=1 suppressing the picker's own confirmation), so
+# anything not pushed is gone for good — and `recover` cannot help afterwards
+# because it skips members whose worktree is missing. That was survivable while
+# a recycled pane id made some dead members read as alive; now that liveness is
+# session-scoped, a server crash marks every member dead and one `reap --yes`
+# takes the whole team's uncommitted work at once.
+_reap_risk() {
+	local facts="$1" wt dirty
+	wt=$(printf '%s' "$facts" | jq -r '.worktree')
+	dirty=$(printf '%s' "$facts" | jq -r '.dirty')
+	# No worktree left means there is nothing to lose — that is `reap`'s job.
+	[[ -z $wt || ! -d $wt ]] && return 0
+
+	local -a why=()
+	[[ $dirty == true ]] && why+=("uncommitted changes")
+
+	# Deliberately not .commits_ahead: that is @{upstream}-relative, and a
+	# branch that was never pushed has no upstream, so rev-list fails and the
+	# count reads 0 — precisely the member whose work reap would destroy.
+	# `HEAD --not --remotes` asks the question that actually matters: is any of
+	# this reachable from a remote ref?
+	local unpushed
+	unpushed=$(git -C "$wt" rev-list --count HEAD --not --remotes 2>/dev/null) || unpushed=""
+	if [[ -z $unpushed ]]; then
+		why+=("could not read git state")
+	elif (( unpushed > 0 )); then
+		why+=("$unpushed unpushed commit(s)")
+	fi
+
+	(( ${#why} )) && print -r -- "${(j:, :)why}"
+	return 0
+}
+
+# _reap_cleanup <session> <worktree> — tear down a reaped member's worktree and
+# session. Prints why and returns non-zero if the worktree is still there
+# afterwards, so the caller can keep the member record rather than orphan it.
+#
+# The exit status of the cleanup itself is not the thing to trust: `gwtrm -f`
+# used to prompt a second time for a dirty worktree, and with no tty that read
+# failed into an "Aborted." path that returned 0 for a worktree it had not
+# touched. Both halves of that are fixed now (gwt.zsh honours -f, the picker
+# propagates a surviving worktree), but the only fact that actually settles the
+# question is whether the directory is gone — so check that, and keep the
+# output instead of discarding it to /dev/null.
+_reap_cleanup() {
+	local session="$1" wt="$2"
+	if [[ -z $wt || ! -d $wt ]]; then
+		tmux kill-session -t "$session" 2>/dev/null
+		return 0
+	fi
+
+	local out
+	out=$(TMUX_DELTA_ASSUME_YES=1 "${SCRIPTS}/tmux-picker.sh" --delete-wt "wt:${wt}" 2>&1)
+	if [[ -d $wt ]]; then
+		print "  worktree survived cleanup: $wt"
+		[[ -n $out ]] && print -r -- "  ${out//$'\n'/$'\n'  }"
+		return 1
+	fi
+	return 0
+}
+
 _cmd_reap() {
-	local yes=false a
-	for a in "$@"; do [[ $a == --yes ]] && yes=true; done
+	local yes=false force=false a
+	for a in "$@"; do
+		case "$a" in
+			--yes)   yes=true ;;
+			--force) force=true ;;
+		esac
+	done
 
 	local manager
 	manager=$(_require_manager)
 	APEX_SESSION="$manager"
 
-	local -a done_members=()
-	local s facts alive pr_state
+	local -a done_members=() held=()
+	local s facts alive pr_state risk
 	for s in ${(f)"$(apex_members "$manager")"}; do
 		[[ -z $s ]] && continue
 		facts=$(_member_facts "$s")
 		alive=$(printf '%s' "$facts" | jq -r '.alive')
 		pr_state=$(printf '%s' "$facts" | jq -r '.pr_state')
 		if [[ $alive == false || $pr_state == MERGED || $pr_state == CLOSED ]]; then
-			done_members+=("$s")
-			print "  $s  — $(_facts_line "$facts")"
+			risk=$(_reap_risk "$facts")
+			if [[ -n $risk ]] && ! $force; then
+				held+=("$s")
+				print "  $s  — HOLD: $risk — $(_facts_line "$facts")"
+			else
+				done_members+=("$s")
+				print "  $s  — $(_facts_line "$facts")"
+			fi
 		fi
 	done
 
+	if (( ${#held} )); then
+		print "\n${#held} member(s) held back: reap force-removes the worktree and"
+		print "deletes the branch, so unpushed work would be unrecoverable — and"
+		print "\`recover\` cannot bring back a member whose worktree is gone."
+		print "Push or commit that work first (\`recover --yes\` puts a crashed"
+		print "member back on its own conversation so it can), or pass --force to"
+		print "reap them anyway."
+	fi
+
 	if (( ${#done_members} == 0 )); then
-		print "Nothing to reap."
+		if (( ${#held} )); then
+			print "\nNothing reaped."
+		else
+			print "Nothing to reap."
+		fi
 		return
 	fi
 
@@ -1719,19 +1996,217 @@ _cmd_reap() {
 		session=$(_member_session "$s")
 
 		tmux kill-pane -t "$(_member_pane "$s")" 2>/dev/null
+
+		# Worktree first, member record second. The record carries
+		# agent_session_id, and that is the only thing `recover` can put a
+		# member back from — so deleting it before a cleanup that is allowed to
+		# fail makes every such failure unrecoverable by construction. The pane
+		# is expendable either way: `recover` makes a new one.
+		#
+		# Only clean up the shared worktree/session once no other apex member
+		# (e.g. a worker, if we just reaped a reviewer) still owns a pane there.
+		if ! _session_has_apex_member "$session"; then
+			if ! _reap_cleanup "$session" "$wt"; then
+				print "  Kept $s — its record is the only way \`recover\` can reach that work."
+				continue
+			fi
+		fi
+
 		rm -f "$(apex_member_file "$manager" "$s")"
 		apex_event "$manager" "$(jq -nc --arg s "$s" '{event:"reap", session:$s}')"
 		print "Reaped $s"
+	done
+}
 
-		# Only clean up the shared worktree/session once no other apex member
-		# (e.g. a worker, if we just reaped a reviewer) still owns a pane there.
-		_session_has_apex_member "$session" && continue
-		if [[ -n $wt && -d $wt ]]; then
-			TMUX_DELTA_ASSUME_YES=1 "${SCRIPTS}/tmux-picker.sh" --delete-wt "wt:${wt}" >/dev/null 2>&1
+# ─── recover (tmux-server-crash recovery) ────────────────────────────
+
+# _apex_session_label <session> <worktree> [pr] — the short pill label the picker
+# would have given this session. A recovered session that keeps its full
+# worktree-derived name reads as a different session to the human than the one
+# that died, so this has to agree with the picker exactly — which is why the
+# derivation now lives in lib/session-label.sh instead of being a second copy
+# here. <pr> is passed through for the same reason: the picker prefixes a review
+# session's label with its PR number, so dropping it here would bring a dead
+# "43: fix-issue-42" back as "fix-issue-42".
+_apex_session_label() {
+	source "${SCRIPTS}/lib/session-label.sh"
+	delta_session_label "$1" "$2" "${3:-}"
+}
+
+# recover [--yes] [member ...] — put crashed members back, with their
+# conversations intact.
+#
+# When the tmux server dies, every member's session and pane die with it. The
+# work does not: worktrees, branches, uncommitted diffs and the agents' own
+# transcripts all survive on disk, and so does the apex member record. What used
+# to be missing was the link from a record to the conversation it belonged to,
+# so the only recovery was a fresh spawn — which reuses the worktree but throws
+# the whole conversation away and makes the agent re-derive its state from git
+# and gh. This resumes instead: same worktree, same role, same task, same
+# conversation (see _record_agent_session, and --resume in lib/agents/claude.sh).
+#
+# Deliberately not automatic on relink. A human who kills a session on purpose
+# must not have it grow back; the manager invokes this when it finds dead
+# members whose worktrees are still there. Dry run unless --yes, mirroring
+# `reap`.
+_cmd_recover() {
+	local yes=false a
+	local -a want=()
+	for a in "$@"; do
+		case "$a" in
+			--yes) yes=true ;;
+			-*)    _die "recover: unknown argument '$a'" ;;
+			*)     want+=("$a") ;;
+		esac
+	done
+
+	local manager
+	manager=$(_require_manager)
+	APEX_SESSION="$manager"
+	source "${SCRIPTS}/lib/agent-prompts.sh"
+	source "${SCRIPTS}/lib/agent-launch.sh"
+
+	local -a plan=()
+	local s
+	for s in ${(f)"$(apex_members "$manager")"}; do
+		[[ -z $s ]] && continue
+		(( ${#want} )) && [[ ${want[(Ie)$s]} == 0 ]] && continue
+		_member_alive "$s" && continue
+
+		local wt role mode model perm agent profile issue pr sid task session note
+		wt=$(apex_member_get "$manager" "$s" worktree)
+		role=$(apex_member_get "$manager" "$s" role);  [[ -z $role ]] && role=worker
+		mode=$(apex_member_get "$manager" "$s" mode)
+		model=$(apex_member_get "$manager" "$s" model)
+		perm=$(apex_member_get "$manager" "$s" permission_mode)
+		agent=$(apex_member_get "$manager" "$s" agent); [[ -z $agent ]] && agent=claude
+		profile=$(apex_member_get "$manager" "$s" profile)
+		issue=$(apex_member_get "$manager" "$s" issue)
+		pr=$(apex_member_get "$manager" "$s" review_pr)
+		session=$(_member_session "$s")
+
+		if [[ -z $wt || ! -d $wt ]]; then
+			print "  $s  — SKIP: worktree gone (${wt:-<unrecorded>}); nothing to recover into"
+			continue
+		fi
+
+		if [[ -n $pr ]]; then task="pr:$pr"; elif [[ -n $issue ]]; then task="issue:$issue"; else task=""; fi
+
+		# Already back? A previous recover, or a plain spawn, may have put a live
+		# pane on this task in this session. Don't add a second one.
+		#
+		# A member with neither an issue nor a PR has an empty task, and
+		# _register-member does not set @apex_task at all in that case — so
+		# matching on the task would skip this guard entirely and every
+		# `recover --yes` would stack another pane. Fall back to "any pane in
+		# this session that is already an apex member".
+		if _session_alive "$session"; then
+			local p dup=""
+			for p in ${(f)"$(tmux list-panes -t "$session" -F '#{pane_id}' 2>/dev/null)"}; do
+				if [[ -n $task ]]; then
+					[[ $(tmux show-option -p -t "$p" -qv @apex_task 2>/dev/null) == "$task" ]] \
+						&& dup="$p" && break
+				else
+					[[ -n $(tmux show-option -p -t "$p" -qv @apex_session 2>/dev/null) ]] \
+						&& dup="$p" && break
+				fi
+			done
+			if [[ -n $dup ]]; then
+				print "  $s  — SKIP: ${session}:${dup} is already live on ${task:-this session}"
+				continue
+			fi
+		fi
+
+		# The transcript, not the record, decides what can be resumed. A recorded
+		# id can be wrong — the conversation may have been pruned, or the record
+		# may predate a correction — and handing a dead id to --resume was the
+		# one failure mode worth avoiding: it looks like recovery worked. So
+		# resolve from disk and treat the recorded value as a cache to correct.
+		local recorded
+		recorded=$(apex_member_get "$manager" "$s" agent_session_id)
+		sid=$(_agent_session_for "$agent" "$wt" "$issue" "$pr" 2>/dev/null) || sid=""
+		note="resume ${sid:-<none found>}"
+		if [[ -n $recorded && $recorded != "$sid" ]]; then
+			note+=" (recorded id ${recorded} no longer resolves; record corrected)"
+		fi
+		# Only the claude adapter knows how to resume one specific recorded
+		# conversation (DELTA_AGENT_RESUME). codex and opencode both have their
+		# own resume story and their ids are already discoverable
+		# (_codex_thread_for/_opencode_session_for), but wiring their argv is a
+		# separate change — say so rather than resuming something else.
+		if [[ ${agent:t} != claude && -n $sid ]]; then
+			note="fresh (agent '${agent}' has no apex resume support yet; id ${sid} recorded)"
+			sid=""
+		fi
+		[[ -z $sid ]] && note="fresh (no resumable conversation found)"
+
+		plan+=("${s}"$'\t'"${session}"$'\t'"${wt}"$'\t'"${role}"$'\t'"${task}"$'\t'"${sid}"$'\t'"${agent}"$'\t'"${mode}"$'\t'"${model}"$'\t'"${perm}"$'\t'"${profile}"$'\t'"${issue}"$'\t'"${pr}")
+		print "  $s  — role=${role} ${task:+task=${task} }worktree=${wt}  ${note}"
+	done
+
+	if (( ${#plan} == 0 )); then
+		print "Nothing to recover."
+		return
+	fi
+
+	if ! $yes; then
+		print "\n${#plan} dead member(s) recoverable. Re-run with --yes to recreate their panes."
+		return
+	fi
+
+	local row
+	for row in "${plan[@]}"; do
+		local -a f=("${(@s:	:)row}")
+		local old_key="${f[1]}" session="${f[2]}" wt="${f[3]}" role="${f[4]}" task="${f[5]}"
+		local sid="${f[6]}" agent="${f[7]}" mode="${f[8]}" model="${f[9]}" perm="${f[10]}"
+		local profile="${f[11]}" issue="${f[12]}" pr="${f[13]}"
+
+		# Pane width follows the shape of the session, so a recovered layout is
+		# the layout the human is used to: a session we just made gets the
+		# dev-layout split (editor | agent), a surviving one gets the narrower
+		# extra-pane width the picker uses.
+		local pct=$DELTA_AGENT_PANE_PCT_EXTRA
+		if ! _session_alive "$session"; then
+			tmux new-session -ds "$session" -c "$wt" 2>/dev/null \
+				|| { print -u2 "recover: could not create session '$session'"; continue }
+			_apex_session_label "$session" "$wt" "$pr"
+			pct=$DELTA_AGENT_PANE_PCT_NEW
+		fi
+
+		local system prompt inner pane adapter="${SCRIPTS}/lib/agent-adapter.sh"
+		system=$(delta_managed_prompt "$role" "$manager")
+		prompt=$(delta_task_prompt "$issue" "$pr" "$mode")
+		inner=$(delta_agent_launch_cmd "${(q)agent}" "$model" "$perm" "$system" "$prompt" "$wt" "$adapter" "$sid")
+		pane=$(tmux split-window -t "$session" -h -p $pct -c "$wt" -P -F '#{pane_id}' \
+			"direnv exec ${(q)wt} zsh -ic ${(q)inner}" 2>/dev/null)
+		if [[ -z $pane ]]; then
+			print -u2 "recover: could not create an agent pane in '$session'"
+			continue
+		fi
+		tmux set-option -t "$session" @agent_pane "$pane" 2>/dev/null
+
+		# New pane, new member key. Registration writes the fresh record (and
+		# drops any stale one recycled onto this pane id); then retire the old
+		# key so the member isn't counted twice.
+		_cmd_register_member "$pane" "$manager" "$role" "$task" "$wt" \
+			"$model" "$perm" "$mode" "$agent" "$profile" "$issue" "$pr" "$sid" >/dev/null
+
+		local new_key="${session}:${pane}"
+		[[ $old_key != $new_key ]] && rm -f "$(apex_member_file "$manager" "$old_key")"
+
+		apex_event "$manager" "$(jq -nc --arg old "$old_key" --arg new "$new_key" \
+			--arg sid "$sid" --arg role "$role" \
+			'{event:"recover", session:$new, previous_session:$old, role:$role,
+			  agent_session_id:$sid, resumed:($sid != "")}')"
+
+		if [[ -n $sid ]]; then
+			print "Recovered $new_key (resumed conversation $sid)"
 		else
-			tmux kill-session -t "$session" 2>/dev/null
+			print "Recovered $new_key (fresh conversation — nothing resumable found)"
 		fi
 	done
+
+	tmux refresh-client -S 2>/dev/null
 }
 
 _cmd_profiles() {
@@ -2441,6 +2916,7 @@ case "${1:-}" in
 	pending)  shift; _cmd_pending "$@" ;;
 	watch)    shift; _cmd_watch "$@" ;;
 	reap)     shift; _cmd_reap "$@" ;;
+	recover)  shift; _cmd_recover "$@" ;;
 	profiles) shift; _cmd_profiles "$@" ;;
 	_settle)  shift; _cmd_settle "$@" ;;
 	_register-member) shift; _cmd_register_member "$@" ;;
@@ -2471,7 +2947,11 @@ case "${1:-}" in
 		print "  watch [--status|--stop|--once] start the background poller that nudges the"
 		print "                                 manager ~1s after a member goes idle/attention"
 		print "                                 (returns immediately; --once runs one tick)"
-		print "  reap [--yes]                   clean up finished/dead members"
+		print "  reap [--yes] [--force]         clean up finished/dead members"
+		print "                                 (--force also takes members with"
+		print "                                  uncommitted or unpushed work)"
+		print "  recover [--yes] [member ...]   re-create dead members' panes, resuming"
+		print "                                 their conversations (after a tmux crash)"
 		print "  profiles                       list available spawn profiles"
 		print "  doctor                         check that ping-delivery hooks are wired"
 		[[ -n ${1:-} ]] && exit 1

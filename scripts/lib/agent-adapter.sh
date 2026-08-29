@@ -15,6 +15,10 @@
 #   DELTA_AGENT_SYSTEM  extra system-prompt text (managed-worker instructions)
 #   DELTA_AGENT_PROMPT  initial user prompt; empty means "resume last session"
 #   DELTA_AGENT_DIR     project directory
+#   DELTA_AGENT_RESUME  resume THIS specific recorded session id, rather than
+#                       "whatever was last in this directory" — used by
+#                       `tmux-apex.sh recover` after a tmux-server crash, where
+#                       the pane is gone but the conversation is not
 #
 # An adapter is scripts/lib/agents/<command-basename>.sh defining
 # delta_agent_argv(), which sets the array `agent_argv` to everything that
