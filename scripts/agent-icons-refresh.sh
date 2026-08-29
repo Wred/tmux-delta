@@ -66,37 +66,64 @@ COLOR_IDLE_ACTIVE=$(tmux show-option -gqv @tmux_delta_color_agent_idle_active 2>
 MAX_ICONS=$(tmux show-option -gqv @tmux_delta_agent_icons_max 2>/dev/null)
 case "$MAX_ICONS" in ''|*[!0-9]*|0) MAX_ICONS=4 ;; esac
 
-# Panes whose foreground command is one of these still count as hosting a live
-# agent. Only consulted for *idle* panes: @agent_present is sticky for the life
-# of the pane, so an agent that has exited leaves a pane that would otherwise
-# keep drawing an idle robot forever. A pane reporting working/attention has
-# just been heard from, so it is skipped — no flicker if an agent's tool call
-# briefly changes the foreground command.
+# Liveness, in two tiers, because pane state outlives the agent process:
+# @agent_present is sticky for the life of the pane, and an agent killed or
+# crashed mid-turn never fires `clear`, so @agent_working /
+# @agent_needs_attention stay set too.
+#
+# AGENT_CMDS — an *idle* pane must have one of these in the foreground to count
+# as hosting an agent at all.
 AGENT_CMDS=$(tmux show-option -gqv @tmux_delta_apex_agent_cmds 2>/dev/null)
 : "${AGENT_CMDS:=node bun claude codex gemini pi opencode}"
 
-# _is_agent_cmd <pane_current_command>
-_is_agent_cmd() {
-	local cmd="$1" allowed
-	[ -n "$cmd" ] || return 0   # unknown: don't hide the agent on a guess
-	for allowed in $AGENT_CMDS; do
-		[ "$cmd" = "$allowed" ] && return 0
+# SHELL_CMDS — a pane claiming to be mid-turn is normally taken at its word,
+# since an agent's own tool call can put `git`/`grep`/anything in the
+# foreground and second-guessing it would blink the icon out mid-turn. A bare
+# login shell is the one unambiguous exception: nothing is running in the pane,
+# so no tool call can be in flight and the agent is definitively gone.
+SHELL_CMDS='zsh bash fish sh dash ksh csh tcsh'
+
+# _in_list <needle> <space-separated haystack>
+_in_list() {
+	local needle="$1" item
+	for item in $2; do
+		[ "$needle" = "$item" ] && return 0
 	done
 	return 1
+}
+
+# _is_agent_cmd <pane_current_command>
+_is_agent_cmd() {
+	[ -n "$1" ] || return 0   # unknown: don't hide the agent on a guess
+	_in_list "$1" "$AGENT_CMDS"
+}
+
+# _is_dead_shell <pane_current_command> — the pane has dropped back to a shell.
+_is_dead_shell() {
+	[ -n "$1" ] || return 1   # unknown: never claim the agent died
+	_in_list "$1" "$SHELL_CMDS"
 }
 
 # icons_for <session> — prints the filled icon string, a TAB, then the outline
 # icon string for one session. Either may be empty.
 icons_for() {
 	local session="$1" line pane role present working attention cmd
-	local icons="" outline="" shown=0 extra=0 extra_state=idle
+	local icons="" outline="" shown=0 extra=0 extra_state=idle pruned=0
 
 	while IFS='|' read -r pane role present working attention cmd; do
 		[ -n "$pane" ] || continue
 		# Not an agent pane: no apex role and no hook has ever fired here.
 		[ -n "$role" ] || [ -n "$present" ] || continue
-		# Idle and no agent process left in the pane: the agent has exited.
-		if [ -z "$working" ] && [ -z "$attention" ] && ! _is_agent_cmd "$cmd"; then
+		# Liveness. Idle: the pane must still be running an agent. Mid-turn or
+		# blocked: believed unless the pane has dropped back to a bare shell,
+		# which means the agent was killed without ever firing `clear`.
+		if [ -n "$working" ] || [ -n "$attention" ]; then
+			if _is_dead_shell "$cmd"; then
+				pruned=$((pruned + 1))
+				continue
+			fi
+		elif ! _is_agent_cmd "$cmd"; then
+			pruned=$((pruned + 1))
 			continue
 		fi
 		# Overflow keeps no glyph, but the +N counter is coloured by the most
@@ -136,7 +163,12 @@ icons_for() {
 	# been seen as a pane (a hook wired to a different tmux pane, an older
 	# agent-tmux-status.sh still in ~/.claude/settings.json). One icon, from
 	# the session aggregate — the pre-per-agent behaviour.
-	if [ "$shown" -eq 0 ]; then
+	#
+	# Skipped when panes were pruned as dead: the session aggregate is just as
+	# stale as the pane flags were (a killed agent fires no `clear` at either
+	# scope), so consulting it would put back the glyph we just dropped — the
+	# common single-agent-per-session case.
+	if [ "$shown" -eq 0 ] && [ "$pruned" -eq 0 ]; then
 		attention=$(tmux show-option -t "$session" -qv @agent_needs_attention 2>/dev/null || true)
 		working=$(tmux show-option -t "$session" -qv @agent_working 2>/dev/null || true)
 		if [ -n "$attention" ]; then

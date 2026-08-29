@@ -99,8 +99,16 @@ into a `+N` counter, coloured by the most urgent state hidden behind it, so a
 blocked agent in the overflow still shows up. An *idle* pane whose foreground
 command is no longer an agent (`@tmux_delta_apex_agent_cmds`) is dropped — pane
 options outlive the agent process, and without that check an exited agent would
-leave an idle robot on the pill forever. Panes reporting working or blocked are
-never second-guessed this way, so a tool call can't blink an icon out.
+leave an idle robot on the pill forever.
+
+A pane reporting *working* or *blocked* is believed even when the foreground
+command isn't an agent, since the agent's own tool call can put `git` or
+anything else there and second-guessing it would blink the icon out mid-turn.
+The one exception is a bare login shell (`zsh`/`bash`/`fish`/…): nothing is
+running in the pane, so no tool call can be in flight and the agent is gone.
+That matters because an agent killed or crashed mid-turn never fires `clear`,
+so its state flags — pane *and* session-level — stay set for the life of the
+pane.
 
 Switching into a session clears the "blocked" flag for the panes of that
 session's **current window** only: attention is per-agent now, and an agent

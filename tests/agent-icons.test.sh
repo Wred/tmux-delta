@@ -200,13 +200,37 @@ eq "an idle pane with no agent process shows nothing" "" "$out"
 out=$(icons '%1|worker|1|||node')
 contains "an idle pane still running the agent shows" "$IDLE" "$out"
 
-# Working/attention panes have just been heard from — never second-guessed by
-# the command check, so a tool call that changes the foreground command can't
-# blink the icon out.
+# A working/attention pane is believed even when the foreground command is not
+# an agent: the agent's own tool call can put anything there, and second-
+# guessing it would blink the icon out mid-turn.
 out=$(icons '%1|worker|1|1||git')
-contains "a working pane is kept whatever the foreground command" "$WORKING" "$out"
+contains "a working pane survives a tool call in the foreground" "$WORKING" "$out"
 out=$(icons '%1|worker|1||1|git')
-contains "a blocked pane is kept whatever the foreground command" "$ATTENTION" "$out"
+contains "a blocked pane survives a tool call in the foreground" "$ATTENTION" "$out"
+
+# ...with one exception: a bare login shell means nothing is running in the
+# pane, so no tool call can be in flight. An agent killed or crashed mid-turn
+# never fires `clear`, so its state flags stay set forever — without this the
+# green or peach robot would persist for the life of the pane.
+for sh in zsh bash fish; do
+	out=$(icons "%1|worker|1|1||$sh")
+	eq "an agent killed mid-turn drops its working glyph ($sh)" "" "$out"
+	out=$(icons "%1|worker|1||1|$sh")
+	eq "an agent killed while blocked drops its glyph ($sh)" "" "$out"
+done
+
+# The session aggregate is stale in exactly the same way (a killed agent fires
+# no `clear` at either scope), so pruning the last agent pane must not fall
+# through to it — that is the common one-agent-per-session case.
+STUB_SESS_WORKING=1
+out=$(icons '%1|worker|1|1||zsh')
+eq "a pruned pane does not fall through to the stale session aggregate" "" "$out"
+STUB_SESS_WORKING=""
+
+# An unknown command is never read as death — better a stale glyph than an
+# agent that vanishes from the pill while it is working.
+out=$(icons '%1|worker|1|1||')
+contains "an unknown foreground command keeps the working glyph" "$WORKING" "$out"
 
 # ── overflow carries the most urgent hidden state ────────────────────
 # The peach pill background is gone, so a blocked agent hidden behind +N would
