@@ -64,6 +64,7 @@ case "$1" in
 esac
 case "$*" in
 	*@tmux_delta_agent_icons_max*) printf '%s\n' "$STUB_MAX" ;;
+	*@tmux_delta_apex_agent_cmds*) printf '%s\n' "$STUB_AGENT_CMDS" ;;
 	*@agent_icons_outline*)  printf '%s\n' "$STUB_PREV_OUTLINE" ;;
 	*@agent_icons*)          printf '%s\n' "$STUB_PREV" ;;
 	*@agent_needs_attention*) printf '%s\n' "$STUB_SESS_ATTENTION" ;;
@@ -77,6 +78,7 @@ export PATH="$BIN:$PATH" TMUX=fake-socket LC_ALL=en_US.UTF-8
 export STUB_LOG="$TMPROOT/tmux.log"
 export STUB_SESSION=work STUB_SESSIONS=work STUB_PREV="" STUB_PREV_OUTLINE=""
 export STUB_SESS_WORKING="" STUB_SESS_ATTENTION="" STUB_MAX="" STUB_WINDOW_PANES=""
+export STUB_AGENT_CMDS=""
 
 # icons <panes...> — runs the script and prints the @agent_icons value written
 # (empty when the script wrote nothing).
@@ -124,6 +126,19 @@ eq "a pane with neither role nor presence shows nothing" "" "$out"
 
 out=$(icons '%1|worker||')
 contains "an apex member with no hook events yet still shows" "$IDLE" "$out"
+
+# The launching window: _cmd_register_member refreshes the icons immediately,
+# while the pane is typically still sitting at the shell it spawned the agent
+# from. @apex_role without @agent_present means "registered, never reported in"
+# — nothing has been heard from the pane, so there is no stale presence to
+# guard against and the icon appears at registration rather than a second later.
+out=$(icons '%1|worker||||zsh')
+contains "a launching apex member shows before its first hook event" "$IDLE" "$out"
+
+# Once the pane HAS reported in, the exemption is gone and the ordinary idle
+# check applies — otherwise an exited agent would keep an idle robot forever.
+out=$(icons '%1|worker|1|||zsh')
+eq "a reported-in apex member at a shell is dropped" "" "$out"
 
 # Panes without agents are ignored, not counted.
 out=$(icons '%1|worker|1||' '%2||||')
@@ -236,6 +251,13 @@ STUB_SESS_WORKING=1
 out=$(icons '%1|worker|1|1||zsh')
 eq "a pruned pane does not fall through to the stale session aggregate" "" "$out"
 STUB_SESS_WORKING=""
+
+# A glob in the command lists compares literally rather than expanding against
+# the cwd (_in_list word-splits without pathname expansion).
+STUB_AGENT_CMDS='* node'
+out=$(icons '%1||1|||definitely-not-an-agent')
+eq "a '*' in the agent command list does not match everything" "" "$out"
+STUB_AGENT_CMDS=""
 
 # An unknown command is never read as death — better a stale glyph than an
 # agent that vanishes from the pill while it is working.

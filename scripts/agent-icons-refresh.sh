@@ -89,12 +89,23 @@ AGENT_CMDS=$(tmux show-option -gqv @tmux_delta_apex_agent_cmds 2>/dev/null)
 SHELL_CMDS='zsh bash fish'
 
 # _in_list <needle> <space-separated haystack>
+#
+# The haystack is intentionally unquoted so it word-splits, but that also
+# exposes it to pathname expansion — a `*` in @tmux_delta_apex_agent_cmds would
+# glob against the cwd instead of comparing literally. `set -f` for the loop
+# only, restoring the caller's setting rather than assuming it was off.
 _in_list() {
-	local needle="$1" item
+	local needle="$1" item rc=1 had_noglob=
+	case "$-" in *f*) had_noglob=1 ;; esac
+	set -f
 	for item in $2; do
-		[ "$needle" = "$item" ] && return 0
+		if [ "$needle" = "$item" ]; then
+			rc=0
+			break
+		fi
 	done
-	return 1
+	[ -n "$had_noglob" ] || set +f
+	return "$rc"
 }
 
 # _is_agent_cmd <pane_current_command>
@@ -119,7 +130,8 @@ icons_for() {
 		[ -n "$pane" ] || continue
 		# Not an agent pane: no apex role and no hook has ever fired here.
 		[ -n "$role" ] || [ -n "$present" ] || continue
-		# Liveness. Idle: the pane must still be running an agent. Mid-turn or
+		# Liveness. Idle: the pane must still be running an agent, unless it
+		# was only just registered and hasn't reported in yet. Mid-turn or
 		# blocked: believed unless the pane has dropped back to a bare shell,
 		# which means the agent was killed without ever firing `clear`.
 		if [ -n "$working" ] || [ -n "$attention" ]; then
@@ -127,6 +139,13 @@ icons_for() {
 				pruned=$((pruned + 1))
 				continue
 			fi
+		elif [ -n "$role" ] && [ -z "$present" ]; then
+			# Registered as an apex member but no hook has ever fired here: the
+			# agent is still launching, so the pane is typically still showing
+			# the shell it was spawned from. Nothing has been heard from this
+			# pane yet, so there is no stale presence to guard against — show
+			# the icon from registration rather than a second later.
+			:
 		elif ! _is_agent_cmd "$cmd"; then
 			pruned=$((pruned + 1))
 			continue

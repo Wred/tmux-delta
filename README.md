@@ -101,6 +101,12 @@ command is no longer an agent (`@tmux_delta_apex_agent_cmds`) is dropped — pan
 options outlive the agent process, and without that check an exited agent would
 leave an idle robot on the pill forever.
 
+A pane that has an apex role but has never fired a hook event is exempt from
+that check: it was registered a moment ago and the agent is still launching, so
+the pane is typically still showing the shell it was spawned from. Nothing has
+been heard from it yet, so there is no stale presence to guard against, and the
+icon appears at registration instead of a second later.
+
 A pane reporting *working* or *blocked* is believed even when the foreground
 command isn't an agent, since the agent's own tool call can put `git` or
 anything else there and second-guessing it would blink the icon out mid-turn.
