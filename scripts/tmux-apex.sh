@@ -1960,7 +1960,14 @@ _apex_client_activity() {
 		[[ $(tmux display-message -p -c "$c" '#{pane_id}' 2>/dev/null) == "$pane" ]] || continue
 		t=$(tmux display-message -p -c "$c" '#{client_activity}' 2>/dev/null)
 		[[ $t =~ '^[0-9]+$' ]] || continue
-		[[ -z $best ]] || (( t > best )) && best=$t
+		# Explicit `if`, not `[[ ]] || (( )) && best=$t`: that form is correct
+		# (|| and && are equal-precedence and left-associative, so the two
+		# tests group together) but it reads identically to the other
+		# grouping, which would also happen to work here — so it gives a
+		# later editor no signal that the precedence is load-bearing.
+		if [[ -z $best ]] || (( t > best )); then
+			best=$t
+		fi
 	done
 	[[ -n $best ]] && print -r -- "$best"
 	return 0
