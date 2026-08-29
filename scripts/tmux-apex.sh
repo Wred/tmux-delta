@@ -1924,15 +1924,17 @@ _cmd_reap() {
 
 # ─── recover (tmux-server-crash recovery) ────────────────────────────
 
-# _apex_session_label <session> <worktree> — the short pill label the picker
+# _apex_session_label <session> <worktree> [pr] — the short pill label the picker
 # would have given this session. A recovered session that keeps its full
 # worktree-derived name reads as a different session to the human than the one
 # that died, so this has to agree with the picker exactly — which is why the
 # derivation now lives in lib/session-label.sh instead of being a second copy
-# here.
+# here. <pr> is passed through for the same reason: the picker prefixes a review
+# session's label with its PR number, so dropping it here would bring a dead
+# "43: fix-issue-42" back as "fix-issue-42".
 _apex_session_label() {
 	source "${SCRIPTS}/lib/session-label.sh"
-	delta_session_label "$1" "$2"
+	delta_session_label "$1" "$2" "${3:-}"
 }
 
 # recover [--yes] [member ...] — put crashed members back, with their
@@ -2071,7 +2073,7 @@ _cmd_recover() {
 		if ! _session_alive "$session"; then
 			tmux new-session -ds "$session" -c "$wt" 2>/dev/null \
 				|| { print -u2 "recover: could not create session '$session'"; continue }
-			_apex_session_label "$session" "$wt"
+			_apex_session_label "$session" "$wt" "$pr"
 			pct=$DELTA_AGENT_PANE_PCT_NEW
 		fi
 

@@ -121,8 +121,11 @@ set-environment)
 	if [[ $unset == yes ]]; then rm -f "$f"; else print -r -- "$val" > "$f"; fi
 	;;
 has-session)
+	# Exits here rather than falling through: the stub ends in `exit 0`, and a
+	# has-session that always succeeds makes every dead session look alive.
 	local n="${2#-t}"; n="${n#=}"
 	grep -qxF "$n" "$STUB/sessions" 2>/dev/null
+	exit $?
 	;;
 new-session)
 	# new-session -ds NAME -c DIR
@@ -553,6 +556,52 @@ before=$(grep -c '' "$STUB/panes")
 eq "re-spawning the same review adds no pane" "$before" "$(grep -c '' "$STUB/panes")"
 
 # ─── summary ─────────────────────────────────────────────────────────
+
+# ─── 8. recovered layout and stale recorded ids ──────────────────────
+
+print "\nrecovered layout"
+
+# A reviewer whose whole session died, carrying a recorded conversation id that
+# no longer resolves. Recovery has to (a) rebuild the label the picker would
+# have given it — PR number included, or the pill reads as a different session
+# than the one that died — (b) use the fresh-session pane width, and (c) notice
+# that the recorded id is not the one the transcript actually has.
+REVIEW_SESSION=repo-fix-issue-42-review
+member "$REVIEW_SESSION:%4" "$(jq -nc --arg wt "$WT" \
+	'{role:"monitor", worktree:$wt, issue:"", review_pr:"43", agent:"claude",
+	  mode:"review", model:"opus", permission_mode:"", profile:"",
+	  agent_session_id:"id-from-before-the-crash", status:"idle", seq:3}')"
+
+stub_reset_log
+out=$(apex recover --yes "$REVIEW_SESSION:%4" 2>&1)
+contains "a resumed reviewer gets its own conversation" \
+	"resumed conversation $REVIEW_ID" "$out"
+contains "a recorded id that no longer resolves is called out" \
+	"recorded id id-from-before-the-crash no longer resolves" "$out"
+rec=$(cat "$APEX_ROOT/$MANAGER/members/$REVIEW_SESSION":*.json)
+eq "…and the record is corrected, not left stale" "$REVIEW_ID" \
+	"$(print -r -- "$rec" | jq -r '.agent_session_id')"
+
+eq "a recovered review session keeps its PR number in the label" "43: review" \
+	"$(cat "$STUB/opt.session.$(print -r -- "${REVIEW_SESSION//[^a-zA-Z0-9]/_}")._session_label" 2>/dev/null || true)"
+contains "a session recover just built gets the dev-layout pane width" \
+	"-p $DELTA_AGENT_PANE_PCT_NEW" \
+	"$(grep -F "split-window -t $REVIEW_SESSION" "$STUB/log" | tail -1)"
+
+# A member with no task at all still must not get a second pane: the duplicate
+# guard used to be gated on a non-empty task, so a record written before the
+# task was known was recovered on every run.
+TASKLESS=taskless-session
+member "$TASKLESS:%5" "$(jq -nc --arg wt "$WT" \
+	'{role:"worker", worktree:$wt, issue:"", review_pr:"", agent:"claude"}')"
+print -r -- "$TASKLESS" >> "$STUB/sessions"
+printf '%%55\t%s\t\n' "$TASKLESS" >> "$STUB/panes"
+print -r -- "$MANAGER" > "$STUB/opt.pane._55._apex_session"
+before=$(grep -c '' "$STUB/panes")
+out=$(apex recover --yes "$TASKLESS:%5" 2>&1)
+contains "a taskless member already in a pane is left alone" \
+	"already live on this session" "$out"
+eq "…and gains no second pane" "$before" "$(grep -c '' "$STUB/panes")"
 
 print ""
 print "$PASS passed, $FAIL failed"
