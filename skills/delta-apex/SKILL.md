@@ -45,6 +45,18 @@ it warns, say so to the human with the fix it printed, and until it is fixed
 treat yourself as having no automatic delivery at all: poll `tmux-apex.sh
 pending` yourself every time you would otherwise have waited for a ping.
 
+`init` also starts `tmux-apex.sh watch`, a background poller that nudges you
+within ~1s of a member going idle or blocked. Without it your hooks only fire
+on your own turns, so a worker that finishes while you are waiting stays
+invisible until the human types. `doctor` reports whether it is running, and
+`relink` restarts it on every one of your hooks if it has died. It is not an
+agent turn and costs you nothing until something actually happens, so leave it
+alone; you do not need a `/loop` heartbeat on top of it.
+
+`tmux-apex.sh watch` returns as soon as the poller is up, so it is safe to run
+in a tool call. Never run `watch --daemon` yourself — that is the blocking loop
+`run-shell` invokes, and it will hang your turn until the harness times out.
+
 Report state to the human after `init`, then wait for direction.
 
 ## Planning work
@@ -252,9 +264,19 @@ A worker's hooks are what generates a ping in the first place, so a worker that
 crashes outright never records one — there is nothing to pull, and you won't
 hear about it until you go looking. If your workers have gone quiet longer than
 the work should have taken, check `tmux-apex.sh status` — dead sessions show
-as `dead`. For long unattended runs you can `/loop 20m` over a status check
-yourself as a fallback heartbeat between deliveries; it is not needed in
-normal operation.
+as `dead`. `watch` cannot help here either — a crashed worker records no
+transition, so there is nothing for the poller to notice. For long unattended
+runs you can `/loop 20m` over a status check yourself as a fallback heartbeat;
+that is now only for crashes and never-reported state, not for latency.
+
+If pings arrive only when the human writes to you, the poller is not running:
+check `tmux-apex.sh watch --status` and start it with `tmux-apex.sh watch`.
+
+A ping that is late rather than missing is usually the poller deferring to
+unsent text in your own input box — it will not type over something a human
+looks to be working on. It clears and delivers once the box has been quiet for
+a while, and there is a hard cap on how long that can take, so this costs
+latency and never the event.
 
 The other reason to hear nothing is that delivery was never wired up on your
 side. Run `tmux-apex.sh doctor` — it names the missing hooks and prints the
