@@ -653,8 +653,11 @@ contains "uncommitted changes hold it back" "uncommitted changes" \
 ) >/dev/null 2>&1
 contains "a commit no remote has holds it back" "1 unpushed commit(s)" \
 	"$(risk "$CLEAN" false)"
-lacks "…and the @{upstream}-relative count is not what answered" "commits_ahead" \
-	"$(risk "$CLEAN" false)"
+# Pins the premise the guard rests on rather than the guard's own output: if
+# @{upstream} ever did resolve on a never-pushed branch, the reason for not
+# reading commits_ahead would be stale and this is what would say so.
+eq "…and @{upstream} really does report 0 for that same branch" "0" \
+	"$(PATH="$GBIN:$PATH" git -C "$CLEAN" rev-list --count '@{upstream}..HEAD' 2>/dev/null || print 0)"
 
 # A worktree that is already gone is exactly what reap is for.
 eq "a missing worktree is not held back" "" "$(risk "$TMPROOT/wt/vanished" false)"
@@ -663,6 +666,71 @@ eq "a missing worktree is not held back" "" "$(risk "$TMPROOT/wt/vanished" false
 NOTREPO="$TMPROOT/wt/notrepo"; mkdir -p "$NOTREPO"
 contains "an unreadable worktree fails closed" "could not read git state" \
 	"$(risk "$NOTREPO" false)"
+
+# ─── 10. the guard where it actually matters: inside `reap` ──────────
+#
+# _reap_risk returning the right string is only half of it. The value is in
+# _cmd_reap's wiring: a held member must keep its record and its worktree, or
+# `recover` has nothing left to work with. So run the real command.
+#
+# Two accommodations. The other sections' members are parked out of the way so
+# only these are in play — reap walks every member, and a stray one pointing at
+# a clean worktree would take the destructive branch through the real picker.
+# And real git is on PATH for these invocations, because the shared git stub
+# cannot answer "is any of this on a remote".
+
+print "\nreap holds the line"
+
+mv "$APEX_ROOT/$MANAGER/members" "$TMPROOT/members.parked"
+mkdir -p "$APEX_ROOT/$MANAGER/members"
+
+HOLD_WT="$TMPROOT/wt/held-issue-99"
+PATH="$GBIN:$PATH" git clone -q "$REMOTE" "$HOLD_WT" 2>/dev/null
+(
+	cd "$HOLD_WT" || exit
+	export PATH="$GBIN:$PATH"
+	git config user.email t@t; git config user.name t
+	git checkout -qb held; print work > w; git add w; git commit -qm unpushed
+) >/dev/null 2>&1
+
+HELD_KEY="held-issue-99:%20"
+member "$HELD_KEY" "$(jq -nc --arg wt "$HOLD_WT" \
+	'{role:"worker", worktree:$wt, issue:"99", review_pr:"", agent:"claude"}')"
+
+# A live sibling in the same session, so that if the guard is ever broken this
+# test fails at an assertion rather than by handing a worktree to the real
+# picker: _cmd_reap skips worktree cleanup while any member still owns a pane
+# there. gwtrm has no rm -rf fallback, but a test should not be one bug away
+# from calling it at all.
+member "held-issue-99:%21" "$(jq -nc --arg wt "$HOLD_WT" \
+	'{role:"reviewer", worktree:$wt, issue:"", review_pr:"99", agent:"claude"}')"
+printf '%%21\t%s\t\n' held-issue-99 >> "$STUB/panes"
+print -r -- held-issue-99 >> "$STUB/sessions"
+
+# %20 is in no pane, which after a server crash is every member's state.
+out=$(PATH="$GBIN:$PATH" apex reap --yes 2>&1)
+contains "reap holds back a member with unpushed work" \
+	"HOLD: 1 unpushed commit(s)" "$out"
+contains "…and names the member it held" "$HELD_KEY" "$out"
+contains "…and reaps nothing" "Nothing reaped." "$out"
+contains "…and says how to override" "--force" "$out"
+
+eq "…and leaves the record on disk for recover" yes \
+	"$([[ -f "$APEX_ROOT/$MANAGER/members/${HELD_KEY}.json" ]] && print yes)"
+eq "…and leaves the worktree on disk for recover" yes \
+	"$([[ -d "$HOLD_WT" ]] && print yes)"
+eq "…and leaves the unpushed commit reachable" unpushed \
+	"$(PATH="$GBIN:$PATH" git -C "$HOLD_WT" log -1 --format=%s 2>/dev/null)"
+lacks "…and never killed its pane" "kill-pane -t %20" "$(cat "$STUB/log")"
+
+# --force reclassifies it. Checked on the dry run: --yes here would hand the
+# worktree to the real picker, and a test has no business calling gwtrm -f.
+out=$(PATH="$GBIN:$PATH" apex reap --force 2>&1)
+contains "--force offers the held member instead" "$HELD_KEY" "$out"
+lacks "…and drops the HOLD" "HOLD:" "$out"
+contains "…but still will not act without --yes" "Re-run with --yes" "$out"
+
+mv "$TMPROOT/members.parked" "$APEX_ROOT/$MANAGER/members"
 
 print ""
 print "$PASS passed, $FAIL failed"
