@@ -1870,29 +1870,90 @@ _cmd_pending() {
 
 # ─── reap ────────────────────────────────────────────────────────────
 
+# _reap_risk <facts> — one line saying why reaping this member unattended would
+# destroy work, or nothing if it is safe to take.
+#
+# `reap` force-removes the worktree and deletes the branch (gwtrm -f, with
+# TMUX_DELTA_ASSUME_YES=1 suppressing the picker's own confirmation), so
+# anything not pushed is gone for good — and `recover` cannot help afterwards
+# because it skips members whose worktree is missing. That was survivable while
+# a recycled pane id made some dead members read as alive; now that liveness is
+# session-scoped, a server crash marks every member dead and one `reap --yes`
+# takes the whole team's uncommitted work at once.
+_reap_risk() {
+	local facts="$1" wt dirty
+	wt=$(printf '%s' "$facts" | jq -r '.worktree')
+	dirty=$(printf '%s' "$facts" | jq -r '.dirty')
+	# No worktree left means there is nothing to lose — that is `reap`'s job.
+	[[ -z $wt || ! -d $wt ]] && return 0
+
+	local -a why=()
+	[[ $dirty == true ]] && why+=("uncommitted changes")
+
+	# Deliberately not .commits_ahead: that is @{upstream}-relative, and a
+	# branch that was never pushed has no upstream, so rev-list fails and the
+	# count reads 0 — precisely the member whose work reap would destroy.
+	# `HEAD --not --remotes` asks the question that actually matters: is any of
+	# this reachable from a remote ref?
+	local unpushed
+	unpushed=$(git -C "$wt" rev-list --count HEAD --not --remotes 2>/dev/null) || unpushed=""
+	if [[ -z $unpushed ]]; then
+		why+=("could not read git state")
+	elif (( unpushed > 0 )); then
+		why+=("$unpushed unpushed commit(s)")
+	fi
+
+	(( ${#why} )) && print -r -- "${(j:, :)why}"
+	return 0
+}
+
 _cmd_reap() {
-	local yes=false a
-	for a in "$@"; do [[ $a == --yes ]] && yes=true; done
+	local yes=false force=false a
+	for a in "$@"; do
+		case "$a" in
+			--yes)   yes=true ;;
+			--force) force=true ;;
+		esac
+	done
 
 	local manager
 	manager=$(_require_manager)
 	APEX_SESSION="$manager"
 
-	local -a done_members=()
-	local s facts alive pr_state
+	local -a done_members=() held=()
+	local s facts alive pr_state risk
 	for s in ${(f)"$(apex_members "$manager")"}; do
 		[[ -z $s ]] && continue
 		facts=$(_member_facts "$s")
 		alive=$(printf '%s' "$facts" | jq -r '.alive')
 		pr_state=$(printf '%s' "$facts" | jq -r '.pr_state')
 		if [[ $alive == false || $pr_state == MERGED || $pr_state == CLOSED ]]; then
-			done_members+=("$s")
-			print "  $s  — $(_facts_line "$facts")"
+			risk=$(_reap_risk "$facts")
+			if [[ -n $risk ]] && ! $force; then
+				held+=("$s")
+				print "  $s  — HOLD: $risk — $(_facts_line "$facts")"
+			else
+				done_members+=("$s")
+				print "  $s  — $(_facts_line "$facts")"
+			fi
 		fi
 	done
 
+	if (( ${#held} )); then
+		print "\n${#held} member(s) held back: reap force-removes the worktree and"
+		print "deletes the branch, so unpushed work would be unrecoverable — and"
+		print "\`recover\` cannot bring back a member whose worktree is gone."
+		print "Push or commit that work first (\`recover --yes\` puts a crashed"
+		print "member back on its own conversation so it can), or pass --force to"
+		print "reap them anyway."
+	fi
+
 	if (( ${#done_members} == 0 )); then
-		print "Nothing to reap."
+		if (( ${#held} )); then
+			print "\nNothing reaped."
+		else
+			print "Nothing to reap."
+		fi
 		return
 	fi
 
@@ -2851,7 +2912,9 @@ case "${1:-}" in
 		print "  watch [--status|--stop|--once] start the background poller that nudges the"
 		print "                                 manager ~1s after a member goes idle/attention"
 		print "                                 (returns immediately; --once runs one tick)"
-		print "  reap [--yes]                   clean up finished/dead members"
+		print "  reap [--yes] [--force]         clean up finished/dead members"
+		print "                                 (--force also takes members with"
+		print "                                  uncommitted or unpushed work)"
 		print "  recover [--yes] [member ...]   re-create dead members' panes, resuming"
 		print "                                 their conversations (after a tmux crash)"
 		print "  profiles                       list available spawn profiles"

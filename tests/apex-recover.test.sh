@@ -603,6 +603,67 @@ contains "a taskless member already in a pane is left alone" \
 	"already live on this session" "$out"
 eq "…and gains no second pane" "$before" "$(grep -c '' "$STUB/panes")"
 
+# ─── 9. reap must not destroy what recover needs ─────────────────────
+
+print "\nreap guard"
+
+eval "$(sed -n '/^_reap_risk()/,/^}/p' "$SCRIPTS/tmux-apex.sh")"
+(( ${+functions[_reap_risk]} )) || {
+	print -u2 "apex-recover.test.sh: could not extract _reap_risk from tmux-apex.sh"
+	exit 1
+}
+
+# Real repos here, not a git stub: the whole point of the guard is what git
+# actually reports about unpushed work, and a stub would only assert that the
+# test author and the implementation agree on the same wrong model.
+GBIN="$TMPROOT/realbin"; mkdir -p "$GBIN"
+REAL_GIT=$(PATH="/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin" whence -p git)
+ln -sf "$REAL_GIT" "$GBIN/git"
+
+facts_for() {  # facts_for <worktree> <dirty-bool>
+	jq -nc --arg wt "$1" --argjson d "$2" '{worktree:$wt, dirty:$d, commits_ahead:0}'
+}
+
+risk() { PATH="$GBIN:$PATH" _reap_risk "$(facts_for "$1" "$2")" }
+
+# A bare "remote" plus a clone whose one commit is pushed: nothing to lose.
+REMOTE="$TMPROOT/remote.git"
+PATH="$GBIN:$PATH" git init -q --bare "$REMOTE"
+CLEAN="$TMPROOT/wt/clean"
+PATH="$GBIN:$PATH" git clone -q "$REMOTE" "$CLEAN" 2>/dev/null
+(
+	cd "$CLEAN" || exit
+	export PATH="$GBIN:$PATH"
+	git config user.email t@t; git config user.name t
+	print pushed > f; git add f; git commit -qm pushed; git push -q origin HEAD:main
+) >/dev/null 2>&1
+
+eq "a clean, fully pushed member is safe to reap" "" "$(risk "$CLEAN" false)"
+
+contains "uncommitted changes hold it back" "uncommitted changes" \
+	"$(risk "$CLEAN" true)"
+
+# A commit no remote has. commits_ahead stays 0 in the facts on purpose: this
+# is the never-pushed branch whose @{upstream} does not exist, which is the case
+# the old field reports as "0 ahead" and reap would have destroyed.
+(
+	cd "$CLEAN" || exit
+	export PATH="$GBIN:$PATH"
+	git checkout -qb side; print local > g; git add g; git commit -qm unpushed
+) >/dev/null 2>&1
+contains "a commit no remote has holds it back" "1 unpushed commit(s)" \
+	"$(risk "$CLEAN" false)"
+lacks "…and the @{upstream}-relative count is not what answered" "commits_ahead" \
+	"$(risk "$CLEAN" false)"
+
+# A worktree that is already gone is exactly what reap is for.
+eq "a missing worktree is not held back" "" "$(risk "$TMPROOT/wt/vanished" false)"
+
+# Unreadable git state must fail closed, not read as "nothing unpushed".
+NOTREPO="$TMPROOT/wt/notrepo"; mkdir -p "$NOTREPO"
+contains "an unreadable worktree fails closed" "could not read git state" \
+	"$(risk "$NOTREPO" false)"
+
 print ""
 print "$PASS passed, $FAIL failed"
 (( FAIL == 0 ))

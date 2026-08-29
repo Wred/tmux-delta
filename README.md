@@ -409,6 +409,7 @@ tmux-apex.sh send <session> "rebase on main, CI is red"
 tmux-apex.sh link --worker wt:%3 --reviewer wt:%7   # automatic fix/re-review loop
 tmux-apex.sh status                  # or --json
 tmux-apex.sh reap --yes              # remove finished/dead members
+tmux-apex.sh reap --yes --force      # ...including ones with unpushed work
 tmux-apex.sh recover                 # dry run: what a tmux crash took out
 tmux-apex.sh recover --yes           # recreate those panes, resuming their conversations
 tmux-apex.sh stop
@@ -760,6 +761,16 @@ recycled pane id. When registration does find a stale record on a pane id tmux
 reused, it replaces it and writes a `stale-record-replaced` entry to
 `events.jsonl`: the real call sites redirect stderr to `/dev/null`, so a warning
 alone would never be seen.
+
+**Run `recover` before `reap`, never the other way round.** `reap` force-removes
+the worktree and deletes the branch, so a crashed member's uncommitted or
+unpushed work is gone for good — and `recover` cannot help afterwards, because it
+skips members whose worktree is missing. `reap` therefore holds back any member
+with uncommitted changes or commits no remote has, printing `HOLD:` and the
+reason instead of taking it; `--force` overrides that. The check asks
+`git rev-list --count HEAD --not --remotes` rather than reading `commits_ahead`,
+because a branch that was never pushed has no upstream and so reports zero
+commits ahead — exactly the member whose work is at stake.
 
 `recover` is a dry run by default, like `reap`; `--yes` acts. Pass member keys
 to limit it. It skips members whose worktree is gone, and members whose task is

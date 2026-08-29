@@ -272,11 +272,20 @@ lines matter:
 - `recorded id … no longer resolves; record corrected` — normal, not an error.
   The record is a cache and the transcript is the authority.
 
-Members whose worktree is gone are skipped; use `reap` for those. Agents other
+Members whose worktree is gone are skipped — there is nothing left to recover
+into, so `reap` is what clears those records. Agents other
 than Claude Code always restart fresh — their conversation ids are recorded but
 resuming them is not wired up yet.
 
 `recover` never merges a PR and never closes an issue.
+
+**Order matters: recover first, reap second.** `reap` force-removes the worktree
+and deletes the branch, so a crashed member's uncommitted or unpushed work is
+destroyed — and `recover` cannot undo it, because a member whose worktree is gone
+is skipped. After a server crash every member reads as dead, so an unguarded
+`reap --yes` would take the whole team's unpushed work in one command. `reap`
+holds those members back and prints `HOLD:` with the reason; do not reach for
+`--force` to clear the message. Recover them, let them push, then reap.
 
 ## Cleaning up
 
@@ -284,6 +293,11 @@ resuming them is not wired up yet.
 tmux-apex.sh reap              # list finished/dead members
 tmux-apex.sh reap --yes        # remove their worktrees and sessions
 ```
+
+`reap` holds back any member with uncommitted changes or commits no remote has,
+printing `HOLD:` and the reason — it force-removes the worktree and deletes the
+branch, and that is not undoable. See "After a tmux crash" above before reaching
+for `--force`.
 
 `reap` targets members whose session has died or whose PR is already merged or
 closed. It never merges or closes anything itself. Run the dry version first and
