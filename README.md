@@ -104,8 +104,11 @@ leave an idle robot on the pill forever.
 A pane reporting *working* or *blocked* is believed even when the foreground
 command isn't an agent, since the agent's own tool call can put `git` or
 anything else there and second-guessing it would blink the icon out mid-turn.
-The one exception is a bare login shell (`zsh`/`bash`/`fish`/…): nothing is
-running in the pane, so no tool call can be in flight and the agent is gone.
+The one exception is an interactive login shell — `zsh`, `bash` or `fish`, and
+only those three: nothing is running in the pane, so no tool call can be in
+flight and the agent is gone. `sh` and `dash` are left out on purpose, since
+they are routinely the foreground command *during* real work (a build script, a
+`#!/bin/sh` git hook) and would flicker the icon out mid-turn.
 That matters because an agent killed or crashed mid-turn never fires `clear`,
 so its state flags — pane *and* session-level — stay set for the life of the
 pane.

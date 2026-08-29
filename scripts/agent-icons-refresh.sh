@@ -78,10 +78,15 @@ AGENT_CMDS=$(tmux show-option -gqv @tmux_delta_apex_agent_cmds 2>/dev/null)
 
 # SHELL_CMDS — a pane claiming to be mid-turn is normally taken at its word,
 # since an agent's own tool call can put `git`/`grep`/anything in the
-# foreground and second-guessing it would blink the icon out mid-turn. A bare
-# login shell is the one unambiguous exception: nothing is running in the pane,
-# so no tool call can be in flight and the agent is definitively gone.
-SHELL_CMDS='zsh bash fish sh dash ksh csh tcsh'
+# foreground and second-guessing it would blink the icon out mid-turn. An
+# *interactive* login shell is the one unambiguous exception: nothing is
+# running in the pane, so no tool call can be in flight and the agent is gone.
+#
+# Deliberately only the three shells people actually log into. `sh` and `dash`
+# are routinely the foreground command *during* real work — a build script, a
+# git hook, any `#!/bin/sh` the agent invoked — so treating them as death would
+# blink the icon out mid-turn, which is the exact flicker this gate avoids.
+SHELL_CMDS='zsh bash fish'
 
 # _in_list <needle> <space-separated haystack>
 _in_list() {

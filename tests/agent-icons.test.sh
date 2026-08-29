@@ -219,6 +219,16 @@ for sh in zsh bash fish; do
 	eq "an agent killed while blocked drops its glyph ($sh)" "" "$out"
 done
 
+# `sh` and `dash` are NOT in that list: an agent's own build script or
+# `#!/bin/sh` git hook shows up as the foreground command mid-turn, so reading
+# them as death would blink the glyph out during genuine work.
+for sh in sh dash; do
+	out=$(icons "%1|worker|1|1||$sh")
+	contains "a $sh subprocess keeps the working glyph" "$WORKING" "$out"
+	out=$(icons "%1|worker|1||1|$sh")
+	contains "a $sh subprocess keeps the blocked glyph" "$ATTENTION" "$out"
+done
+
 # The session aggregate is stale in exactly the same way (a killed agent fires
 # no `clear` at either scope), so pruning the last agent pane must not fall
 # through to it — that is the common one-agent-per-session case.
