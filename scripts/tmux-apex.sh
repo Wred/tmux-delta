@@ -342,11 +342,18 @@ _send_to_pane() {
 	# real instruction — the issue #10 failure mode, reintroduced by the fix
 	# for it. Clear and retype instead, so the worst case is our own message
 	# delivered twice rather than the agent's guess delivered once.
-	local left i
+	local left i j
 	for i in 1 2 3; do
-		sleep 0.2
-		left=$(_pane_input_line "$pane" 2>/dev/null)
-		_box_pending "$left" "$text" || return 0
+		# A busy agent TUI can take longer than one tick to redraw the box
+		# empty after a real submit. Poll for up to 1s before concluding the
+		# Enter was swallowed — a single 0.2s sample was mistaking normal
+		# redraw lag for a failed submission and retyping+re-entering a
+		# message that had already landed, delivering it twice for real.
+		for j in 1 2 3 4 5; do
+			sleep 0.2
+			left=$(_pane_input_line "$pane" 2>/dev/null)
+			_box_pending "$left" "$text" || return 0
+		done
 		_clear_pane_input "$pane" >/dev/null
 		tmux send-keys -t "$pane" -l -- "$text" || return 1
 		# Hazard 2 applies to the retype exactly as it does to the first
@@ -358,7 +365,7 @@ _send_to_pane() {
 	done
 	# The Enter above has had no time to land yet — wait before the verdict,
 	# or a send that succeeded on the last retry gets reported as a failure.
-	sleep 0.2
+	sleep 1
 	left=$(_pane_input_line "$pane" 2>/dev/null)
 	_box_pending "$left" "$text" && return 2
 	return 0
