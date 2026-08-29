@@ -128,6 +128,14 @@ icons_for() {
 
 	while IFS='|' read -r pane role present working attention cmd; do
 		[ -n "$pane" ] || continue
+		# @apex_role is session-scoped for the manager (tmux-apex.sh sets it on
+		# the session, not the pane), so tmux's pane->session fallback makes
+		# every other pane in that session report it too — a plain shell pane
+		# sharing the manager's session would otherwise look like an agent.
+		# Only trust it here when this pane carries its own local value.
+		if [ -n "$role" ] && ! tmux show-options -p -t "$pane" 2>/dev/null | grep -q '^@apex_role '; then
+			role=""
+		fi
 		# Not an agent pane: no apex role and no hook has ever fired here.
 		[ -n "$role" ] || [ -n "$present" ] || continue
 		# Liveness. Idle: the pane must still be running an agent, unless it
