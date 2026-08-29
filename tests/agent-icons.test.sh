@@ -253,11 +253,24 @@ eq "a pruned pane does not fall through to the stale session aggregate" "" "$out
 STUB_SESS_WORKING=""
 
 # A glob in the command lists compares literally rather than expanding against
-# the cwd (_in_list word-splits without pathname expansion).
+# the cwd. Run from a directory holding a file named exactly like the pane's
+# command, so an unprotected `*` in the list would expand to it and wrongly
+# count the pane as an agent — without that file the assertion passes for the
+# wrong reason, since the glob just lands on names that cannot match anyway.
 STUB_AGENT_CMDS='* node'
-out=$(icons '%1||1|||definitely-not-an-agent')
+mkdir -p "$TMPROOT/globcwd"
+: > "$TMPROOT/globcwd/definitely-not-an-agent"
+out=$(cd "$TMPROOT/globcwd" && icons '%1||1|||definitely-not-an-agent')
 eq "a '*' in the agent command list does not match everything" "" "$out"
 STUB_AGENT_CMDS=""
+
+# Same exposure through SHELL_CMDS, for symmetry: the list is a fixed literal
+# in the script today, but _in_list is shared and a glob must not turn a
+# working pane's command into a "the agent is gone" match.
+mkdir -p "$TMPROOT/globcwd2"
+: > "$TMPROOT/globcwd2/some-build-step"
+out=$(cd "$TMPROOT/globcwd2" && icons '%1|worker|1|1||some-build-step')
+contains "a working pane is not pruned by a glob against the cwd" "$WORKING" "$out"
 
 # An unknown command is never read as death — better a stale glyph than an
 # agent that vanishes from the pill while it is working.
