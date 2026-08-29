@@ -145,8 +145,15 @@ split-window)
 	print -r -- "$p"
 	;;
 list-panes)
+	# Honours the two formats the scripts actually ask for: bare "#{pane_id}"
+	# and the member key "#{session_name}:#{pane_id}".
+	local fmt="${@[-1]}"
 	if [[ $2 == -a ]]; then
-		cut -f1 "$STUB/panes" 2>/dev/null
+		if [[ $fmt == *'#{session_name}'* ]]; then
+			awk -F'\t' '{print $2 ":" $1}' "$STUB/panes" 2>/dev/null
+		else
+			cut -f1 "$STUB/panes" 2>/dev/null
+		fi
 	else
 		local s="$3"
 		awk -F'\t' -v s="$s" '$2==s{print $1}' "$STUB/panes" 2>/dev/null
@@ -206,7 +213,13 @@ REVIEW_ID=22222222-2222-2222-2222-222222222222
 transcript "$WORKER_ID" "$WT" "$(delta_task_prompt 42 '' autonomous)" >/dev/null
 sleep 0.05
 # The reviewer's is NEWER, so any newest-wins matcher returns it for both.
-transcript "$REVIEW_ID" "$WT" "$(delta_task_prompt '' 43 review)"     >/dev/null
+# Claude Code never stores a slash command verbatim — it records the expanded
+# form. A reviewer transcript that begins with the literal "/my-pr-review 43"
+# does not exist, so the fixture must not pretend otherwise.
+transcript "$REVIEW_ID" "$WT" \
+	'<command-message>my-pr-review</command-message>
+<command-name>/my-pr-review</command-name>
+<command-args>43</command-args>' >/dev/null
 
 # A transcript in the same project dir but a different cwd — must never match.
 transcript 33333333-3333-3333-3333-333333333333 "$TMPROOT/elsewhere" \
@@ -217,8 +230,8 @@ transcript 33333333-3333-3333-3333-333333333333 "$TMPROOT/elsewhere" \
 print "conversation identity"
 
 # Load just the discovery helpers out of tmux-apex.sh.
-eval "$(sed -n '/^_claude_project_dirs()/,/^}/p; /^_claude_session_for()/,/^}/p' \
-	"$SCRIPTS/tmux-apex.sh")"
+eval "$(sed -n '/^_claude_project_dirs()/,/^}/p; /^_claude_normalize_prompt()/,/^}/p;
+	/^_claude_session_for()/,/^}/p' "$SCRIPTS/tmux-apex.sh")"
 
 eq "worker's own conversation, not the newer reviewer's" \
 	"$WORKER_ID" "$(_claude_session_for "$WT" "$(delta_task_marker 42 '')")"
@@ -228,6 +241,15 @@ eq "unknown task matches nothing" \
 	"" "$(_claude_session_for "$WT" "$(delta_task_marker 99 '')" || true)"
 eq "a transcript for another cwd is never used" \
 	"" "$(_claude_session_for "$TMPROOT/no-such-tree" '' || true)"
+
+# The normalizer is what makes the reviewer case work; pin its shapes directly.
+eq "an expanded slash command folds back to what was typed" "/my-pr-review 43" \
+	"$(_claude_normalize_prompt '<command-name>/my-pr-review</command-name>
+<command-args>43</command-args>')"
+eq "an argument-less slash command keeps no trailing space" "/compact" \
+	"$(_claude_normalize_prompt '<command-name>/compact</command-name>')"
+eq "an ordinary prompt passes through untouched" "GitHub issue #42. Read it" \
+	"$(_claude_normalize_prompt 'GitHub issue #42. Read it')"
 
 # The marker must be a prefix of every prompt variant for the same task, or
 # matching silently fails for whichever mode wasn't tested.
@@ -312,6 +334,20 @@ lacks "a live member is never offered" "repo-fix-issue-42:%7  — role" "$out"
 { grep -v '^%7	' "$STUB/panes" > "$STUB/panes.new" || true; }
 mv "$STUB/panes.new" "$STUB/panes"
 { grep -v '^repo-fix-issue-42$' "$STUB/sessions" > "$STUB/sessions.new" || true; }
+mv "$STUB/sessions.new" "$STUB/sessions"
+
+# ...but "alive" has to mean the pane is alive *in that member's session*. A
+# restarted tmux server hands out %0, %1, … again, so pane %7 almost certainly
+# exists somewhere — and a bare pane-id check would call every crashed member
+# healthy, making recover skip exactly the members it exists to recover.
+printf '%%7\t%s\t\n' some-unrelated-session >> "$STUB/panes"
+print -r -- some-unrelated-session >> "$STUB/sessions"
+out=$(apex recover 2>&1)
+contains "a recycled pane id elsewhere does not fake a live member" \
+	"repo-fix-issue-42:%7" "$out"
+{ grep -v '^%7\t' "$STUB/panes" > "$STUB/panes.new" || true; }
+mv "$STUB/panes.new" "$STUB/panes"
+{ grep -v '^some-unrelated-session$' "$STUB/sessions" > "$STUB/sessions.new" || true; }
 mv "$STUB/sessions.new" "$STUB/sessions"
 
 stub_reset_log

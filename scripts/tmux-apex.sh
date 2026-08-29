@@ -93,7 +93,11 @@ _session_alive() { tmux has-session -t="$1" 2>/dev/null; }
 # in may host other members too, so session liveness alone isn't enough.
 _member_alive() {
 	if _is_member "$1"; then
-		tmux list-panes -a -F '#{pane_id}' 2>/dev/null | grep -qxF "$(_member_pane "$1")"
+		# Session-scoped on purpose. Pane ids are recycled across a tmux server
+		# restart, so matching a bare pane id finds "%7" alive in some unrelated
+		# session and reports a dead member as healthy — which made `recover`
+		# skip exactly the members it exists to recover (issue #18).
+		tmux list-panes -a -F '#{session_name}:#{pane_id}' 2>/dev/null | grep -qxF "$1"
 	else
 		_session_alive "$1"
 	fi
@@ -864,6 +868,30 @@ _claude_project_dirs() {
 	return 0
 }
 
+# _claude_normalize_prompt <first-user-message> — the message as the human typed
+# it. Claude Code does not store a slash command verbatim: it records the
+# expanded form
+#
+#   <command-message>my-pr-review</command-message>
+#   <command-name>/my-pr-review</command-name>
+#   <command-args>17</command-args>
+#
+# so a reviewer's transcript never begins with the literal "/my-pr-review 17"
+# apex launched it with, and every reviewer would fail to match and be recovered
+# with a blank context. Fold that shape back into "/name args" here, in one
+# place, so the marker stays the string the launcher actually used.
+_claude_normalize_prompt() {
+	local m="$1" name args
+	[[ $m == *"<command-name>"* ]] || { print -r -- "$m"; return 0; }
+	name=${${m#*<command-name>}%%</command-name>*}
+	if [[ $m == *"<command-args>"* ]]; then
+		args=${${m#*<command-args>}%%</command-args>*}
+	else
+		args=""
+	fi
+	print -r -- "${name}${args:+ $args}"
+}
+
 # _claude_session_for <worktree> <task-marker> — the Claude Code session id of
 # the conversation started in <worktree> whose first user message begins with
 # <task-marker>, newest first; or nothing.
@@ -886,10 +914,13 @@ _claude_session_for() {
 			# Cheapest disqualifier first: the recorded cwd. Transcripts run to
 			# megabytes, so every read here is streaming + head, never slurped.
 			cwd=$(jq -r 'select(.cwd != null) | .cwd' "$f" 2>/dev/null | head -n1)
-			[[ $cwd == "$wt" ]] || continue
+			[[ ${cwd:A} == ${wt:A} ]] || continue
 			if [[ -n $marker ]]; then
+				# gsub before head: an expanded slash command spans three lines,
+				# and `head -n1` on raw output would keep only the first of them.
 				first=$(jq -r 'select(.type=="user" and (.message.content|type=="string"))
-					| .message.content' "$f" 2>/dev/null | head -n1)
+					| (.message.content | gsub("\n"; " "))' "$f" 2>/dev/null | head -n1)
+				first=$(_claude_normalize_prompt "$first")
 				[[ $first == "$marker"* ]] || continue
 			fi
 			print -r -- "${f:t:r}"

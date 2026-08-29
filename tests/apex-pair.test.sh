@@ -39,7 +39,9 @@ BIN="$TMPROOT/bin"
 mkdir -p "$BIN"
 
 # tmux stub. Options live in $STUB_OPTS as "scope<TAB>key<TAB>value"; panes
-# that exist live in $STUB_PANES, one id per line. Only the subset of tmux
+# that exist live in $STUB_PANES, one id per line — every one of them in the
+# member session $STUB_PANE_SESSION (STUB_SESSION is the *caller's* session, and
+# the caller is often the manager). Only the subset of tmux
 # that tmux-apex.sh actually calls is implemented — anything else is a
 # silent no-op, which is what a missing tmux feature looks like anyway.
 cat > "$BIN/tmux" <<'EOF'
@@ -105,7 +107,14 @@ case "$cmd" in
 		_set "$target" "$key" "$val"
 		;;
 	list-panes)
-		cat "$STUB_PANES"
+		# Liveness is checked session-scoped ("#{session_name}:#{pane_id}"),
+		# because tmux recycles pane ids across servers and a bare id can
+		# belong to a different session than the member's.
+		if [[ ${@[-1]} == *'#{session_name}'* ]]; then
+			sed "s|^|${STUB_PANE_SESSION}:|" "$STUB_PANES"
+		else
+			cat "$STUB_PANES"
+		fi
 		;;
 	send-keys)
 		local target=""
@@ -158,6 +167,7 @@ export PATH="$BIN:$PATH"
 export XDG_CACHE_HOME="$TMPROOT/cache"
 export STUB_OPTS="$TMPROOT/opts.tsv"
 export STUB_PANES="$TMPROOT/panes"
+export STUB_PANE_SESSION=wt
 export STUB_SENT="$TMPROOT/sent.tsv"
 export STUB_GH="$TMPROOT/gh.log"
 export STUB_SESSION=mgr

@@ -743,7 +743,9 @@ Claude Code conversation id, discovered from the transcript under
 `~/.claude/projects/<mangled-worktree>/<id>.jsonl` by matching `cwd` plus the
 opening task prompt (a worker and its reviewer share a worktree, so the prompt
 is the only thing that tells them apart — hence the single copy of that text in
-`scripts/lib/agent-prompts.sh`). The id only exists after the member's first
+`scripts/lib/agent-prompts.sh`). A slash command is stored expanded rather than
+verbatim, so a reviewer's `/my-pr-review 17` is folded back from its
+`<command-name>`/`<command-args>` form before matching. The id only exists after the member's first
 turn, so it is filled in on the member's first `event` call, not at spawn.
 
 `recover` is a dry run by default, like `reap`; `--yes` acts. Pass member keys
@@ -816,7 +818,8 @@ pill branches.
 `tests/apex-recover.test.sh` covers crash recovery: picking a worker's own
 conversation out of a worktree it shares with its reviewer, `--resume` argv
 construction and its fresh-start fallback, `recover`'s dry run / `--yes` /
-idempotency, recycled pane ids not corrupting an existing member's record, one
+idempotency, a recycled pane id neither faking a live member nor corrupting an
+existing member's record, one
 task per member (never `issue:42pr:43`), and an apex spawn into a session that
 already has a member landing in its own new pane without rewriting that
 session's `CODING_AGENT_*` env. `tmux`, `gh` and `git` are stubbed.
