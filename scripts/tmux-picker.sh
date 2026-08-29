@@ -709,6 +709,15 @@ _delete_wt() {
 	fi
 	local wt_path="${raw#wt:}"
 	local branch=$(git -C "$wt_path" symbolic-ref --short HEAD 2>/dev/null)
+	# gwtrm -f no longer prompts a second time for a dirty worktree, so the
+	# uncommitted-changes warning it used to give a human belongs here, in the
+	# one confirmation this path still shows.
+	local dirty=$(git -C "$wt_path" status --porcelain 2>/dev/null)
+	if [[ -n $dirty ]]; then
+		echo "Warning: worktree has uncommitted changes:"
+		git -C "$wt_path" status --short
+		echo
+	fi
 	if ! _confirm "Remove worktree '${wt_path:t}' and delete branch '$branch'?"; then
 		echo "Aborted."
 		sleep 0.5
@@ -716,7 +725,9 @@ _delete_wt() {
 	fi
 	local session_name=$(basename "$wt_path" | tr . _)
 	gwtrm -f "$wt_path"
-	if [[ -f $_HIST_FILE ]]; then
+	local rc=$?
+	# Only forget the worktree if it is actually gone.
+	if [[ ! -d $wt_path && -f $_HIST_FILE ]]; then
 		local -a lines=()
 		while IFS= read -r line; do
 			[[ $line == $wt_path ]] && continue
@@ -729,6 +740,14 @@ _delete_wt() {
 		echo "Session '$session_name' killed."
 		sleep 0.5
 	fi
+	# Report the truth to non-interactive callers: gwtrm can return 0 having
+	# removed nothing, and a caller that then discards its own bookkeeping
+	# (tmux-apex.sh's `reap`) orphans the worktree it thinks it deleted.
+	if [[ -d $wt_path ]]; then
+		echo "Worktree still present: $wt_path"
+		return 1
+	fi
+	return $rc
 }
 
 # ─── Session handlers ───────────────────────────────────────────────

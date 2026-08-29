@@ -96,18 +96,26 @@ gwtrm() {
       echo
       if [[ $reply != "y" ]]; then
         echo "Aborted."
-        return 0
+        return 2
       fi
     fi
-    if [[ -n $(git -C "$dir" status --porcelain 2>/dev/null) ]]; then
+    local dirty=$(git -C "$dir" status --porcelain 2>/dev/null)
+    if [[ -n $dirty ]]; then
       echo "Warning: worktree has uncommitted changes:"
       git -C "$dir" status --short
       echo
-      read -q "force_reply?Remove anyway? [y/N] "
-      echo
-      if [[ $force_reply != "y" ]]; then
-        echo "Aborted."
-        return 0
+      # -f skips this too. It used to prompt regardless, which meant a caller
+      # with no tty (tmux-apex.sh's `reap`) hit a `read` that could not succeed,
+      # fell through to "Aborted." and got exit 0 for a worktree that was still
+      # there. Callers that want a human in the loop for dirty state ask for it
+      # themselves — see tmux-picker.sh's _delete_wt.
+      if [[ $force != true ]]; then
+        read -q "force_reply?Remove anyway? [y/N] "
+        echo
+        if [[ $force_reply != "y" ]]; then
+          echo "Aborted."
+          return 2
+        fi
       fi
       if ! git -C "$main_tree" worktree remove --force "$dir"; then
         echo "Error: failed to remove worktree '$dir:t'."

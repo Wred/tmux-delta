@@ -772,6 +772,15 @@ reason instead of taking it; `--force` overrides that. The check asks
 because a branch that was never pushed has no upstream and so reports zero
 commits ahead — exactly the member whose work is at stake.
 
+`--force` genuinely takes a dirty worktree: `gwtrm`'s `-f` used to skip only the
+first confirmation and prompt again for uncommitted changes, which with no tty
+failed into an "Aborted." path that returned success for a worktree it had not
+removed. `-f` now covers both prompts (the picker shows the dirty-file warning
+itself, so an interactive delete loses nothing), the picker reports a worktree
+that survived, and `reap` removes the worktree *before* deleting the member
+record — so if cleanup fails anyway it says `worktree survived cleanup` and
+keeps the record, which is the only thing `recover` can act on.
+
 `recover` is a dry run by default, like `reap`; `--yes` acts. Pass member keys
 to limit it. It skips members whose worktree is gone, and members whose task is
 already live in a pane. When no conversation can be resumed it says so and

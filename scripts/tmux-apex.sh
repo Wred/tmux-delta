@@ -1907,6 +1907,34 @@ _reap_risk() {
 	return 0
 }
 
+# _reap_cleanup <session> <worktree> — tear down a reaped member's worktree and
+# session. Prints why and returns non-zero if the worktree is still there
+# afterwards, so the caller can keep the member record rather than orphan it.
+#
+# The exit status of the cleanup itself is not the thing to trust: `gwtrm -f`
+# used to prompt a second time for a dirty worktree, and with no tty that read
+# failed into an "Aborted." path that returned 0 for a worktree it had not
+# touched. Both halves of that are fixed now (gwt.zsh honours -f, the picker
+# propagates a surviving worktree), but the only fact that actually settles the
+# question is whether the directory is gone — so check that, and keep the
+# output instead of discarding it to /dev/null.
+_reap_cleanup() {
+	local session="$1" wt="$2"
+	if [[ -z $wt || ! -d $wt ]]; then
+		tmux kill-session -t "$session" 2>/dev/null
+		return 0
+	fi
+
+	local out
+	out=$(TMUX_DELTA_ASSUME_YES=1 "${SCRIPTS}/tmux-picker.sh" --delete-wt "wt:${wt}" 2>&1)
+	if [[ -d $wt ]]; then
+		print "  worktree survived cleanup: $wt"
+		[[ -n $out ]] && print -r -- "  ${out//$'\n'/$'\n'  }"
+		return 1
+	fi
+	return 0
+}
+
 _cmd_reap() {
 	local yes=false force=false a
 	for a in "$@"; do
@@ -1968,18 +1996,25 @@ _cmd_reap() {
 		session=$(_member_session "$s")
 
 		tmux kill-pane -t "$(_member_pane "$s")" 2>/dev/null
+
+		# Worktree first, member record second. The record carries
+		# agent_session_id, and that is the only thing `recover` can put a
+		# member back from — so deleting it before a cleanup that is allowed to
+		# fail makes every such failure unrecoverable by construction. The pane
+		# is expendable either way: `recover` makes a new one.
+		#
+		# Only clean up the shared worktree/session once no other apex member
+		# (e.g. a worker, if we just reaped a reviewer) still owns a pane there.
+		if ! _session_has_apex_member "$session"; then
+			if ! _reap_cleanup "$session" "$wt"; then
+				print "  Kept $s — its record is the only way \`recover\` can reach that work."
+				continue
+			fi
+		fi
+
 		rm -f "$(apex_member_file "$manager" "$s")"
 		apex_event "$manager" "$(jq -nc --arg s "$s" '{event:"reap", session:$s}')"
 		print "Reaped $s"
-
-		# Only clean up the shared worktree/session once no other apex member
-		# (e.g. a worker, if we just reaped a reviewer) still owns a pane there.
-		_session_has_apex_member "$session" && continue
-		if [[ -n $wt && -d $wt ]]; then
-			TMUX_DELTA_ASSUME_YES=1 "${SCRIPTS}/tmux-picker.sh" --delete-wt "wt:${wt}" >/dev/null 2>&1
-		else
-			tmux kill-session -t "$session" 2>/dev/null
-		fi
 	done
 }
 

@@ -732,6 +732,59 @@ contains "…but still will not act without --yes" "Re-run with --yes" "$out"
 
 mv "$TMPROOT/members.parked" "$APEX_ROOT/$MANAGER/members"
 
+# ─── 10. reap keeps the record when cleanup does not happen ──────────
+
+print "\nreap cleanup"
+
+# `gwtrm -f` once prompted a second time for a dirty worktree and, with no tty,
+# fell through to "Aborted." returning 0 — so reap deleted the member record for
+# a worktree that was still on disk, and `recover` could no longer reach it.
+# _reap_cleanup answers the only question that settles it: is the directory gone?
+eval "$(sed -n '/^_reap_cleanup()/,/^}/p' "$SCRIPTS/tmux-apex.sh")"
+(( ${+functions[_reap_cleanup]} )) || {
+	print -u2 "fatal: could not extract _reap_cleanup from tmux-apex.sh"
+	exit 1
+}
+
+# A stub picker stands in for the real --delete-wt, so the test decides whether
+# cleanup succeeds instead of handing a worktree to gwtrm.
+FAKE_SCRIPTS="$TMPROOT/fakescripts"
+mkdir -p "$FAKE_SCRIPTS"
+cleanup() { SCRIPTS="$FAKE_SCRIPTS" _reap_cleanup "$1" "$2" }
+
+CLEAN_WT="$TMPROOT/cleanup-wt"
+
+# The honest case: the picker removes the worktree.
+mkdir -p "$CLEAN_WT"
+print -r -- '#!/usr/bin/env zsh
+rm -rf "${2#wt:}"' > "$FAKE_SCRIPTS/tmux-picker.sh"
+chmod +x "$FAKE_SCRIPTS/tmux-picker.sh"
+out=$(cleanup dead-session "$CLEAN_WT" 2>&1)
+ok "cleanup succeeds when the worktree is actually removed" $?
+eq "…and says nothing" "" "$out"
+
+# The regression: exit 0, worktree untouched.
+mkdir -p "$CLEAN_WT"
+print -r -- '#!/usr/bin/env zsh
+print "Warning: worktree has uncommitted changes:"
+print "Aborted."
+exit 0' > "$FAKE_SCRIPTS/tmux-picker.sh"
+rc=0
+out=$(cleanup dead-session "$CLEAN_WT" 2>&1) || rc=$?
+eq "a surviving worktree fails cleanup even on exit 0" 1 $rc
+contains "…and names the worktree" "worktree survived cleanup: $CLEAN_WT" "$out"
+contains "…and keeps the output reap used to discard" "Aborted." "$out"
+
+# Nothing to remove is not a failure — it is reap's whole purpose.
+print -r -- '#!/usr/bin/env zsh
+print "picker must not be called for a missing worktree"
+exit 1' > "$FAKE_SCRIPTS/tmux-picker.sh"
+out=$(cleanup dead-session "$TMPROOT/never-existed" 2>&1)
+ok "a worktree that is already gone counts as clean" $?
+lacks "…without invoking the picker" "must not be called" "$out"
+contains "…and kills the orphaned session instead" "kill-session -t dead-session" \
+	"$(cat "$STUB/log")"
+
 print ""
 print "$PASS passed, $FAIL failed"
 (( FAIL == 0 ))

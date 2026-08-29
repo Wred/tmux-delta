@@ -287,6 +287,10 @@ is skipped. After a server crash every member reads as dead, so an unguarded
 holds those members back and prints `HOLD:` with the reason; do not reach for
 `--force` to clear the message. Recover them, let them push, then reap.
 
+`--force` does remove a dirty worktree, and if the removal fails regardless
+`reap` prints `worktree survived cleanup` and keeps the member record rather
+than orphaning the work — so that member is still recoverable.
+
 ## Cleaning up
 
 ```bash
