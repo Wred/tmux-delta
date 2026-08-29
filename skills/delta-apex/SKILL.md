@@ -247,6 +247,37 @@ tmux-apex.sh status --json     # every member + recent events
 Treat that output as the truth and your memory as a cache. Never report on a
 worker from recollection alone.
 
+## After a tmux crash
+
+A tmux server crash (or `kill-server`) takes every worker pane with it. The
+member records under `~/.cache/tmux-delta/apex/<you>/members/` survive, so the
+work is not lost — but nothing restarts on its own, and `status` will show the
+members as dead.
+
+```bash
+tmux-apex.sh recover           # dry run: what the crash took out
+tmux-apex.sh recover --yes     # recreate those panes, resuming their conversations
+```
+
+`recover` recreates the session and pane for each dead member and restarts its
+agent **on the original conversation**, not with a blank context — so a worker
+picks up mid-task instead of re-doing it. Pass member keys to limit it to those.
+
+Read the dry run before you act on it, and tell the human what it found. Two
+lines matter:
+
+- `resume <none found>` — no conversation could be located, so that member will
+  restart fresh on the same task. Say so, because a fresh start on a task that
+  was half-done can duplicate commits.
+- `recorded id … no longer resolves; record corrected` — normal, not an error.
+  The record is a cache and the transcript is the authority.
+
+Members whose worktree is gone are skipped; use `reap` for those. Agents other
+than Claude Code always restart fresh — their conversation ids are recorded but
+resuming them is not wired up yet.
+
+`recover` never merges a PR and never closes an issue.
+
 ## Cleaning up
 
 ```bash
@@ -265,7 +296,9 @@ crashes outright never records one — there is nothing to pull, and you won't
 hear about it until you go looking. If your workers have gone quiet longer than
 the work should have taken, check `tmux-apex.sh status` — dead sessions show
 as `dead`. `watch` cannot help here either — a crashed worker records no
-transition, so there is nothing for the poller to notice. For long unattended
+transition, so there is nothing for the poller to notice. If the whole tmux
+server went down rather than one agent, see "After a tmux crash" below —
+`recover` puts the workers back on their own conversations. For long unattended
 runs you can `/loop 20m` over a status check yourself as a fallback heartbeat;
 that is now only for crashes and never-reported state, not for latency.
 
