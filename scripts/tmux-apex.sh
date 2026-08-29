@@ -54,6 +54,13 @@ _cur_session() {
 	tmux display-message -p '#S' 2>/dev/null
 }
 
+# Session pills draw one icon per agent pane; membership changes change that
+# set, so nudge the cache after registering or releasing a member.
+_refresh_agent_icons() {
+	[[ -n ${1:-} ]] || return 0
+	"${0:A:h}/agent-icons-refresh.sh" "$1" >/dev/null 2>&1 || true
+}
+
 # Member identity is "<session>:<pane_id>" (e.g. "myworktree:%57"); a manager
 # is identified by its bare session name. Tmux session names can't contain
 # "%", so "contains :%" reliably distinguishes the two shapes.
@@ -626,6 +633,7 @@ _cmd_relink() {
 	new_key="${session}:${pane}"
 	[[ $old_key != $new_key ]] && mv -f "$f" "$(apex_member_file "$manager" "$new_key")" 2>/dev/null
 
+	_refresh_agent_icons "$session"
 	tmux refresh-client -S 2>/dev/null
 }
 
@@ -769,6 +777,7 @@ _cmd_register_member() {
 		--arg issue "$issue" --arg pr "$pr" \
 		'{event:"register", session:$s, role:$role, issue:$issue, review_pr:$pr}')"
 
+	_refresh_agent_icons "$session"
 	tmux refresh-client -S 2>/dev/null
 }
 
