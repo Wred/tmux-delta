@@ -906,9 +906,13 @@ A zsh built without zsh/system falls back to `mkdir` of a sibling `.lock.d`.
 `mkdir` is a sound create-exclusive; what it cannot do safely is recover a lock
 whose holder died, so the fallback never steals one. A wedged lock costs each
 later writer one `$APEX_LOCK_WAIT` stall and then an unlocked, logged write —
-degraded and noisy, never wedged, and never two holders. The directory is cleared
+degraded and noisy, never wedged, and never two holders except behind a critical
+section that has already stalled past `$APEX_LOCK_STALE`. The directory is cleared
 only once a writer has already given up, so nobody ever claims a lock they
-stole.
+stole — but a holder that is live and stalled for 30s does get its directory
+removed under it, and the next writer then runs alongside it. That is the one
+multi-holder path left, and it needs a two-`jq`-fork critical section to hang for
+half a minute.
 
 `reap`, `relink` and `recover` re-keying call `apex_member_lock_forget`, since a
 record that is destroyed or re-keyed leaves behind a lock nothing will ever take

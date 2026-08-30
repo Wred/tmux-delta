@@ -80,9 +80,17 @@ _apex_mtime() {
 
 # apex_lock_acquire <lockpath> — 0 when held, 1 when it gave up waiting.
 #
-# MUST NOT be called from a subshell (including a command substitution): the
-# descriptor carrying the lock closes when that subshell exits, so the lock would
-# be released before the caller's critical section had even started.
+# The lock lives on a descriptor, so acquire, critical section and release must
+# all run in the SAME shell. A subshell is fine as long as it contains all three
+# — `seq=$(apex_member_merge_bump …)` is correct, because the whole section
+# happens inside that command substitution. What is not fine is taking the lock
+# in a subshell and doing the work outside it: the descriptor closes when the
+# subshell exits, so the lock is gone before the section starts.
+#
+# One acquire per path per shell, too. APEX_LOCK_FD[$lock] is overwritten rather
+# than guarded, and flock does not self-conflict across two descriptors in one
+# process, so a nested acquire of the same path would leak the first descriptor
+# and silently fail to exclude. No caller does this today.
 #
 # -i matters as much as -t here. zsystem flock retries once a second by default,
 # and a critical section is two jq forks — tens of milliseconds. A waiter polling
@@ -121,10 +129,14 @@ apex_lock_release() {
 # block comment above. So it never steals one. A wedged lock therefore costs
 # each later writer one $APEX_LOCK_WAIT stall and then an unlocked write with a
 # `lock_timeout` event (see _apex_member_lock) — degraded and noisy, never
-# wedged, and never two holders. Only once we have already given up, and only if
-# the directory has sat there far longer than any real critical section, is it
-# cleared so the *next* writer starts clean; we do not claim it ourselves, which
-# is precisely the step that cannot be made single-winner.
+# wedged. Only once we have already given up, and only if the directory has sat
+# there far longer than any real critical section, is it cleared so the *next*
+# writer starts clean; we do not claim it ourselves, which is precisely the step
+# that cannot be made single-winner. That clear is the one remaining way to get
+# two holders here: a live-but-stalled holder past $APEX_LOCK_STALE has its
+# directory removed under it, and the next writer then mkdirs alongside it. It
+# needs a critical section two jq forks long to hang for 30s, so it trades the
+# ordinary crash path for a pathological one.
 _apex_lockdir_acquire() {
 	setopt localoptions no_err_return
 	local lock="$1" deadline now mt
@@ -139,7 +151,7 @@ _apex_lockdir_acquire() {
 			fi
 			return 1
 		fi
-		sleep 0.05
+		sleep "$APEX_LOCK_POLL"
 	done
 }
 
@@ -149,6 +161,14 @@ apex_member_lockpath() { printf '%s/%s/members/.%s.lock' "$APEX_ROOT" "$1" "$2";
 # apex_member_lock_forget <manager> <session>
 # Drops the lock state for a record that is being destroyed or re-keyed. The
 # glob catches the fallback's `.lock.d` too, so nothing is left behind.
+#
+# Unlinking a lock file does not release a flock held on its inode, so a live
+# holder plus a later acquirer of the same path would end up on two different
+# inodes and exclude nothing. That is safe here only because this is called
+# exactly when the key stops existing: reap and recover destroy the record,
+# relink has already mv'd it to the new key. There is no next writer for this
+# path, and a write racing the re-key was going to land on an orphaned file
+# either way. Do not call it on a key that is still in use.
 apex_member_lock_forget() {
 	setopt localoptions no_err_return
 	local lock
@@ -161,7 +181,7 @@ apex_member_lock_forget() {
 # unlocked — a dropped state update is worse than a racy one, and the whole
 # point of this issue is that losing a write must not be silent.
 #
-# Called directly, never through $(...): see apex_lock_acquire.
+# The caller must release in the same shell that called this: see apex_lock_acquire.
 _apex_member_lock() {
 	setopt localoptions no_err_return
 	apex_lock_acquire "$(apex_member_lockpath "$1" "$2")" && return 0
