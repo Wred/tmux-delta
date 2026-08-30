@@ -505,6 +505,21 @@ task=$(pane_opt '%2' @apex_task)
 lacks "relink never concatenates two tasks" "issue:42pr:43" "$task"
 eq "relink picks the PR when a record has both" "pr:43" "$task"
 
+# Re-keying moves the record to the live pane, so the old key's write lock has
+# to go with it — nothing will ever take that lock again, and a leftover file
+# per crashed pane accumulates for the life of the cache directory.
+rm -f "$APEX_ROOT/$MANAGER/members/both:"*.json
+member "both:%9" "$(jq -nc --arg wt "$WT" \
+	'{role:"worker", worktree:$wt, review_pr:"43", agent:"claude"}')"
+LOCK9="$APEX_ROOT/$MANAGER/members/.both:%9.lock"
+: > "$LOCK9"
+rm -f "$STUB/opt.pane."*   # else the pane reads as already linked
+( cd "$WT" && STUB_SESSION=both TMUX_PANE='%2' apex relink ) >/dev/null 2>&1 || true
+eq "relink re-keys the record to the live pane" yes \
+	"$([[ -f "$APEX_ROOT/$MANAGER/members/both:%2.json" ]] && print yes)"
+eq "…and takes the dead key's lock with it" "" \
+	"$(print -r -- "$LOCK9"(N))"
+
 # ─── 7. no session env rewrite on an apex spawn ──────────────────────
 
 print "\napex spawn into an existing session"

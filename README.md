@@ -801,7 +801,8 @@ tests/agent-icons.test.sh
 tests/status-format.test.sh
 ```
 
-All eight stub `tmux`, so none of them needs a tmux server or a live agent.
+None of them needs a tmux server or a live agent — seven stub `tmux`, and
+`apex-lock.test.sh` never calls it.
 
 Covers apex ping delivery: which output channel `apex-manager-notify.sh` picks
 per event, that an invocation which cannot deliver also does not *consume*
@@ -862,10 +863,12 @@ vs 42) not matching each other's transcripts. `tmux`, `gh` and `git` are stubbed
 `apex-lock.test.sh` covers the per-member mutex (see below). It is the one suite
 that runs real concurrent processes, because the claim being tested is a
 concurrency claim: sixteen writers of disjoint fields must all survive, the pair
-race must keep both halves, twelve concurrent seq bumps must hand out twelve
+race must keep both halves, four contending processes must never overlap in the
+critical section (each holder checks for itself and fails loudly), a SIGKILLed
+holder's lock must come free, twelve concurrent seq bumps must hand out twelve
 distinct numbers, and a compare-and-set on a value that moved must refuse rather
-than write. It also pins the degraded paths — a stale lock is stolen, and a lock
-that cannot be taken still writes but logs `lock_timeout`.
+than write. It also pins the degraded paths — the lockdir fallback, and a lock
+that cannot be taken at all still writing but logging `lock_timeout`.
 
 ### Writing member records
 
@@ -879,17 +882,37 @@ then relays into its pane, which wakes the partner agent whose own hooks merge
 `{status, seq}` into that same record. A lost `pair_turn` flip stalls the round
 with nothing logged and no escalation.
 
-So `apex_member_merge` holds a per-record mutex. The mutex is a `mkdir` of
-`members/.<session>.lock` — atomic everywhere we run and needing no helper
-binary, which matters because macOS ships no `flock(1)`. Releasing it *renames*
-the directory before deleting it: `rm -rf` unlinks the pid file first, and a
-waiter that wins `mkdir` in that gap gets its own fresh directory `rmdir`'d out
-from under it, so two processes end up believing they hold the lock. A lock held
-longer than `$APEX_LOCK_STALE` (30s) is stolen, because hook processes are killed
-freely and a crash must not wedge a record for the rest of the session. Waiting
-longer than `$APEX_LOCK_WAIT` (5s) writes anyway and logs `lock_timeout` to
-`events.jsonl`: dropping a state update is worse than a racy one, and the point
-of the lock is that a lost write is never silent.
+So `apex_member_merge` holds a per-record mutex on `members/.<session>.lock`,
+taken with `zsystem flock` from zsh/system — a real advisory lock, held on an
+open descriptor. The kernel drops it when the holder exits, and that is the whole
+reason to prefer it over a lockfile protocol of our own: hook processes are
+killed freely (tmux teardown, `^C`, a crash mid-write), so any lock we release
+ourselves needs a staleness rule, and a staleness rule has no safe
+implementation. Stealing a stale lock means removing it and creating your own,
+and two waiters that saw the same stale lock will each do that and each believe
+they won — a pid file does not settle it either, because `$$` is shared by every
+zsh subshell forked from one shell. The kernel already knows what we would be
+guessing at.
+
+Two knobs: `$APEX_LOCK_WAIT` (5s) before giving up, and `$APEX_LOCK_POLL`
+(0.02s) between retries. The second is not cosmetic — `zsystem flock` retries
+once a second by default, and a critical section here is two `jq` forks, so a
+waiter on that cadence is running a lottery it usually loses. Giving up writes
+anyway and logs `lock_timeout` to `events.jsonl`: dropping a state update is
+worse than a racy one, and the point of the lock is that a lost write is never
+silent.
+
+A zsh built without zsh/system falls back to `mkdir` of a sibling `.lock.d`.
+`mkdir` is a sound create-exclusive; what it cannot do safely is recover a lock
+whose holder died, so the fallback never steals one. A wedged lock costs each
+later writer one `$APEX_LOCK_WAIT` stall and then an unlocked, logged write —
+degraded and noisy, never wedged, and never two holders. The directory is cleared
+only once a writer has already given up, so nobody ever claims a lock they
+stole.
+
+`reap`, `relink` and `recover` re-keying call `apex_member_lock_forget`, since a
+record that is destroyed or re-keyed leaves behind a lock nothing will ever take
+again.
 
 Two writers need more than a merge. `apex_member_merge_bump` increments `seq` in
 the same critical section as the status write, because `_settle` arms a callback

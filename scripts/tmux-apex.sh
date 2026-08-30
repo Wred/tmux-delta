@@ -655,7 +655,7 @@ _cmd_relink() {
 	new_key="${session}:${pane}"
 	if [[ $old_key != $new_key ]]; then
 		mv -f "$f" "$(apex_member_file "$manager" "$new_key")" 2>/dev/null
-		rm -rf "$(apex_member_lockdir "$manager" "$old_key")"
+		apex_member_lock_forget "$manager" "$old_key"
 	fi
 
 	_refresh_agent_icons "$session"
@@ -1676,7 +1676,7 @@ _cmd_event() {
 	# same number, and _settle below arms a callback keyed on it.
 	seq=$(apex_member_merge_bump "$manager" "$session" "$(jq -nc \
 		--arg st "$st" --argjson t "$(date +%s)" \
-		'{status:$st, updated_at:$t}')")
+		'{status:$st, updated_at:$t}')") || seq=""
 
 	case "$verb" in
 		notify)
@@ -1690,7 +1690,11 @@ _cmd_event() {
 			# session has actually settled: re-check the sequence number after a
 			# quiet window. run-shell -d defers inside the tmux server, so this
 			# outlives the short-lived hook process without a sleeping watcher.
-			tmux run-shell -b -d "$APEX_QUIET_SECS" \
+			#
+			# No seq means the bump above failed outright, and a callback keyed
+			# on nothing has nothing to confirm: skip it rather than arm it
+			# blank and rely on _cmd_settle's comparisons falling through.
+			[[ -n $seq ]] && tmux run-shell -b -d "$APEX_QUIET_SECS" \
 				"${SELF} _settle ${(q)session} ${(q)manager} ${seq}" 2>/dev/null
 			;;
 	esac
@@ -2026,7 +2030,7 @@ _cmd_reap() {
 		fi
 
 		rm -f "$(apex_member_file "$manager" "$s")"
-		rm -rf "$(apex_member_lockdir "$manager" "$s")"
+		apex_member_lock_forget "$manager" "$s"
 		apex_event "$manager" "$(jq -nc --arg s "$s" '{event:"reap", session:$s}')"
 		print "Reaped $s"
 	done
@@ -2208,7 +2212,7 @@ _cmd_recover() {
 		local new_key="${session}:${pane}"
 		if [[ $old_key != $new_key ]]; then
 			rm -f "$(apex_member_file "$manager" "$old_key")"
-			rm -rf "$(apex_member_lockdir "$manager" "$old_key")"
+			apex_member_lock_forget "$manager" "$old_key"
 		fi
 
 		apex_event "$manager" "$(jq -nc --arg old "$old_key" --arg new "$new_key" \

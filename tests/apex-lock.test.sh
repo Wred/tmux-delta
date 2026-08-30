@@ -69,33 +69,108 @@ eq "seq recorded"       2       "$(get seq)"
 print "\nlock primitives"
 reset
 LOCK="$TMPROOT/l.lock"
-apex_lock_acquire "$LOCK" && ok "acquires a free lock" || bad "acquires a free lock" "returned 1"
-(
-	APEX_LOCK_WAIT=1
-	apex_lock_acquire "$LOCK" && print held || print blocked
-) | read -r r
-eq "a held lock blocks" blocked "$r"
-apex_lock_release "$LOCK"
-[[ -d $LOCK ]] && bad "release removes the lock" "still present" || ok "release removes the lock"
+_apex_have_flock && ok "zsh/system provides flock" \
+	|| bad "zsh/system provides flock" "falling back to the lockdir path"
 
-# A crashed writer must not wedge the record forever: an old lock is stolen.
-mkdir -p "$LOCK"
-touch -t 197001020000 "$LOCK"
-( APEX_LOCK_WAIT=1; apex_lock_acquire "$LOCK" ) \
-	&& ok "steals a stale lock" || bad "steals a stale lock" "returned 1"
+apex_lock_acquire "$LOCK" && ok "acquires a free lock" || bad "acquires a free lock" "returned 1"
+r=$( APEX_LOCK_WAIT=1; apex_lock_acquire "$LOCK" && print held || print blocked )
+eq "a held lock blocks another process" blocked "$r"
 apex_lock_release "$LOCK"
+r=$( APEX_LOCK_WAIT=1; apex_lock_acquire "$LOCK" && print held || print blocked )
+eq "release hands it to the next waiter" held "$r"
+
+# The reason for using a kernel lock rather than a lockdir: a holder that is
+# killed mid-critical-section releases it, so there is no staleness rule to get
+# wrong and nothing for a second writer to steal.
+rm -f "$TMPROOT/holding"
+( apex_lock_acquire "$LOCK"; touch "$TMPROOT/holding"; sleep 30 ) &
+holder=$!
+while [[ ! -e $TMPROOT/holding ]]; do sleep 0.05; done
+kill -9 $holder 2>/dev/null
+wait $holder 2>/dev/null || true
+r=$( APEX_LOCK_WAIT=1; apex_lock_acquire "$LOCK" && print held || print blocked )
+eq "a SIGKILLed holder's lock is free" held "$r"
+rm -f "$TMPROOT/holding"
+
+# Exactly one holder at a time, checked by the holders themselves: four
+# processes contend, and each one fails loudly if it finds the critical section
+# already occupied. The previous mkdir-with-stale-steal design passed a
+# single-stealer test and failed this one — two waiters that saw the same stale
+# lock each removed it and each created their own.
+print "\nmutual exclusion under contention"
+rm -f "$TMPROOT/occupied" "$TMPROOT/overlap" "$TMPROOT/won"
+for w in 1 2 3 4; do
+	(
+		APEX_LOCK_WAIT=5
+		apex_lock_acquire "$LOCK" || exit 0
+		print -r -- "w$w" >> "$TMPROOT/won"
+		[[ -e $TMPROOT/occupied ]] && print -r -- "w$w" >> "$TMPROOT/overlap"
+		touch "$TMPROOT/occupied"
+		sleep 0.2
+		rm -f "$TMPROOT/occupied"
+		apex_lock_release "$LOCK"
+	) &
+done
+wait
+eq "all four got a turn"        4 "$(grep -c . "$TMPROOT/won" 2>/dev/null || print 0)"
+eq "no two held it at once"     0 "$(grep -c . "$TMPROOT/overlap" 2>/dev/null || print 0)"
 
 # Giving up must not drop the state update — a racy write beats a lost one —
 # but it must leave a trace, since silent loss is the whole bug.
 print "\nlock timeout still writes, and is logged"
 reset
 apex_member_merge "$MGR" "$M" '{"status":"idle"}'
-mkdir -p "$(apex_member_lockdir "$MGR" "$M")"
+(
+	apex_lock_acquire "$(apex_member_lockpath "$MGR" "$M")"
+	touch "$TMPROOT/holding"
+	sleep 3
+) &
+holder=$!
+while [[ ! -e $TMPROOT/holding ]]; do sleep 0.05; done
 ( APEX_LOCK_WAIT=1; apex_member_merge "$MGR" "$M" '{"status":"working"}' )
 eq "write still landed" working "$(get status)"
-eq "timeout logged" 1 \
-	"$(grep -c lock_timeout "$(apex_events_file "$MGR")")"
-rm -rf "$(apex_member_lockdir "$MGR" "$M")"
+eq "timeout logged" 1 "$(grep -c lock_timeout "$(apex_events_file "$MGR")")"
+kill $holder 2>/dev/null; wait $holder 2>/dev/null || true
+rm -f "$TMPROOT/holding"
+
+# ── lockdir fallback ─────────────────────────────────────────────────
+# Exercised on a zsh built without zsh/system. It never steals a lock, because
+# stealing cannot be made single-winner on top of mkdir: a wedged lock degrades
+# to one stall plus an unlocked write per writer, and is cleared only after the
+# giving-up writer has already decided to proceed.
+print "\nlockdir fallback"
+(
+	APEX_HAVE_FLOCK=1 APEX_LOCK_WAIT=1
+	FLOCK="$TMPROOT/f.lock"
+	apex_lock_acquire "$FLOCK" && print -n "held " || print -n "failed "
+	[[ -d $FLOCK.d ]] && print -n "dir " || print -n "nodir "
+	( apex_lock_acquire "$FLOCK" ) && print -n "notexcl " || print -n "excl "
+	apex_lock_release "$FLOCK"
+	[[ -d $FLOCK.d ]] && print "notreleased" || print "released"
+) | read -r r
+eq "fallback locks, excludes, releases" "held dir excl released" "$r"
+
+(
+	APEX_HAVE_FLOCK=1 APEX_LOCK_WAIT=1 APEX_LOCK_STALE=0
+	FLOCK="$TMPROOT/g.lock"
+	mkdir -p "$FLOCK.d"
+	apex_lock_acquire "$FLOCK" && print -n "held " || print -n "refused "
+	[[ -d $FLOCK.d ]] && print "kept" || print "cleared"
+) | read -r r
+eq "a wedged lockdir is not claimed, but is cleared for the next writer" \
+	"refused cleared" "$r"
+
+# ── lock cleanup ─────────────────────────────────────────────────────
+# reap, relink and recover re-keying all drop the lock state of a record that
+# is going away; the glob has to catch the fallback's sibling directory too.
+print "\napex_member_lock_forget"
+reset
+apex_lock_acquire "$(apex_member_lockpath "$MGR" "$M")"
+apex_lock_release "$(apex_member_lockpath "$MGR" "$M")"
+mkdir -p "$(apex_member_lockpath "$MGR" "$M").d"
+apex_member_lock_forget "$MGR" "$M"
+eq "nothing left behind" "" \
+	"$(print -r -- "$(apex_members_dir "$MGR")"/.*.lock*(N))"
 
 # ── merge_bump ───────────────────────────────────────────────────────
 # Every concurrent bump must get a number of its own: _cmd_event arms a settle
