@@ -653,7 +653,10 @@ _cmd_relink() {
 
 	old_key="${f:t:r}"
 	new_key="${session}:${pane}"
-	[[ $old_key != $new_key ]] && mv -f "$f" "$(apex_member_file "$manager" "$new_key")" 2>/dev/null
+	if [[ $old_key != $new_key ]]; then
+		mv -f "$f" "$(apex_member_file "$manager" "$new_key")" 2>/dev/null
+		apex_member_lock_forget "$manager" "$old_key"
+	fi
 
 	_refresh_agent_icons "$session"
 	tmux refresh-client -S 2>/dev/null
@@ -1397,11 +1400,10 @@ _pair_advance() {
 		local next=$(( round + 1 ))
 		# Write the partner's pair state *before* delivering, not after.
 		# Delivery wakes the partner agent, whose own `event set` merges
-		# {status,seq} into the same member file; apex_member_merge is a
-		# lock-free read-modify-write, so a write scheduled after the relay
-		# can lose the pair_turn flip to that agent's — and a lost flip is
-		# silent, not escalated: the partner's next idle falls through to
-		# the manager with a stale round counter.
+		# {status,seq} into the same member file. apex_member_merge now holds
+		# the record's mutex, so neither write can lose the other's fields;
+		# the ordering is kept anyway because it is the cheaper guarantee —
+		# the partner's write blocks rather than racing.
 		apex_member_merge "$manager" "$member" \
 			"$(jq -nc --argjson r "$next" '{pair_round:$r, pair_turn:"worker"}')"
 		apex_member_merge "$manager" "$pair" \
@@ -1662,8 +1664,6 @@ _cmd_event() {
 	_record_agent_session "$manager" "$session"
 
 	local seq st
-	seq=$(apex_member_bump_seq "$manager" "$session")
-
 	case "$verb" in
 		set)    st=working ;;
 		notify) st=attention ;;
@@ -1671,9 +1671,12 @@ _cmd_event() {
 		*)      return 0 ;;
 	esac
 
-	apex_member_merge "$manager" "$session" "$(jq -nc \
-		--arg st "$st" --argjson seq "$seq" --argjson t "$(date +%s)" \
-		'{status:$st, seq:$seq, updated_at:$t}')"
+	# Increment and claim seq in the same critical section as the status write:
+	# reading it first, then merging, let two concurrent hook processes claim the
+	# same number, and _settle below arms a callback keyed on it.
+	seq=$(apex_member_merge_bump "$manager" "$session" "$(jq -nc \
+		--arg st "$st" --argjson t "$(date +%s)" \
+		'{status:$st, updated_at:$t}')") || seq=""
 
 	case "$verb" in
 		notify)
@@ -1687,7 +1690,11 @@ _cmd_event() {
 			# session has actually settled: re-check the sequence number after a
 			# quiet window. run-shell -d defers inside the tmux server, so this
 			# outlives the short-lived hook process without a sleeping watcher.
-			tmux run-shell -b -d "$APEX_QUIET_SECS" \
+			#
+			# No seq means the bump above failed outright, and a callback keyed
+			# on nothing has nothing to confirm: skip it rather than arm it
+			# blank and rely on _cmd_settle's comparisons falling through.
+			[[ -n $seq ]] && tmux run-shell -b -d "$APEX_QUIET_SECS" \
 				"${SELF} _settle ${(q)session} ${(q)manager} ${seq}" 2>/dev/null
 			;;
 	esac
@@ -1828,7 +1835,7 @@ _cmd_pending() {
 	manager=$(_require_manager)
 	APEX_SESSION="$manager"
 
-	local s st seq pinged role task facts summary pair_msg
+	local s st seq rawseq pinged role task facts summary pair_msg
 	for s in ${(f)"$(apex_members "$manager")"}; do
 		[[ -z $s ]] && continue
 		st=$(apex_member_get "$manager" "$s" status)
@@ -1843,7 +1850,8 @@ _cmd_pending() {
 			[[ $st == idle || $st == attention ]] || continue
 		fi
 
-		seq=$(apex_member_get "$manager" "$s" seq); [[ -z $seq ]] && seq=0
+		rawseq=$(apex_member_get "$manager" "$s" seq)
+		seq=$rawseq; [[ -z $seq ]] && seq=0
 		pinged=$(apex_member_get "$manager" "$s" pinged_seq); [[ -z $pinged ]] && pinged=-1
 		(( seq == pinged )) && continue
 
@@ -1861,9 +1869,18 @@ _cmd_pending() {
 		# pair_message is a one-shot escalation, not a status field: clearing
 		# it on delivery keeps a later idle transition of the same member
 		# from re-reporting a resolved round as if it were fresh.
+		#
+		# Compare-and-set on seq, because this is the one writer whose
+		# correctness depends on a value it just read: if the member has
+		# transitioned since, marking that seq delivered would swallow a
+		# transition the manager never saw. A failed CAS re-reports the member
+		# (and, for a pair escalation, repeats it) on the next pull — the safe
+		# direction, and it self-heals in one round-trip.
 		if $mark; then
-			apex_member_merge "$manager" "$s" "$(jq -nc --argjson seq "$seq" '{pinged_seq:$seq}')"
-			[[ -n $pair_msg ]] && apex_member_merge "$manager" "$s" '{"pair_message":""}'
+			apex_member_merge_cas "$manager" "$s" "$(jq -nc \
+				--argjson seq "$seq" --arg msg "$pair_msg" \
+				'{pinged_seq:$seq} + (if $msg == "" then {} else {pair_message:""} end)')" \
+				seq "$rawseq" || true
 		fi
 	done
 }
@@ -2013,6 +2030,7 @@ _cmd_reap() {
 		fi
 
 		rm -f "$(apex_member_file "$manager" "$s")"
+		apex_member_lock_forget "$manager" "$s"
 		apex_event "$manager" "$(jq -nc --arg s "$s" '{event:"reap", session:$s}')"
 		print "Reaped $s"
 	done
@@ -2192,7 +2210,10 @@ _cmd_recover() {
 			"$model" "$perm" "$mode" "$agent" "$profile" "$issue" "$pr" "$sid" >/dev/null
 
 		local new_key="${session}:${pane}"
-		[[ $old_key != $new_key ]] && rm -f "$(apex_member_file "$manager" "$old_key")"
+		if [[ $old_key != $new_key ]]; then
+			rm -f "$(apex_member_file "$manager" "$old_key")"
+			apex_member_lock_forget "$manager" "$old_key"
+		fi
 
 		apex_event "$manager" "$(jq -nc --arg old "$old_key" --arg new "$new_key" \
 			--arg sid "$sid" --arg role "$role" \
