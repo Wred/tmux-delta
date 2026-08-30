@@ -138,13 +138,29 @@ case "$cmd" in
 		# that never drains (NEXT == TEXT), and a foreign draft that will not
 		# clear with our own relay then appended to it (NEXT holds ours).
 		# File-backed because the stub is a fresh process per call.
+		#
+		# STUB_PANE_BUSY adds a fourth shape: a trailing line that differs on
+		# every read, i.e. an agent mid-turn repainting a spinner while the box
+		# keeps our text. NEXT == TEXT alone is a byte-frozen pane, which the
+		# send path now reads as a genuine stall (issue #24), so a test that
+		# wants the busy reading has to say so.
+		busy_line() {
+			[[ -n ${STUB_PANE_BUSY:-} ]] || return 0
+			local n
+			n=$(( $(cat "$STUB_SENT.busy" 2>/dev/null || print 0) + 1 ))
+			print -n -- "$n" > "$STUB_SENT.busy"
+			print -r -- "esc to interrupt · $n tokens"
+		}
 		if [[ -e "$STUB_SENT.pt" ]]; then
 			[[ -n ${STUB_PANE_TEXT_NEXT:-} ]] && print -r -- "$STUB_PANE_TEXT_NEXT"
+			busy_line
 			exit 0
 		fi
-		[[ -n ${STUB_PANE_TEXT:-} ]] || exit 0
-		: > "$STUB_SENT.pt"
-		print -r -- "$STUB_PANE_TEXT"
+		if [[ -n ${STUB_PANE_TEXT:-} ]]; then
+			: > "$STUB_SENT.pt"
+			print -r -- "$STUB_PANE_TEXT"
+		fi
+		busy_line
 		exit 0
 		;;
 	has-session)  exit 0 ;;
@@ -194,7 +210,7 @@ reset() {
 	for a in "$@"; do
 		case "$a" in --no-link) nolink=true ;; --max=*) max="${a#--max=}" ;; esac
 	done
-	rm -rf "$XDG_CACHE_HOME" "$STUB_OPTS" "$STUB_PANES" "$STUB_SENT" "$STUB_GH" "$STUB_SENT.pt"
+	rm -rf "$XDG_CACHE_HOME" "$STUB_OPTS" "$STUB_PANES" "$STUB_SENT" "$STUB_GH" "$STUB_SENT.pt" "$STUB_SENT.busy"
 	mkdir -p "$MEMBERS"
 	: > "$STUB_OPTS"; : > "$STUB_SENT"; : > "$STUB_GH"
 	printf '%%1\n%%2\n' > "$STUB_PANES"
@@ -454,6 +470,59 @@ contains "with the _deliver return code" '"rc":5' "$(ev pair-relay-failed)"
 # starts foreign and then holds ours.
 contains "the pre-send box read is carried onto the event" "PAIRED REVIEW" \
 	"$(ev pair-relay-failed)"
+
+# ── a relay the send path could not confirm (issue #24) ──────────────
+# The send path no longer retypes into a pane that is visibly working, because
+# that is how the same instruction got delivered twice for real. It reports
+# delivered-by-inference instead, with APEX_SEND_UNCONFIRMED set. For a human
+# at a terminal that is fine — `send` prints a NOTE they can act on. Here there
+# is nobody to read it, and advancing pair_turn on an inference risks a loop
+# waiting forever on a partner that was never woken, with the rollback
+# machinery built for that case unreachable. So the relay demotes it to
+# undelivered and escalates, accepting a false alarm to avoid a silent
+# deadlock.
+print "\nan unconfirmed relay escalates rather than advancing the turn"
+reset --max=3
+verdict --findings 2 >/dev/null
+export STUB_PANE_TEXT='│ > [apex from:apex-pair] PAIRED REVIEW              │'
+export STUB_PANE_TEXT_NEXT="$STUB_PANE_TEXT"    # box never drains…
+export STUB_PANE_BUSY=1                         # …but the pane keeps repainting
+export APEX_SEND_SETTLE_TICKS=6
+settle "$REVIEWER" >/dev/null
+unset STUB_PANE_TEXT STUB_PANE_TEXT_NEXT STUB_PANE_BUSY APEX_SEND_SETTLE_TICKS
+eq "the loop is marked stuck" stuck "$(mget "$REVIEWER" pair_state)"
+contains "the stuck ping says the delivery was unconfirmed" \
+	"could not be confirmed" "$(apex pending)"
+eq "the round is rolled back" 1 "$(mget "$WORKER" pair_round)"
+eq "and the turn is not advanced" reviewer "$(mget "$WORKER" pair_turn)"
+# The event is the only surviving record on this path, and the whole
+# justification for reporting delivered-by-inference at all — so it is pinned,
+# jq program included: a typo there loses the entire event, not just the field.
+eq "the event marks it unconfirmed" true \
+	"$(print -r -- "$(ev pair-relay-failed)" | jq -r '.unconfirmed // false')"
+contains "and reports it as an unsubmitted-class failure" '"rc":5' \
+	"$(ev pair-relay-failed)"
+
+# The same pane, read by a human's `send`: delivered, with the NOTE and the
+# flag on the `send` event rather than an escalation.
+print "\nsend reports the same pane as delivered-but-unconfirmed"
+reset --max=3
+export STUB_PANE_TEXT='│ > [apex from:mgr] check the build                  │'
+export STUB_PANE_TEXT_NEXT="$STUB_PANE_TEXT"
+export STUB_PANE_BUSY=1
+export APEX_SEND_SETTLE_TICKS=6
+out=$(apex send "$WORKER" "check the build")
+unset STUB_PANE_TEXT STUB_PANE_TEXT_NEXT STUB_PANE_BUSY APEX_SEND_SETTLE_TICKS
+contains "send reports delivery" "Delivered to" "$out"
+contains "and notes that it was never observed" "never drained" "$out"
+eq "the send event marks it unconfirmed" true \
+	"$(print -r -- "$(ev send)" | jq -r '.unconfirmed // false')"
+# The ordinary case must not carry the field at all — an always-present
+# "unconfirmed" would be worthless to grep for.
+reset --max=3
+apex send "$WORKER" "check the build" >/dev/null
+eq "a confirmed send has no unconfirmed field" false \
+	"$(print -r -- "$(ev send)" | jq -r '.unconfirmed // false')"
 
 # ── the relay records what its pane-clearing discarded ───────────────
 # `_send_to_pane` fires C-e/C-u before typing (#12), and the contract for

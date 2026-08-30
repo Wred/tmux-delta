@@ -43,6 +43,10 @@ lacks() { if [[ $3 != *$2* ]]; then ok "$1"; else bad "$1" "expected NOT to cont
 #                   settle sleep exists for
 #   DROP_FIRST_ENTER  the first Enter is swallowed outright, forcing the retry
 #                   loop to be the thing that delivers
+#   BUSY            every capture-pane renders a different trailing line, i.e.
+#                   an agent mid-turn repainting a spinner/token counter. The
+#                   input box is untouched by it, so this models the issue #24
+#                   case: pane demonstrably active, box still showing our text
 BIN="$TMPROOT/bin"; mkdir -p "$BIN"
 cat > "$BIN/tmux" <<'STUB'
 #!/usr/bin/env zsh
@@ -55,7 +59,13 @@ drain() {
 	fi
 }
 case "$1" in
-	capture-pane) cat "$PANE_FILE" ;;
+	capture-pane)
+		cat "$PANE_FILE"
+		if [ -n "${BUSY:-}" ]; then
+			n=$(( $(cat "$BUSY_COUNT" 2>/dev/null || echo 0) + 1 ))
+			printf '%s' "$n" > "$BUSY_COUNT"
+			printf 'esc to interrupt - %s tokens\n' "$n"
+		fi ;;
 	send-keys)
 		shift
 		# Join first: ${*#pat} applies the pattern to each positional
@@ -93,6 +103,7 @@ chmod +x "$BIN/tmux"
 export PATH="$BIN:$PATH"
 export PANE_FILE="$TMPROOT/pane" KEYS_LOG="$TMPROOT/keys"
 export ENTER_COUNT="$TMPROOT/enters" PASTE_AT="$TMPROOT/paste-at"
+export BUSY_COUNT="$TMPROOT/busy"
 export EMPTY_BOX='│ >                                    │'
 
 # Source the script under test. Its dispatch prints usage when called with no
@@ -144,6 +155,13 @@ eq "prompt line above the 12-line window is ignored" "" "$(_pane_input_line %1)"
 
 print -r -- 'no prompt on this line at all' > "$PANE_FILE"
 eq "no prompt line reads as empty" "" "$(_pane_input_line %1)"
+
+# The parsing half, against a capture the caller already holds — this is what
+# the send verify loop calls, so that one capture answers both of its questions
+# instead of forking tmux twice per tick.
+eq "_box_line_of parses a capture the caller already has" "from a held capture" \
+	"$(_box_line_of "$(print -l -- 'some output' '│ > from a held capture   │')")"
+eq "_box_line_of on an empty capture reads as empty" "" "$(_box_line_of "")"
 
 # ── is our own line still pending? ───────────────────────────────────
 # Prefix, not suffix: a message wider than the box wraps and only its leading
@@ -254,6 +272,102 @@ rc=0
 _send_to_pane %1 "stuck message here" >/dev/null 2>&1 || rc=$?
 eq "box never drains: reports failure, not success" 2 "$rc"
 eq "box never drains: re-sends Enter three times" 4 "$(keys | grep -c Enter)"
+
+# ── pane active vs. pane idle (issue #24) ────────────────────────────
+# "Our text is still in the box after N seconds" does not mean the Enter was
+# swallowed — under a loaded turn the TUI can lag the repaint well past any
+# fixed timeout, and retyping there delivers the instruction twice for real.
+# The retry is therefore gated on the *whole pane* being static, not on the
+# clock: a pane that keeps repainting is an agent working on what we sent.
+print "\npane activity gate"
+
+unset DRAIN_ON_ENTER DRAIN_AT_ENTER DRAIN_DELAY
+export BUSY=1 APEX_SEND_SETTLE_TICKS=8
+: > "$BUSY_COUNT"
+pane '│ > busy agent message                 │'
+rc=0
+out=$(_send_to_pane %1 "busy agent message" 2>&1; print "rc=$?")
+contains "pane busy, box stale: reported as delivered" "rc=0" "$out"
+eq "pane busy, box stale: does not retype" 1 "$(keys | grep -c ' -l -- ')"
+eq "pane busy, box stale: fires exactly one Enter" 1 "$(keys | grep -c Enter)"
+contains "pane busy, box stale: says why it stopped" "issue #24" "$out"
+
+# The flag has to survive the call: it is what _cmd_send logs and prints.
+: > "$BUSY_COUNT"
+pane '│ > busy agent message                 │'
+_send_to_pane %1 "busy agent message" >/dev/null 2>&1 || true
+eq "pane busy, box stale: exports the unconfirmed flag" 1 "$APEX_SEND_UNCONFIRMED"
+
+# A busy pane whose box does drain mid-turn is an ordinary success, and must
+# not be reported as unconfirmed.
+export DRAIN_ON_ENTER=1 DRAIN_DELAY=0.5
+: > "$BUSY_COUNT"
+pane "$EMPTY_BOX"
+rc=0
+_send_to_pane %1 "slow repaint but it lands" >/dev/null 2>&1 || rc=$?
+eq "pane busy, box drains late: delivered" 0 "$rc"
+eq "pane busy, box drains late: not flagged unconfirmed" "" "$APEX_SEND_UNCONFIRMED"
+eq "pane busy, box drains late: does not retype" 1 "$(keys | grep -c ' -l -- ')"
+unset DRAIN_ON_ENTER DRAIN_DELAY
+
+# The genuine unsubmitted case is unchanged: nothing in the pane moves at all,
+# so the retry loop still runs and still refuses to claim delivery.
+unset BUSY
+pane '│ > truly stuck                        │'
+rc=0
+_send_to_pane %1 "truly stuck" >/dev/null 2>&1 || rc=$?
+eq "pane idle, box stale: still retries" 4 "$(keys | grep -c ' -l -- ')"
+eq "pane idle, box stale: still reports failure" 2 "$rc"
+unset APEX_SEND_SETTLE_TICKS
+
+# The knobs are clamped, not trusted. `local -i x=abc` is 0 in zsh with no
+# error, and a settle of 0 skips the poll loop entirely: nothing is read back,
+# no retry can fire, and every send reports delivered-but-unconfirmed forever.
+# A knob that silently disables the verification it exists to tune is the
+# failure this repo already guards against at the door for `watch`.
+#
+# Assert on APEX_SEND_UNCONFIRMED, not on stderr text: the flag is what
+# callers branch on, and it is the thing a broken clamp actually sets. Stderr
+# here belongs to _send_to_pane, whose wording ("still shows the sent text")
+# differs from the NOTE _cmd_send prints ("never drained") — matching the
+# wrong one gives an assertion that cannot fail. That means running the call
+# outside a subshell, so the flag survives, with stderr diverted to a file.
+export DRAIN_ON_ENTER=1
+ERRFILE="$TMPROOT/err"
+for bad_val in abc 0 -3; do
+	pane "$EMPTY_BOX"
+	rc=0
+	APEX_SEND_SETTLE_TICKS=$bad_val _send_to_pane %1 "do the thing" 2>"$ERRFILE" || rc=$?
+	eq "APEX_SEND_SETTLE_TICKS=$bad_val: still verifies and delivers" 0 "$rc"
+	contains "APEX_SEND_SETTLE_TICKS=$bad_val: says it fell back" "using 25" "$(cat "$ERRFILE")"
+	eq "APEX_SEND_SETTLE_TICKS=$bad_val: not reported as unconfirmed" \
+		"" "$APEX_SEND_UNCONFIRMED"
+	lacks "APEX_SEND_SETTLE_TICKS=$bad_val: does not claim a busy pane" \
+		"still shows the sent text" "$(cat "$ERRFILE")"
+	# The other half of "verification is off": with settle=0 the poll loop
+	# never runs, so a clamp on idle alone would fall straight through to
+	# three blind retypes of an already-delivered message — the duplicate
+	# this whole change exists to prevent. One literal send means the box was
+	# actually read back.
+	eq "APEX_SEND_SETTLE_TICKS=$bad_val: does not blind-retype" 1 \
+		"$(keys | grep -c ' -l -- ')"
+done
+pane "$EMPTY_BOX"
+rc=0
+APEX_SEND_IDLE_TICKS=abc _send_to_pane %1 "do the thing" 2>"$ERRFILE" || rc=$?
+contains "APEX_SEND_IDLE_TICKS=abc: falls back" "using 5" "$(cat "$ERRFILE")"
+eq "APEX_SEND_IDLE_TICKS=abc: still delivers" 0 "$rc"
+eq "APEX_SEND_IDLE_TICKS=abc: not reported as unconfirmed" "" "$APEX_SEND_UNCONFIRMED"
+
+# An idle threshold above the ceiling is unreachable, which disables the retry
+# by another route: clamp it to the ceiling instead.
+unset DRAIN_ON_ENTER
+pane '│ > stuck message here                 │'
+rc=0
+APEX_SEND_SETTLE_TICKS=3 APEX_SEND_IDLE_TICKS=99 \
+	_send_to_pane %1 "stuck message here" >/dev/null 2>&1 || rc=$?
+eq "idle above the ceiling still retries" 4 "$(keys | grep -c ' -l -- ')"
+eq "idle above the ceiling still reports failure" 2 "$rc"
 
 # ── the paste/Enter race, in the retry path too ──────────────────────
 # tmux wraps a literal send in bracketed paste and codex drops an Enter that
