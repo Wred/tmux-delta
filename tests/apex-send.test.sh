@@ -325,20 +325,39 @@ unset APEX_SEND_SETTLE_TICKS
 # no retry can fire, and every send reports delivered-but-unconfirmed forever.
 # A knob that silently disables the verification it exists to tune is the
 # failure this repo already guards against at the door for `watch`.
+#
+# Assert on APEX_SEND_UNCONFIRMED, not on stderr text: the flag is what
+# callers branch on, and it is the thing a broken clamp actually sets. Stderr
+# here belongs to _send_to_pane, whose wording ("still shows the sent text")
+# differs from the NOTE _cmd_send prints ("never drained") — matching the
+# wrong one gives an assertion that cannot fail. That means running the call
+# outside a subshell, so the flag survives, with stderr diverted to a file.
 export DRAIN_ON_ENTER=1
+ERRFILE="$TMPROOT/err"
 for bad_val in abc 0 -3; do
 	pane "$EMPTY_BOX"
 	rc=0
-	out=$(APEX_SEND_SETTLE_TICKS=$bad_val _send_to_pane %1 "do the thing" 2>&1; print "rc=$?")
-	contains "APEX_SEND_SETTLE_TICKS=$bad_val: still verifies and delivers" "rc=0" "$out"
-	contains "APEX_SEND_SETTLE_TICKS=$bad_val: says it fell back" "using 25" "$out"
-	lacks "APEX_SEND_SETTLE_TICKS=$bad_val: not reported as unconfirmed" \
-		"never drained" "$out"
+	APEX_SEND_SETTLE_TICKS=$bad_val _send_to_pane %1 "do the thing" 2>"$ERRFILE" || rc=$?
+	eq "APEX_SEND_SETTLE_TICKS=$bad_val: still verifies and delivers" 0 "$rc"
+	contains "APEX_SEND_SETTLE_TICKS=$bad_val: says it fell back" "using 25" "$(cat "$ERRFILE")"
+	eq "APEX_SEND_SETTLE_TICKS=$bad_val: not reported as unconfirmed" \
+		"" "$APEX_SEND_UNCONFIRMED"
+	lacks "APEX_SEND_SETTLE_TICKS=$bad_val: does not claim a busy pane" \
+		"still shows the sent text" "$(cat "$ERRFILE")"
+	# The other half of "verification is off": with settle=0 the poll loop
+	# never runs, so a clamp on idle alone would fall straight through to
+	# three blind retypes of an already-delivered message — the duplicate
+	# this whole change exists to prevent. One literal send means the box was
+	# actually read back.
+	eq "APEX_SEND_SETTLE_TICKS=$bad_val: does not blind-retype" 1 \
+		"$(keys | grep -c ' -l -- ')"
 done
 pane "$EMPTY_BOX"
-out=$(APEX_SEND_IDLE_TICKS=abc _send_to_pane %1 "do the thing" 2>&1; print "rc=$?")
-contains "APEX_SEND_IDLE_TICKS=abc: falls back" "using 5" "$out"
-contains "APEX_SEND_IDLE_TICKS=abc: still delivers" "rc=0" "$out"
+rc=0
+APEX_SEND_IDLE_TICKS=abc _send_to_pane %1 "do the thing" 2>"$ERRFILE" || rc=$?
+contains "APEX_SEND_IDLE_TICKS=abc: falls back" "using 5" "$(cat "$ERRFILE")"
+eq "APEX_SEND_IDLE_TICKS=abc: still delivers" 0 "$rc"
+eq "APEX_SEND_IDLE_TICKS=abc: not reported as unconfirmed" "" "$APEX_SEND_UNCONFIRMED"
 
 # An idle threshold above the ceiling is unreachable, which disables the retry
 # by another route: clamp it to the ceiling instead.
