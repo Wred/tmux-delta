@@ -212,6 +212,13 @@ _box_pending "half-written draftrun tests firstrun tests first" "run tests first
 	&& ok "spliced box: repeated retypes still read as pending" \
 	|| bad "spliced box: repeated retypes still read as pending" "returned false"
 
+# Stripping an empty sent-text never shortens the line, so the collapse above
+# must not be entered for one — it would spin forever. _send_to_pane refuses an
+# empty message before it gets here; this pins the function itself.
+_box_pending "half-written draftrun tests first" "" "half-written draft" \
+	&& bad "spliced box: an empty sent-text is not pending" "returned true" \
+	|| ok "spliced box: an empty sent-text is not pending"
+
 _box_pending "half-written draft" "run tests first" "half-written draft" \
 	&& bad "spliced box: residue alone means ours is gone" "returned true" \
 	|| ok "spliced box: residue alone means ours is gone"

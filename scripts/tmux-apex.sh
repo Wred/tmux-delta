@@ -298,9 +298,6 @@ _clear_pane_input() {
 _box_pending() {
 	local sent="$2" residue="${3:-}" left
 	left=${1#"$residue"}
-	# _pane_input_line trims, so a residue that ended in spaces was recorded
-	# without them while the box still renders them between it and our text.
-	# Drop that gap rather than let it fail the prefix test.
 	if [[ -n $residue ]]; then
 		# _pane_input_line trims, so a residue that ended in spaces was
 		# recorded without them while the box still renders them between it
@@ -311,7 +308,11 @@ _box_pending() {
 		# the repeats, or the second attempt onward reads as "not our text" and
 		# the stall is lost again. Only on this path: on a clean box, text
 		# beyond ours still means ours is gone.
-		while [[ $left == "$sent"?* ]]; do left=${left#"$sent"}; done
+		# Guarded on a non-empty $sent: stripping "" never shortens $left, so
+		# an empty sent-text would spin here forever.
+		if [[ -n $sent ]]; then
+			while [[ $left == "$sent"?* ]]; do left=${left#"$sent"}; done
+		fi
 	fi
 	[[ -n $left ]] || return 1
 	[[ $sent == "$left"* ]]
