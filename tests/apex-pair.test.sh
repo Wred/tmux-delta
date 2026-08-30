@@ -225,12 +225,11 @@ mget() { jq -r --arg k "$2" '.[$k] // "" | tostring' "$MEMBERS/$1.json" }
 
 # reset [--no-link] [--max N] — rebuild a clean two-member world.
 reset() {
-	rm -f "$STUB_SENT.pt" "$STUB_SENT.box" "$STUB_SENT.boxseed"
 	local nolink=false max=5 a
 	for a in "$@"; do
 		case "$a" in --no-link) nolink=true ;; --max=*) max="${a#--max=}" ;; esac
 	done
-	rm -rf "$XDG_CACHE_HOME" "$STUB_OPTS" "$STUB_PANES" "$STUB_SENT" "$STUB_GH" "$STUB_SENT.pt" "$STUB_SENT.box" "$STUB_SENT.boxseed" "$STUB_SENT.busy"
+	rm -rf "$XDG_CACHE_HOME" "$STUB_OPTS" "$STUB_PANES" "$STUB_SENT" "$STUB_GH" "$STUB_SENT.box" "$STUB_SENT.boxseed" "$STUB_SENT.busy"
 	mkdir -p "$MEMBERS"
 	: > "$STUB_OPTS"; : > "$STUB_SENT"; : > "$STUB_GH"
 	printf '%%1\n%%2\n' > "$STUB_PANES"

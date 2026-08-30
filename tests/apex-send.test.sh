@@ -40,6 +40,9 @@ lacks() { if [[ $3 != *$2* ]]; then ok "$1"; else bad "$1" "expected NOT to cont
 #                   that a single kill-to-start cannot deal with)
 #   SPLICE_RESIDUE  text a literal send gets appended to, so the box renders
 #                   `<residue><message>` — the splice NO_CLEAR produces
+#   BOX_WIDTH       the box renders only this many characters, i.e. a message
+#                   wider than the box, whose tail soft-wraps out of the one
+#                   line a pane read can see
 #   PASTE_WINDOW    an Enter arriving within this many seconds of the literal
 #                   send is dropped mid-paste — the codex behaviour the
 #                   settle sleep exists for
@@ -80,7 +83,12 @@ case "$1" in
 				# A literal send lands in the input box, unsubmitted. With
 				# SPLICE_RESIDUE set it lands *on top of* that text, which is
 				# what a box that would not clear really does to a send.
-				printf '\xe2\x94\x82 > %s%s   \xe2\x94\x82\n' "${SPLICE_RESIDUE:-}" "${args#*-l -- }" > "$PANE_FILE"
+				# BOX_WIDTH clips what the box renders, i.e. a message wider
+				# than the box: it soft-wraps and only the caret line is
+				# readable, so a pane read of a long message ends mid-message.
+				line="${SPLICE_RESIDUE:-}${args#*-l -- }"
+				[ -n "${BOX_WIDTH:-}" ] && line=${line[1,$BOX_WIDTH]}
+				printf '\xe2\x94\x82 > %s   \xe2\x94\x82\n' "$line" > "$PANE_FILE"
 				printf '%s' "${EPOCHREALTIME:-0}" > "$PASTE_AT" ;;
 			*Enter*)
 				n=$(( $(cat "$ENTER_COUNT" 2>/dev/null || echo 0) + 1 ))
@@ -342,6 +350,23 @@ eq "spliced and never submitted: still retries" 4 "$(keys | grep -c Enter)"
 eq "spliced and never submitted: reports what it spliced onto" \
 	"half-written human note" "$APEX_SEND_SPLICED"
 unset NO_CLEAR SPLICE_RESIDUE
+
+# Same again, but with a message wider than the box, which is the shape every
+# pair-relay message has. A pane read only ever returns the caret line, so the
+# box reads `<draft><start-of-message>` — and a retry that re-derived the
+# residue from that read would take our own half-typed message as residue,
+# strip it out of every later read, and report the send delivered (the round-2
+# review finding on PR #28). The residue recorded before typing is the only
+# one that survives soft-wrapping.
+export NO_CLEAR=1 SPLICE_RESIDUE='half-written human note' BOX_WIDTH=40
+pane '│ > half-written human note             │'
+rc=0
+_send_to_pane %1 "PAIRED REVIEW round 2: the reviewer on PR #28 recorded 2 finding(s) worth addressing." \
+	>/dev/null 2>&1 || rc=$?
+eq "wrapped and spliced, never submitted: reports failure" 2 "$rc"
+eq "wrapped and spliced, never submitted: retries all three times" 4 \
+	"$(keys | grep -c Enter)"
+unset NO_CLEAR SPLICE_RESIDUE BOX_WIDTH
 
 # ── pane active vs. pane idle (issue #24) ────────────────────────────
 # "Our text is still in the box after N seconds" does not mean the Enter was

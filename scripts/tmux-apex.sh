@@ -479,13 +479,18 @@ _send_to_pane() {
 				"a duplicate turn is worse than an unconfirmed one."
 			return 0
 		fi
-		# Re-read the residue for this attempt, and strip our own text back off
-		# it: when the retry's clear fails too, the box it reads is
-		# `<residue><text>` from the attempt before, and taking that whole thing
-		# as residue would strip our message out of every later box read and
-		# report the send delivered. A clear that succeeds leaves this empty.
-		residue=$(_clear_pane_input "$pane")
-		residue=${residue%"$text"}
+		# The only thing this attempt's clear can tell us about the residue is
+		# whether it is gone. It cannot re-derive it: the box read it returns is
+		# `<residue><text>` from the attempt before, truncated to the caret line,
+		# so for any message wider than the box it ends mid-message. Taking that
+		# as the residue would strip our own text out of every later box read —
+		# which reads as "our text is gone, so it was submitted" and puts issue
+		# #22 straight back for exactly the long relay messages that provoked
+		# it. So keep the residue recorded before we ever typed, and let
+		# _box_pending's collapse loop see past the copies stacked on it.
+		if [[ -z $(_clear_pane_input "$pane") ]]; then
+			residue=""
+		fi
 		tmux send-keys -t "$pane" -l -- "$text" || return 1
 		# Hazard 2 applies to the retype exactly as it does to the first
 		# send: without this gap every retry fires its Enter mid-paste, and
