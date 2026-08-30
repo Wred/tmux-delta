@@ -1,11 +1,20 @@
 name: tests
 
 on:
+  # PRs are covered once by `pull_request`; `push` is scoped to main so the
+  # merged tree is still verified without doubling every PR's checks.
   push:
+    branches: [main]
   pull_request:
 
 permissions:
   contents: read
+
+# Apex workers push repeatedly, and each push otherwise queues 8 more jobs.
+# Supersede rather than accumulate.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   test:
