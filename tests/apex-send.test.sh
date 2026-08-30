@@ -38,6 +38,8 @@ lacks() { if [[ $3 != *$2* ]]; then ok "$1"; else bad "$1" "expected NOT to cont
 #                   verify that reads the pane without waiting sees stale text
 #   NO_CLEAR        C-u does not empty the box (a cursor or multi-line draft
 #                   that a single kill-to-start cannot deal with)
+#   SPLICE_RESIDUE  text a literal send gets appended to, so the box renders
+#                   `<residue><message>` — the splice NO_CLEAR produces
 #   PASTE_WINDOW    an Enter arriving within this many seconds of the literal
 #                   send is dropped mid-paste — the codex behaviour the
 #                   settle sleep exists for
@@ -75,8 +77,10 @@ case "$1" in
 		printf '%s\n' "$args" >> "$KEYS_LOG"
 		case "$args" in
 			*"-l -- "*)
-				# A literal send lands in the input box, unsubmitted.
-				printf '\xe2\x94\x82 > %s   \xe2\x94\x82\n' "${args#*-l -- }" > "$PANE_FILE"
+				# A literal send lands in the input box, unsubmitted. With
+				# SPLICE_RESIDUE set it lands *on top of* that text, which is
+				# what a box that would not clear really does to a send.
+				printf '\xe2\x94\x82 > %s%s   \xe2\x94\x82\n' "${SPLICE_RESIDUE:-}" "${args#*-l -- }" > "$PANE_FILE"
 				printf '%s' "${EPOCHREALTIME:-0}" > "$PASTE_AT" ;;
 			*Enter*)
 				n=$(( $(cat "$ENTER_COUNT" 2>/dev/null || echo 0) + 1 ))
@@ -184,6 +188,41 @@ _box_pending "" "run tests first" \
 	&& bad "empty box is not pending" "returned true" \
 	|| ok "empty box is not pending"
 
+# A box that would not clear holds `<residue><message>`, so the prefix test
+# has to be told about the residue or every spliced send reads as submitted
+# and rc 2 becomes unreachable (issue #22).
+_box_pending "half-written draftrun tests first" "run tests first" "half-written draft" \
+	&& ok "spliced box: known residue is stripped before the prefix test" \
+	|| bad "spliced box: known residue is stripped before the prefix test" "returned false"
+
+_box_pending "half-written draftrun tests fi" "run tests first" "half-written draft" \
+	&& ok "spliced box: still prefix, so a wrapped spliced line counts" \
+	|| bad "spliced box: still prefix, so a wrapped spliced line counts" "returned false"
+
+# _pane_input_line trims, so a draft ending in a space is recorded without it
+# while the box still shows the gap before our text.
+_box_pending "half-written draft run tests first" "run tests first" "half-written draft" \
+	&& ok "spliced box: a trimmed trailing space in the residue is tolerated" \
+	|| bad "spliced box: a trimmed trailing space in the residue is tolerated" "returned false"
+
+# A retype into a box that will not clear appends, so the box holds our text
+# twice over by the second attempt — still a stall, not "our text is gone".
+_box_pending "half-written draftrun tests firstrun tests first" "run tests first" \
+	"half-written draft" \
+	&& ok "spliced box: repeated retypes still read as pending" \
+	|| bad "spliced box: repeated retypes still read as pending" "returned false"
+
+_box_pending "half-written draft" "run tests first" "half-written draft" \
+	&& bad "spliced box: residue alone means ours is gone" "returned true" \
+	|| ok "spliced box: residue alone means ours is gone"
+
+# Residue is a known, recorded prefix — not licence to match anywhere. An
+# autosuggestion quoting our text back under some *other* prefix must still
+# read as gone, which is what rules substring matching out.
+_box_pending "something elserun tests first" "run tests first" "half-written draft" \
+	&& bad "unknown prefix is not our text pending" "returned true" \
+	|| ok "unknown prefix is not our text pending"
+
 # ── delivery ─────────────────────────────────────────────────────────
 print "\ndelivery"
 
@@ -231,13 +270,21 @@ eq "empty message is refused" 1 "$rc"
 # C-u kills to the start of the line, so it leaves anything right of the
 # cursor and clears one line of a multi-line draft. Saying "cleared" when the
 # box did not drain is worse than the old honest append, so say what happened.
-export NO_CLEAR=1
+export NO_CLEAR=1 SPLICE_RESIDUE='mark ready for review '
 pane '│ > mark ready for review               │'
 out=$(_send_to_pane %1 "run tests first" 2>&1; print "rc=$?")
 contains "box refuses to clear: still delivers" "rc=0" "$out"
 contains "box refuses to clear: says so" "did not clear" "$out"
 contains "box refuses to clear: names what it will splice onto" "mark ready for review" "$out"
-unset NO_CLEAR
+
+# Splice plus a submit that lands is not a delivery failure: the message did
+# go in, garbled onto the draft, and the event log is where that is recorded.
+# Only APEX_SEND_SPLICED says so — the return code must stay 0.
+pane '│ > mark ready for review               │'
+_send_to_pane %1 "run tests first" >/dev/null 2>&1
+eq "spliced but submitted: exports what it spliced onto" "mark ready for review" \
+	"$APEX_SEND_SPLICED"
+unset NO_CLEAR SPLICE_RESIDUE
 
 # ── retries must not submit whatever the box happens to hold ─────────
 # A bare Enter as a retry submits the box's current contents. After a
@@ -272,6 +319,22 @@ rc=0
 _send_to_pane %1 "stuck message here" >/dev/null 2>&1 || rc=$?
 eq "box never drains: reports failure, not success" 2 "$rc"
 eq "box never drains: re-sends Enter three times" 4 "$(keys | grep -c Enter)"
+
+# The same swallowed Enter, but onto a box that would not clear, so the box
+# reads `<draft><message>`. The prefix check used to fail on that at the very
+# first read and conclude our text was gone, i.e. submitted — which made rc 2
+# unreachable on every spliced path and reported a garbled, unsent message as
+# delivered (issue #22). The residue recorded before typing is stripped before
+# the check, so a stalled splice now fails like a stalled clean send does.
+export NO_CLEAR=1 SPLICE_RESIDUE='half-written human note '
+pane '│ > half-written human note             │'
+rc=0
+_send_to_pane %1 "PAIRED REVIEW round 2" >/dev/null 2>&1 || rc=$?
+eq "spliced and never submitted: reports failure, not success" 2 "$rc"
+eq "spliced and never submitted: still retries" 4 "$(keys | grep -c Enter)"
+eq "spliced and never submitted: reports what it spliced onto" \
+	"half-written human note" "$APEX_SEND_SPLICED"
+unset NO_CLEAR SPLICE_RESIDUE
 
 # ── pane active vs. pane idle (issue #24) ────────────────────────────
 # "Our text is still in the box after N seconds" does not mean the Enter was

@@ -60,6 +60,22 @@ _set() {  # _set <scope> <key> <value>
 	print -r -- "$1	$2	$3" >> "$STUB_OPTS"
 }
 
+# The input box's live contents. Seeded from $STUB_PANE_TEXT and re-seeded
+# whenever that changes, so a fixture set between two `settle` runs takes
+# effect rather than inheriting the box the previous test left behind.
+box_read() {
+	if [[ -e "$STUB_SENT.box" ]] &&
+		[[ "$(cat "$STUB_SENT.boxseed" 2>/dev/null)" == "${STUB_PANE_TEXT:-}" ]]; then
+		cat "$STUB_SENT.box"
+	else
+		print -r -- "${STUB_PANE_TEXT:-}"
+	fi
+}
+box_write() {
+	print -r -- "$1" > "$STUB_SENT.box"
+	print -r -- "${STUB_PANE_TEXT:-}" > "$STUB_SENT.boxseed"
+}
+
 cmd="$1"; shift
 case "$cmd" in
 	display-message)
@@ -122,28 +138,38 @@ case "$cmd" in
 			case "$1" in
 				-t) target="$2"; shift 2 ;;
 				-l|--) shift ;;
-				Enter) shift ;;
+				# Submitting empties the box, unless the test is modelling a
+				# swallowed Enter.
+				Enter) [[ -n ${STUB_PANE_NO_DRAIN:-} ]] || box_write ""; shift ;;
 				# Key names, not text: cursor/kill keys from _clear_pane_input.
-				C-e|C-u) shift ;;
-				*) print -r -- "$target	$1" >> "$STUB_SENT"; shift ;;
+				C-e) shift ;;
+				C-u) [[ -n ${STUB_PANE_NO_CLEAR:-} ]] || box_write ""; shift ;;
+				# Literal text lands in the box, appended to whatever survived
+				# clearing — the splice.
+				*) print -r -- "$target	$1" >> "$STUB_SENT"
+				   box_write "$(box_read)$1"; shift ;;
 			esac
 		done
 		;;
-	# Empty unless a test opts in, so `send` sees a drained input box and
-	# _send_to_pane confirms submission (the ordinary case here).
+	# The input box is real state, not a canned pair of reads: $STUB_SENT.box
+	# holds its current contents, C-u empties it, a literal send appends to
+	# whatever is there, and Enter empties it. That is what lets one fixture
+	# distinguish the shapes the delivery code cares about — a box that drains,
+	# one that will not (STUB_PANE_NO_DRAIN), and a draft that will not clear
+	# so our text is spliced onto it (STUB_PANE_NO_CLEAR). Canned reads could
+	# not: the residue the splice check strips is read *before* we type, and a
+	# stub that cannot tell before from after has to answer both with one
+	# string (issue #22).
+	#
+	# STUB_PANE_TEXT is the box's initial contents, bare text — the stub draws
+	# the frame. File-backed because the stub is a fresh process per call.
+	#
+	# STUB_PANE_BUSY adds an orthogonal shape: a trailing line that differs on
+	# every read, i.e. an agent mid-turn repainting a spinner while the box
+	# keeps our text. A frozen box alone is a byte-frozen pane, which the send
+	# path reads as a genuine stall (issue #24), so a test that wants the busy
+	# reading has to say so.
 	capture-pane)
-		# STUB_PANE_TEXT is the first read; STUB_PANE_TEXT_NEXT (default
-		# empty) is every read after it. That pair covers all three shapes
-		# the delivery code cares about: a box that drains (NEXT empty), one
-		# that never drains (NEXT == TEXT), and a foreign draft that will not
-		# clear with our own relay then appended to it (NEXT holds ours).
-		# File-backed because the stub is a fresh process per call.
-		#
-		# STUB_PANE_BUSY adds a fourth shape: a trailing line that differs on
-		# every read, i.e. an agent mid-turn repainting a spinner while the box
-		# keeps our text. NEXT == TEXT alone is a byte-frozen pane, which the
-		# send path now reads as a genuine stall (issue #24), so a test that
-		# wants the busy reading has to say so.
 		busy_line() {
 			[[ -n ${STUB_PANE_BUSY:-} ]] || return 0
 			local n
@@ -151,15 +177,9 @@ case "$cmd" in
 			print -n -- "$n" > "$STUB_SENT.busy"
 			print -r -- "esc to interrupt · $n tokens"
 		}
-		if [[ -e "$STUB_SENT.pt" ]]; then
-			[[ -n ${STUB_PANE_TEXT_NEXT:-} ]] && print -r -- "$STUB_PANE_TEXT_NEXT"
-			busy_line
-			exit 0
-		fi
-		if [[ -n ${STUB_PANE_TEXT:-} ]]; then
-			: > "$STUB_SENT.pt"
-			print -r -- "$STUB_PANE_TEXT"
-		fi
+		local box
+		box=$(box_read)
+		[[ -n $box ]] && print -r -- "│ > ${box}   │"
 		busy_line
 		exit 0
 		;;
@@ -205,12 +225,12 @@ mget() { jq -r --arg k "$2" '.[$k] // "" | tostring' "$MEMBERS/$1.json" }
 
 # reset [--no-link] [--max N] — rebuild a clean two-member world.
 reset() {
-	rm -f "$STUB_SENT.pt"
+	rm -f "$STUB_SENT.pt" "$STUB_SENT.box" "$STUB_SENT.boxseed"
 	local nolink=false max=5 a
 	for a in "$@"; do
 		case "$a" in --no-link) nolink=true ;; --max=*) max="${a#--max=}" ;; esac
 	done
-	rm -rf "$XDG_CACHE_HOME" "$STUB_OPTS" "$STUB_PANES" "$STUB_SENT" "$STUB_GH" "$STUB_SENT.pt" "$STUB_SENT.busy"
+	rm -rf "$XDG_CACHE_HOME" "$STUB_OPTS" "$STUB_PANES" "$STUB_SENT" "$STUB_GH" "$STUB_SENT.pt" "$STUB_SENT.box" "$STUB_SENT.boxseed" "$STUB_SENT.busy"
 	mkdir -p "$MEMBERS"
 	: > "$STUB_OPTS"; : > "$STUB_SENT"; : > "$STUB_GH"
 	printf '%%1\n%%2\n' > "$STUB_PANES"
@@ -449,10 +469,10 @@ print "\nan unsubmitted relay escalates and does not consume a round"
 reset --max=3
 verdict --findings 2 >/dev/null
 # A static box still showing our own text: the submit check never clears.
-export STUB_PANE_TEXT='│ > [apex from:apex-pair] PAIRED REVIEW              │'
-export STUB_PANE_TEXT_NEXT="$STUB_PANE_TEXT"    # never drains
+export STUB_PANE_TEXT='[apex from:apex-pair] PAIRED REVIEW'
+export STUB_PANE_NO_DRAIN=1                     # Enter is swallowed
 settle "$REVIEWER" >/dev/null
-unset STUB_PANE_TEXT STUB_PANE_TEXT_NEXT
+unset STUB_PANE_TEXT STUB_PANE_NO_DRAIN
 eq "loop is marked stuck" stuck "$(mget "$REVIEWER" pair_state)"
 contains "the stuck ping names the unsent text, not a dead pane" \
 	"sitting unsent in the input box" "$(apex pending)"
@@ -484,12 +504,12 @@ contains "the pre-send box read is carried onto the event" "PAIRED REVIEW" \
 print "\nan unconfirmed relay escalates rather than advancing the turn"
 reset --max=3
 verdict --findings 2 >/dev/null
-export STUB_PANE_TEXT='│ > [apex from:apex-pair] PAIRED REVIEW              │'
-export STUB_PANE_TEXT_NEXT="$STUB_PANE_TEXT"    # box never drains…
+export STUB_PANE_TEXT='[apex from:apex-pair] PAIRED REVIEW'
+export STUB_PANE_NO_DRAIN=1                     # box never drains…
 export STUB_PANE_BUSY=1                         # …but the pane keeps repainting
 export APEX_SEND_SETTLE_TICKS=6
 settle "$REVIEWER" >/dev/null
-unset STUB_PANE_TEXT STUB_PANE_TEXT_NEXT STUB_PANE_BUSY APEX_SEND_SETTLE_TICKS
+unset STUB_PANE_TEXT STUB_PANE_NO_DRAIN STUB_PANE_BUSY APEX_SEND_SETTLE_TICKS
 eq "the loop is marked stuck" stuck "$(mget "$REVIEWER" pair_state)"
 contains "the stuck ping says the delivery was unconfirmed" \
 	"could not be confirmed" "$(apex pending)"
@@ -507,12 +527,12 @@ contains "and reports it as an unsubmitted-class failure" '"rc":5' \
 # flag on the `send` event rather than an escalation.
 print "\nsend reports the same pane as delivered-but-unconfirmed"
 reset --max=3
-export STUB_PANE_TEXT='│ > [apex from:mgr] check the build                  │'
-export STUB_PANE_TEXT_NEXT="$STUB_PANE_TEXT"
+export STUB_PANE_TEXT='[apex from:mgr] check the build'
+export STUB_PANE_NO_DRAIN=1
 export STUB_PANE_BUSY=1
 export APEX_SEND_SETTLE_TICKS=6
 out=$(apex send "$WORKER" "check the build")
-unset STUB_PANE_TEXT STUB_PANE_TEXT_NEXT STUB_PANE_BUSY APEX_SEND_SETTLE_TICKS
+unset STUB_PANE_TEXT STUB_PANE_NO_DRAIN STUB_PANE_BUSY APEX_SEND_SETTLE_TICKS
 contains "send reports delivery" "Delivered to" "$out"
 contains "and notes that it was never observed" "never drained" "$out"
 eq "the send event marks it unconfirmed" true \
@@ -537,7 +557,7 @@ reset --max=3
 verdict --findings 2 >/dev/null
 # The box drains after the first read, so _send_to_pane confirms submission —
 # a successful relay that still discarded a draft to make room for itself.
-export STUB_PANE_TEXT='│ > half-written note                        │'
+export STUB_PANE_TEXT='half-written note'
 settle "$REVIEWER" >/dev/null
 unset STUB_PANE_TEXT
 eq "the relay succeeded" 2 "$(mget "$WORKER" pair_round)"
@@ -550,23 +570,25 @@ contains "and still recorded the discarded draft" "half-written note" \
 # discard — the worse outcome reading as the benign one, on the path where the
 # stderr line that distinguishes them is unread by design. (PR #13 round 4.)
 #
-# Note what this case does *not* do: it does not fail. The submit check cannot
-# detect a splice, so the loop cannot escalate on one. The event is the only
-# place a splice is visible at all, which is why it is asserted rather than the
-# return code.
+# Note what this case does *not* do: it does not fail. The Enter landed — the
+# message went in, garbled onto the draft — and a splice that submits is not a
+# delivery failure. Escalating on the splice itself would let unsent text in
+# any worker pane halt an autonomous loop, so the splice stays record-only and
+# the event is the only place it is visible. A splice whose Enter is *swallowed*
+# is a different case, and does escalate — see below (issue #22).
 print "\na relay that spliced says so instead of claiming a clear"
 reset --max=3
 verdict --findings 2 >/dev/null
-# Foreign draft first, then our own text appended to it and never submitted.
-export STUB_PANE_TEXT='│ > half-written human note                   │'
-export STUB_PANE_TEXT_NEXT='│ > half-written human note[apex from:apex-pair] PAIRED REVIEW │'
+# A foreign draft that will not clear, so our own text is appended to it. The
+# Enter still lands, so the garbled line is genuinely submitted.
+export STUB_PANE_TEXT='half-written human note'
+export STUB_PANE_NO_CLEAR=1                     # …and it will not clear
 settle "$REVIEWER" >/dev/null
-unset STUB_PANE_TEXT STUB_PANE_TEXT_NEXT
-# The relay *succeeds*: _box_pending is a prefix check on our own text, and a
-# box holding `<draft><relay>` is not prefixed by `<relay>`, so the submit
-# check reads it as gone. The round advances, the loop stays healthy, and the
-# worker is now acting on a garbled line. Nothing about the delivery's return
-# value can say so — which is the whole argument for the event key.
+unset STUB_PANE_TEXT STUB_PANE_NO_CLEAR
+# The relay *succeeds*: the box drained, so the submit check is satisfied and
+# rightly so. The round advances, the loop stays healthy, and the worker is now
+# acting on a garbled line. Nothing about the delivery's return code can say
+# so — which is the whole argument for the event key.
 eq "the relay is reported as delivered" 2 "$(mget "$WORKER" pair_round)"
 eq "and the loop stays active" active "$(mget "$WORKER" pair_state)"
 contains "the event names what it spliced onto" "spliced_onto" \
@@ -576,10 +598,34 @@ contains "and quotes the draft it garbled" "half-written human note" \
 contains "with the pre-send read recorded too" "half-written human note" \
 	"$(print -r -- "$(ev pair-relay)" | jq -r '.cleared_input')"
 
+# A splice whose Enter is swallowed is an unsubmitted relay, and escalates like
+# any other. It used to report success: the box read `<draft><relay>`, the
+# prefix check saw text that was not ours, concluded ours had been submitted,
+# and the round advanced on a message the worker never received (issue #22).
+# The residue recorded before typing is stripped before that check, so the
+# stall is visible again — and the escalation comes through the existing
+# unsubmitted path, not a new splice-specific one.
+print "\na spliced relay that never submits escalates like any other"
+reset --max=3
+verdict --findings 2 >/dev/null
+export STUB_PANE_TEXT='half-written human note'
+export STUB_PANE_NO_CLEAR=1                     # …will not clear…
+export STUB_PANE_NO_DRAIN=1                     # …and the Enter is swallowed
+settle "$REVIEWER" >/dev/null
+unset STUB_PANE_TEXT STUB_PANE_NO_CLEAR STUB_PANE_NO_DRAIN
+eq "the loop is marked stuck" stuck "$(mget "$REVIEWER" pair_state)"
+contains "the stuck ping names the unsent text" \
+	"sitting unsent in the input box" "$(apex pending)"
+eq "the round is rolled back" 1 "$(mget "$WORKER" pair_round)"
+contains "the failure is logged" '"event":"pair-relay-failed"' \
+	"$(ev pair-relay-failed)"
+contains "and still names what it spliced onto" "half-written human note" \
+	"$(print -r -- "$(ev pair-relay-failed)" | jq -r '.spliced_onto // ""')"
+
 print "\na drained box reports cleared, never spliced"
 reset --max=3
 verdict --findings 2 >/dev/null
-export STUB_PANE_TEXT='│ > a draft that does drain                   │'
+export STUB_PANE_TEXT='a draft that does drain'
 settle "$REVIEWER" >/dev/null
 unset STUB_PANE_TEXT
 eq "no spliced_onto when the clear took" "" \

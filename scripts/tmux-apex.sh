@@ -275,8 +275,8 @@ _clear_pane_input() {
 	print -r -- "$still"
 }
 
-# _box_pending <box-line> <sent-text> — is <box-line> our own line still
-# sitting unsent, rather than something else the pane has since drawn?
+# _box_pending <box-line> <sent-text> [residue] — is <box-line> our own line
+# still sitting unsent, rather than something else the pane has since drawn?
 #
 # True when the box shows the whole line or the leading part of it. Prefix,
 # not suffix: a line wider than the box soft-wraps and _pane_input_line only
@@ -284,8 +284,35 @@ _clear_pane_input() {
 # there at all and matching on it would pass unconditionally, checking
 # nothing. Anything else in the box is somebody else's text — a repainted
 # suggestion, a human's draft — which means ours is gone.
+#
+# <residue> is text the caller already knows was in the box and would not
+# clear, so our message got typed onto the end of it and the box reads
+# `<residue><message>`. Strip it and the prefix test works on the remainder
+# as if the box had been clean. Without that, a spliced send fails the prefix
+# test on its very first read, the retry loop concludes "our text is gone, so
+# it was submitted", and rc 2 — typed but never submitted — is unreachable on
+# every spliced path (issue #22). Note this is a *known* residue, recorded
+# before we typed: a substring match would find our text under an unknown
+# prefix too, but it also matches an autosuggestion that quotes us back and
+# gives up the soft-wrap protection the prefix direction exists for.
 _box_pending() {
-	local left="$1" sent="$2"
+	local sent="$2" residue="${3:-}" left
+	left=${1#"$residue"}
+	# _pane_input_line trims, so a residue that ended in spaces was recorded
+	# without them while the box still renders them between it and our text.
+	# Drop that gap rather than let it fail the prefix test.
+	if [[ -n $residue ]]; then
+		# _pane_input_line trims, so a residue that ended in spaces was
+		# recorded without them while the box still renders them between it
+		# and our text. Drop that gap rather than let it fail the prefix test.
+		while [[ $left == ' '* ]]; do left=${left# }; done
+		# A retype into a box that will not clear appends rather than replaces,
+		# so after N attempts the box holds `<residue><text><text>…`. Collapse
+		# the repeats, or the second attempt onward reads as "not our text" and
+		# the stall is lost again. Only on this path: on a clean box, text
+		# beyond ours still means ours is gone.
+		while [[ $left == "$sent"?* ]]; do left=${left#"$sent"}; done
+	fi
 	[[ -n $left ]] || return 1
 	[[ $sent == "$left"* ]]
 }
@@ -393,7 +420,11 @@ _send_to_pane() {
 	# retyping into that is the duplicate. Wait such a pane out to the
 	# ceiling and, if the box never drains, report delivery as unconfirmed
 	# (APEX_SEND_UNCONFIRMED) rather than sending it again.
-	local left i j sig sig0
+	# Residue tracks what the box still holds *under* our text, so the pending
+	# check below can see past it. It starts as whatever clearing failed to
+	# drain and is re-read on every retype, because a retry's own clear may
+	# well succeed where the first attempt's did not.
+	local left i j sig sig0 residue="$APEX_SEND_SPLICED"
 	local -i static
 	# Clamped, not trusted. `local -i x=abc` is 0 with no error in zsh, and a
 	# settle of 0 skips the poll loop entirely: nothing is ever read back, so
@@ -428,7 +459,7 @@ _send_to_pane() {
 			# same instant — see _box_line_of.
 			sig=$(_pane_activity_sig "$pane" 2>/dev/null)
 			left=$(_box_line_of "$sig")
-			_box_pending "$left" "$text" || return 0
+			_box_pending "$left" "$text" "$residue" || return 0
 			if [[ $sig == "$sig0" ]]; then
 				(( static += 1 ))
 				(( static >= idle )) && break
@@ -447,7 +478,13 @@ _send_to_pane() {
 				"a duplicate turn is worse than an unconfirmed one."
 			return 0
 		fi
-		_clear_pane_input "$pane" >/dev/null
+		# Re-read the residue for this attempt, and strip our own text back off
+		# it: when the retry's clear fails too, the box it reads is
+		# `<residue><text>` from the attempt before, and taking that whole thing
+		# as residue would strip our message out of every later box read and
+		# report the send delivered. A clear that succeeds leaves this empty.
+		residue=$(_clear_pane_input "$pane")
+		residue=${residue%"$text"}
 		tmux send-keys -t "$pane" -l -- "$text" || return 1
 		# Hazard 2 applies to the retype exactly as it does to the first
 		# send: without this gap every retry fires its Enter mid-paste, and
@@ -460,7 +497,7 @@ _send_to_pane() {
 	# or a send that succeeded on the last retry gets reported as a failure.
 	sleep 1
 	left=$(_pane_input_line "$pane" 2>/dev/null)
-	_box_pending "$left" "$text" && return 2
+	_box_pending "$left" "$text" "$residue" && return 2
 	return 0
 }
 

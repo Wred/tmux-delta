@@ -661,6 +661,15 @@ key rather than reading identically to a clean discard. Filter on
 `spliced_onto` first: `cleared_input` alone is only a clean discard when
 `spliced_onto` is absent. `send` reports both the same way.
 
+A splice does not by itself count as a failed delivery — the message did go in,
+garbled onto the draft — so it is recorded and nothing escalates on it. The
+submit check does see past it, though: because the box reads
+`<draft><message>`, it is told what the draft was and strips it before matching
+its own text, so a spliced delivery whose Enter was *swallowed* reports as
+unsubmitted like any other rather than as a success (issue #22). Before that,
+the mismatch read as "our text is gone, so it was submitted", and a garbled,
+unsent relay advanced the round.
+
 `status` lists any unsent text it finds in member input boxes, with the caveat
 attached: it is usually the agent's own autosuggestion rather than a failed
 delivery or stray injection, which is otherwise impossible to tell apart from
