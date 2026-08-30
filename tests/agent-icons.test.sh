@@ -61,6 +61,26 @@ esac
 case "$1" in
 	set-option) echo "set-option $*" >> "$STUB_LOG"; exit 0 ;;
 	refresh-client) exit 0 ;;
+	show-options)
+		# `show-options -p -t <pane>` lists only the options set on the pane
+		# itself — no session fallback. agent-icons-refresh.sh uses that to tell
+		# a real member from a pane that merely inherited the manager
+		# session's @apex_role. Panes listed in $STUB_INHERITED_PANES model the
+		# inherited-only case; every other pane owns its role locally.
+		if [[ "$*" == *" -p "* ]]; then
+			pane=""
+			prev=""
+			for arg in "$@"; do
+				[[ "$prev" == "-t" ]] && pane="$arg"
+				prev="$arg"
+			done
+			for skip in ${STUB_INHERITED_PANES:-}; do
+				[[ "$skip" == "$pane" ]] && exit 0
+			done
+			role=$(printf '%s\n' "$STUB_PANES" | awk -F'|' -v p="$pane" '$1 == p { print $2; exit }')
+			[[ -n "$role" ]] && echo "@apex_role $role"
+		fi
+		exit 0 ;;
 esac
 case "$*" in
 	*@tmux_delta_agent_icons_max*) printf '%s\n' "$STUB_MAX" ;;
@@ -78,7 +98,7 @@ export PATH="$BIN:$PATH" TMUX=fake-socket LC_ALL=en_US.UTF-8
 export STUB_LOG="$TMPROOT/tmux.log"
 export STUB_SESSION=work STUB_SESSIONS=work STUB_PREV="" STUB_PREV_OUTLINE=""
 export STUB_SESS_WORKING="" STUB_SESS_ATTENTION="" STUB_MAX="" STUB_WINDOW_PANES=""
-export STUB_AGENT_CMDS=""
+export STUB_AGENT_CMDS="" STUB_INHERITED_PANES=""
 
 # icons <panes...> — runs the script and prints the @agent_icons value written
 # (empty when the script wrote nothing).
@@ -139,6 +159,19 @@ contains "a launching apex member shows before its first hook event" "$IDLE" "$o
 # check applies — otherwise an exited agent would keep an idle robot forever.
 out=$(icons '%1|worker|1|||zsh')
 eq "a reported-in apex member at a shell is dropped" "" "$out"
+
+# tmux's pane->session option fallback means `list-panes -F '#{@apex_role}'`
+# reports the manager session's role for every pane in it, including plain
+# shells. Only a pane carrying its own local @apex_role counts as a member.
+STUB_INHERITED_PANES='%1'
+out=$(icons '%1|manager||||zsh')
+eq "a pane that only inherited the session's @apex_role is ignored" "" "$out"
+
+# ...and presence still stands on its own: the inherited role is discarded,
+# but a hook that fired in this pane is direct evidence of an agent.
+out=$(icons '%1|manager|1||')
+contains "an inherited role still yields an icon when the pane reported in" "$IDLE" "$out"
+STUB_INHERITED_PANES=""
 
 # Panes without agents are ignored, not counted.
 out=$(icons '%1|worker|1||' '%2||||')

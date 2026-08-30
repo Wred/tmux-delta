@@ -1,0 +1,57 @@
+name: tests
+
+on:
+  # PRs are covered once by `pull_request`; `push` is scoped to main so the
+  # merged tree is still verified without doubling every PR's checks.
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+# Apex workers push repeatedly, and each push otherwise queues 8 more jobs.
+# Supersede rather than accumulate.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: ${{ matrix.suite }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        # One job per suite: apex-pair alone runs for minutes, and a matrix
+        # names the failing suite directly in the checks UI.
+        suite:
+          - agent-icons
+          - apex-delivery
+          - apex-lock
+          - apex-pair
+          - apex-recover
+          - apex-send
+          - apex-watch
+          - status-format
+    steps:
+      - uses: actions/checkout@v4
+
+      # Every suite is `#!/usr/bin/env zsh` and uses zsh-only syntax
+      # (${0:A:h:h}, setopt err_return, ${(qqq)…}, ${(f)…}) — bash is not a
+      # fallback. jq parses the apex state fixtures. tmux is not strictly
+      # needed (each suite puts a stub tmux on PATH) but the scripts probe for
+      # the real binary in places, so install it rather than depend on that.
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y zsh tmux jq
+
+      # en_US.UTF-8 — agent-icons compares Nerd Font glyphs, which need a
+      # UTF-8 locale for zsh's pattern matching to line up.
+      - name: Generate en_US.UTF-8 locale
+        run: sudo locale-gen en_US.UTF-8
+
+      - name: tests/${{ matrix.suite }}.test.sh
+        run: zsh tests/${{ matrix.suite }}.test.sh
