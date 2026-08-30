@@ -43,6 +43,10 @@ lacks() { if [[ $3 != *$2* ]]; then ok "$1"; else bad "$1" "expected NOT to cont
 #                   settle sleep exists for
 #   DROP_FIRST_ENTER  the first Enter is swallowed outright, forcing the retry
 #                   loop to be the thing that delivers
+#   BUSY            every capture-pane renders a different trailing line, i.e.
+#                   an agent mid-turn repainting a spinner/token counter. The
+#                   input box is untouched by it, so this models the issue #24
+#                   case: pane demonstrably active, box still showing our text
 BIN="$TMPROOT/bin"; mkdir -p "$BIN"
 cat > "$BIN/tmux" <<'STUB'
 #!/usr/bin/env zsh
@@ -55,7 +59,13 @@ drain() {
 	fi
 }
 case "$1" in
-	capture-pane) cat "$PANE_FILE" ;;
+	capture-pane)
+		cat "$PANE_FILE"
+		if [ -n "${BUSY:-}" ]; then
+			n=$(( $(cat "$BUSY_COUNT" 2>/dev/null || echo 0) + 1 ))
+			printf '%s' "$n" > "$BUSY_COUNT"
+			printf 'esc to interrupt - %s tokens\n' "$n"
+		fi ;;
 	send-keys)
 		shift
 		# Join first: ${*#pat} applies the pattern to each positional
@@ -93,6 +103,7 @@ chmod +x "$BIN/tmux"
 export PATH="$BIN:$PATH"
 export PANE_FILE="$TMPROOT/pane" KEYS_LOG="$TMPROOT/keys"
 export ENTER_COUNT="$TMPROOT/enters" PASTE_AT="$TMPROOT/paste-at"
+export BUSY_COUNT="$TMPROOT/busy"
 export EMPTY_BOX='│ >                                    │'
 
 # Source the script under test. Its dispatch prints usage when called with no
@@ -254,6 +265,53 @@ rc=0
 _send_to_pane %1 "stuck message here" >/dev/null 2>&1 || rc=$?
 eq "box never drains: reports failure, not success" 2 "$rc"
 eq "box never drains: re-sends Enter three times" 4 "$(keys | grep -c Enter)"
+
+# ── pane active vs. pane idle (issue #24) ────────────────────────────
+# "Our text is still in the box after N seconds" does not mean the Enter was
+# swallowed — under a loaded turn the TUI can lag the repaint well past any
+# fixed timeout, and retyping there delivers the instruction twice for real.
+# The retry is therefore gated on the *whole pane* being static, not on the
+# clock: a pane that keeps repainting is an agent working on what we sent.
+print "\npane activity gate"
+
+unset DRAIN_ON_ENTER DRAIN_AT_ENTER DRAIN_DELAY
+export BUSY=1 APEX_SEND_SETTLE_TICKS=8
+: > "$BUSY_COUNT"
+pane '│ > busy agent message                 │'
+rc=0
+out=$(_send_to_pane %1 "busy agent message" 2>&1; print "rc=$?")
+contains "pane busy, box stale: reported as delivered" "rc=0" "$out"
+eq "pane busy, box stale: does not retype" 1 "$(keys | grep -c ' -l -- ')"
+eq "pane busy, box stale: fires exactly one Enter" 1 "$(keys | grep -c Enter)"
+contains "pane busy, box stale: says why it stopped" "issue #24" "$out"
+
+# The flag has to survive the call: it is what _cmd_send logs and prints.
+: > "$BUSY_COUNT"
+pane '│ > busy agent message                 │'
+_send_to_pane %1 "busy agent message" >/dev/null 2>&1 || true
+eq "pane busy, box stale: exports the unconfirmed flag" 1 "$APEX_SEND_UNCONFIRMED"
+
+# A busy pane whose box does drain mid-turn is an ordinary success, and must
+# not be reported as unconfirmed.
+export DRAIN_ON_ENTER=1 DRAIN_DELAY=0.5
+: > "$BUSY_COUNT"
+pane "$EMPTY_BOX"
+rc=0
+_send_to_pane %1 "slow repaint but it lands" >/dev/null 2>&1 || rc=$?
+eq "pane busy, box drains late: delivered" 0 "$rc"
+eq "pane busy, box drains late: not flagged unconfirmed" "" "$APEX_SEND_UNCONFIRMED"
+eq "pane busy, box drains late: does not retype" 1 "$(keys | grep -c ' -l -- ')"
+unset DRAIN_ON_ENTER DRAIN_DELAY
+
+# The genuine unsubmitted case is unchanged: nothing in the pane moves at all,
+# so the retry loop still runs and still refuses to claim delivery.
+unset BUSY
+pane '│ > truly stuck                        │'
+rc=0
+_send_to_pane %1 "truly stuck" >/dev/null 2>&1 || rc=$?
+eq "pane idle, box stale: still retries" 4 "$(keys | grep -c ' -l -- ')"
+eq "pane idle, box stale: still reports failure" 2 "$rc"
+unset APEX_SEND_SETTLE_TICKS
 
 # ── the paste/Enter race, in the retry path too ──────────────────────
 # tmux wraps a literal send in bracketed paste and codex drops an Enter that
