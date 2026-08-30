@@ -156,6 +156,13 @@ eq "prompt line above the 12-line window is ignored" "" "$(_pane_input_line %1)"
 print -r -- 'no prompt on this line at all' > "$PANE_FILE"
 eq "no prompt line reads as empty" "" "$(_pane_input_line %1)"
 
+# The parsing half, against a capture the caller already holds — this is what
+# the send verify loop calls, so that one capture answers both of its questions
+# instead of forking tmux twice per tick.
+eq "_box_line_of parses a capture the caller already has" "from a held capture" \
+	"$(_box_line_of "$(print -l -- 'some output' '│ > from a held capture   │')")"
+eq "_box_line_of on an empty capture reads as empty" "" "$(_box_line_of "")"
+
 # ── is our own line still pending? ───────────────────────────────────
 # Prefix, not suffix: a message wider than the box wraps and only its leading
 # part is readable, so a tail match would pass without checking anything.
@@ -312,6 +319,36 @@ _send_to_pane %1 "truly stuck" >/dev/null 2>&1 || rc=$?
 eq "pane idle, box stale: still retries" 4 "$(keys | grep -c ' -l -- ')"
 eq "pane idle, box stale: still reports failure" 2 "$rc"
 unset APEX_SEND_SETTLE_TICKS
+
+# The knobs are clamped, not trusted. `local -i x=abc` is 0 in zsh with no
+# error, and a settle of 0 skips the poll loop entirely: nothing is read back,
+# no retry can fire, and every send reports delivered-but-unconfirmed forever.
+# A knob that silently disables the verification it exists to tune is the
+# failure this repo already guards against at the door for `watch`.
+export DRAIN_ON_ENTER=1
+for bad_val in abc 0 -3; do
+	pane "$EMPTY_BOX"
+	rc=0
+	out=$(APEX_SEND_SETTLE_TICKS=$bad_val _send_to_pane %1 "do the thing" 2>&1; print "rc=$?")
+	contains "APEX_SEND_SETTLE_TICKS=$bad_val: still verifies and delivers" "rc=0" "$out"
+	contains "APEX_SEND_SETTLE_TICKS=$bad_val: says it fell back" "using 25" "$out"
+	lacks "APEX_SEND_SETTLE_TICKS=$bad_val: not reported as unconfirmed" \
+		"never drained" "$out"
+done
+pane "$EMPTY_BOX"
+out=$(APEX_SEND_IDLE_TICKS=abc _send_to_pane %1 "do the thing" 2>&1; print "rc=$?")
+contains "APEX_SEND_IDLE_TICKS=abc: falls back" "using 5" "$out"
+contains "APEX_SEND_IDLE_TICKS=abc: still delivers" "rc=0" "$out"
+
+# An idle threshold above the ceiling is unreachable, which disables the retry
+# by another route: clamp it to the ceiling instead.
+unset DRAIN_ON_ENTER
+pane '│ > stuck message here                 │'
+rc=0
+APEX_SEND_SETTLE_TICKS=3 APEX_SEND_IDLE_TICKS=99 \
+	_send_to_pane %1 "stuck message here" >/dev/null 2>&1 || rc=$?
+eq "idle above the ceiling still retries" 4 "$(keys | grep -c ' -l -- ')"
+eq "idle above the ceiling still reports failure" 2 "$rc"
 
 # ── the paste/Enter race, in the retry path too ──────────────────────
 # tmux wraps a literal send in bracketed paste and codex drops an Enter that

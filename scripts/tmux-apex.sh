@@ -205,16 +205,28 @@ _apex_utf8_locale() {
 #     with no box at all (a bare `❯ ` prompt) still work, they just have no
 #     frame to disambiguate with.
 _pane_input_line() {
+	local pane="$1" cap
+	[[ -n $pane ]] || return 1
+	cap=$(tmux capture-pane -p -t "$pane" 2>/dev/null) || return 1
+	_box_line_of "$cap"
+}
+
+# _box_line_of <capture> — _pane_input_line's parsing half, against a capture
+# the caller already has. Split out so the send verify loop can answer both of
+# its questions ("is our text still in the box", "has the pane changed at
+# all") from one capture: it used to fork tmux twice per tick, which is 50
+# forks per attempt at the default ceiling and — less obviously — sampled the
+# two facts milliseconds apart, giving them one more way to disagree about the
+# same moment.
+_box_line_of() {
 	setopt localoptions extendedglob
 	# Scoped to this function; zsh calls setlocale() on assignment, and the
 	# restore on return puts back whatever the caller had.
 	local -x LC_ALL
 	LC_ALL=$(_apex_utf8_locale)
 	[[ -z $LC_ALL ]] && unset LC_ALL
-	local pane="$1" cap line text
+	local cap="$1" line text
 	local boxed="" boxed_seen="" bare=""
-	[[ -n $pane ]] || return 1
-	cap=$(tmux capture-pane -p -t "$pane" 2>/dev/null) || return 1
 	local -a lines=(${(f)cap})
 	(( ${#lines} > 12 )) && lines=(${lines[-12,-1]})
 	for line in $lines; do
@@ -383,7 +395,28 @@ _send_to_pane() {
 	# (APEX_SEND_UNCONFIRMED) rather than sending it again.
 	local left i j sig sig0
 	local -i static
-	local -i settle=${APEX_SEND_SETTLE_TICKS:-25} idle=${APEX_SEND_IDLE_TICKS:-5}
+	# Clamped, not trusted. `local -i x=abc` is 0 with no error in zsh, and a
+	# settle of 0 skips the poll loop entirely: nothing is ever read back, so
+	# every send reports delivered-but-unconfirmed forever and no retry can
+	# fire. A knob that silently turns off the verification it exists to tune
+	# is the failure this repo already guards against at the door for `watch`
+	# (see _apex_watch_check_knobs). Warn rather than _die: this is a library
+	# function on the delivery path, and refusing to send is worse than
+	# sending with the documented defaults.
+	local -i settle idle
+	settle=${APEX_SEND_SETTLE_TICKS:-25}
+	idle=${APEX_SEND_IDLE_TICKS:-5}
+	if (( settle < 1 )); then
+		print -u2 "tmux-apex: APEX_SEND_SETTLE_TICKS='${APEX_SEND_SETTLE_TICKS}' is not a positive integer; using 25"
+		settle=25
+	fi
+	if (( idle < 1 )); then
+		print -u2 "tmux-apex: APEX_SEND_IDLE_TICKS='${APEX_SEND_IDLE_TICKS}' is not a positive integer; using 5"
+		idle=5
+	fi
+	# An idle threshold above the ceiling can never be reached, which is the
+	# settle=0 failure by another route: no retry could ever fire.
+	(( idle > settle )) && idle=$settle
 	for i in 1 2 3; do
 		# Re-snapshot per attempt, after that attempt's Enter: the retype's
 		# own repaint is our doing, not the agent's activity.
@@ -391,10 +424,12 @@ _send_to_pane() {
 		static=0
 		for (( j = 1; j <= settle; j++ )); do
 			sleep 0.2
-			left=$(_pane_input_line "$pane" 2>/dev/null)
+			# One capture answers both questions, and answers them about the
+			# same instant — see _box_line_of.
+			sig=$(_pane_activity_sig "$pane" 2>/dev/null)
+			left=$(_box_line_of "$sig")
 			_box_pending "$left" "$text" || return 0
-			sig=$(_pane_activity_sig "$pane")
-			if [[ $sig == $sig0 ]]; then
+			if [[ $sig == "$sig0" ]]; then
 				(( static += 1 ))
 				(( static >= idle )) && break
 			else
@@ -407,7 +442,7 @@ _send_to_pane() {
 			# stop, instead of guessing and risking a second real turn.
 			APEX_SEND_UNCONFIRMED=1
 			print -u2 "tmux-apex: pane $pane still shows the sent text after" \
-				"$(( settle / 5 ))s, but has been repainting throughout —"
+				"$(printf '%.1f' $(( settle * 0.2 )))s, but has been repainting throughout —"
 			print -u2 "  treating it as delivered rather than retyping (issue #24);" \
 				"a duplicate turn is worse than an unconfirmed one."
 			return 0
@@ -1126,6 +1161,13 @@ _send_native() {
 # input box, so an operator has something to act on, and `send` reports that
 # rather than a flat failure. Non-interactive callers (the pair loop) still
 # treat it as undelivered — an unsubmitted relay never wakes the partner.
+#
+# rc 0 has one soft edge: it also covers "typed, submitted, and the box never
+# observably drained because the pane stayed busy the whole time" (issue #24),
+# which is delivered by inference rather than by observation. Callers that
+# cannot tolerate an inference must check APEX_SEND_UNCONFIRMED — _pair_relay
+# does, and demotes it to undelivered, because on that path nobody would ever
+# read the NOTE `send` prints.
 _DELIVER_VIA=""
 _deliver() {
 	local target="$1" from="$2" text="$3"
@@ -1316,12 +1358,28 @@ _pair_relay() {
 		 + (if $cleared != "" then {cleared_input:$cleared} else {} end)
 		 + (if $spliced != "" then {spliced_onto:$spliced} else {} end)
 		 + (if $unconf != "" then {unconfirmed:true} else {} end)')
+	# An unconfirmed send (_send_to_pane returned 0 without ever seeing the box
+	# drain, because the pane stayed busy) is delivered-enough for a human at a
+	# terminal: `send` prints a NOTE and they can look. Here there is nobody to
+	# look. Advancing pair_turn on it would hand the loop a state where it
+	# waits forever on a partner that may never have been woken, and the
+	# rollback machinery built for exactly that case would be unreachable — so
+	# treat it as undelivered, the same as rc 5, and let the escalation put a
+	# human on it. The cost is a false alarm when the Enter did land; the cost
+	# of the other choice is a silent deadlock, which nothing recovers from.
+	if (( rc == 0 )) && [[ -n ${APEX_SEND_UNCONFIRMED:-} ]]; then
+		rc=5
+		_PAIR_RELAY_WHY="delivery to that pane could not be confirmed: the pane stayed busy and the relay never left its input box"
+		ev=$(print -r -- "$ev" | jq -c '. + {rc:5}')
+	fi
 	if (( rc )); then
-		case $rc in
-			5) _PAIR_RELAY_WHY="the relay was typed into that pane but never submitted; it is sitting unsent in the input box" ;;
-			2|3) _PAIR_RELAY_WHY="no reachable coding agent in that pane" ;;
-			*) _PAIR_RELAY_WHY="delivery to that pane failed" ;;
-		esac
+		if [[ -z $_PAIR_RELAY_WHY ]]; then
+			case $rc in
+				5) _PAIR_RELAY_WHY="the relay was typed into that pane but never submitted; it is sitting unsent in the input box" ;;
+				2|3) _PAIR_RELAY_WHY="no reachable coding agent in that pane" ;;
+				*) _PAIR_RELAY_WHY="delivery to that pane failed" ;;
+			esac
+		fi
 		apex_event "$manager" \
 			"$(print -r -- "$ev" | jq -c '{event:"pair-relay-failed"} + .')"
 		return 1
