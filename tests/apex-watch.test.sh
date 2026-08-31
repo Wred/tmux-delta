@@ -135,6 +135,52 @@ eq "a pair escalation is reported even mid-turn" "w:%7#4!" "$(_apex_pending_sig 
 member 'w:%7' idle 4 3
 eq "the escalation marker distinguishes the fingerprint" "w:%7#4" "$(_apex_pending_sig "$MGR")"
 
+# ── the gate and `pending` must agree, exhaustively ──────────────────
+# The invariant the watcher rests on: it nudges exactly when `pending` has
+# something to say. Nothing used to assert that. The decision was written twice
+# — here in jq, and in `_cmd_pending` in shell — and the two drifted, so the
+# gate returned empty while `pending` reported READY FOR HUMAN REVIEW and the
+# handoff was suppressed for as long as nobody looked (issue #23).
+#
+# `_cmd_pending` now shares this file's `reportable` definition, so the two
+# cannot disagree about the predicate by construction. They still *enumerate*
+# members differently — one jq over all files vs. one read per member — which
+# is exactly the kind of difference a shared definition does not cover, so the
+# agreement is asserted directly over every state either one distinguishes.
+print "\npending and the gate agree"
+
+# _cmd_pending reaches for the manager and for per-member git/PR facts; neither
+# is what is under test here, and the stub tmux answers show-option with "".
+_require_manager() { print -r -- "$MGR" }
+
+pending_reports() {  # 1 if `pending` emits a line for w:%7, else 0
+	[[ $(_cmd_pending 2>/dev/null) == *'session=w:%7'* ]] && print 1 || print 0
+}
+gate_reports() {     # 1 if the cheap gate fingerprints w:%7, else 0
+	[[ $(_apex_pending_sig "$MGR" 2>/dev/null) == *'w:%7'* ]] && print 1 || print 0
+}
+
+typeset -a DISAGREE=()
+typeset -i REPORTED=0 CHECKED=0
+for st in idle attention working starting; do
+	for seqs in '4 3' '4 4'; do
+		for pm in '' 'READY FOR HUMAN REVIEW'; do
+			reset
+			member 'w:%7' "$st" ${=seqs} "$pm"
+			p=$(pending_reports); g=$(gate_reports)
+			(( CHECKED += 1 ))
+			(( REPORTED += p ))
+			[[ $p == "$g" ]] || DISAGREE+=("status=$st seq/pinged='$seqs' pair_message='${pm:-<none>}': pending=$p gate=$g")
+		done
+	done
+done
+
+eq "every member state agrees between pending and the gate" "" "${(j:; :)DISAGREE}"
+# Both answering "no" everywhere would satisfy the agreement check while
+# asserting nothing, so pin that the matrix actually exercises both answers.
+eq "…over all 16 states"          16 "$CHECKED"
+eq "…and some of them do report"   6 "$REPORTED"
+
 # Still one-shot. seq is the delivery ledger for escalations too, so a message
 # left in the record after delivery must not re-report forever.
 member 'w:%7' working 4 4 'READY FOR HUMAN REVIEW'
