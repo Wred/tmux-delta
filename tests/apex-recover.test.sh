@@ -658,11 +658,12 @@ GBIN="$TMPROOT/realbin"; mkdir -p "$GBIN"
 REAL_GIT=$(PATH="/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin" whence -p git)
 ln -sf "$REAL_GIT" "$GBIN/git"
 
-facts_for() {  # facts_for <worktree> <dirty-bool>
-	jq -nc --arg wt "$1" --argjson d "$2" '{worktree:$wt, dirty:$d, commits_ahead:0}'
+facts_for() {  # facts_for <worktree> <dirty-bool> [pr-state]
+	jq -nc --arg wt "$1" --argjson d "$2" --arg ps "${3:-}" \
+		'{worktree:$wt, dirty:$d, commits_ahead:0, pr_state:$ps}'
 }
 
-risk() { PATH="$GBIN:$PATH" _reap_risk "$(facts_for "$1" "$2")" }
+risk() { PATH="$GBIN:$PATH" _reap_risk "$(facts_for "$1" "$2" "${3:-}")" }
 
 # A bare "remote" plus a clone whose one commit is pushed: nothing to lose.
 REMOTE="$TMPROOT/remote.git"
@@ -704,6 +705,100 @@ eq "a missing worktree is not held back" "" "$(risk "$TMPROOT/wt/vanished" false
 NOTREPO="$TMPROOT/wt/notrepo"; mkdir -p "$NOTREPO"
 contains "an unreadable worktree fails closed" "could not read git state" \
 	"$(risk "$NOTREPO" false)"
+
+# ── the narrow-refspec case (issue #31) ──────────────────────────────
+# `HEAD --not --remotes` reads local remote-tracking refs, not the remote. With
+# remote.origin.fetch narrowed to one branch — the configuration this was found
+# under — no origin/<worker-branch> ref is ever created, so a fully pushed
+# branch still counts every one of its commits as unpushed. The guard then holds
+# every worker forever, which is indistinguishable from having no guard, because
+# the operator learns to pass --force.
+print "\nreap guard under a narrow fetch refspec"
+NARROW="$TMPROOT/wt/narrow"
+PATH="$GBIN:$PATH" git clone -q "$REMOTE" "$NARROW" 2>/dev/null
+(
+	cd "$NARROW" || exit
+	export PATH="$GBIN:$PATH"
+	git config user.email t@t; git config user.name t
+	# The whole point: only main is ever fetched into a tracking ref.
+	git config remote.origin.fetch '+refs/heads/main:refs/remotes/origin/main'
+	git checkout -qb narrowbranch
+	print work > n; git add n; git commit -qm "pushed on a narrow refspec"
+	git push -q origin narrowbranch
+	git fetch -q origin
+) >/dev/null 2>&1
+
+# Premise first: the old signal really is wrong here, not merely unhelpful.
+# Without this the test below could pass because nothing was pushed at all.
+eq "the local view really does call the pushed branch unpushed" 1 \
+	"$(PATH="$GBIN:$PATH" git -C "$NARROW" rev-list --count HEAD --not --remotes 2>/dev/null)"
+eq "…and no tracking ref for it was ever created" "" \
+	"$(PATH="$GBIN:$PATH" git -C "$NARROW" rev-parse --verify --quiet refs/remotes/origin/narrowbranch 2>/dev/null)"
+eq "a pushed branch with no tracking ref is safe to reap" "" "$(risk "$NARROW" false)"
+# The dirty signal is independent and must still fire — it is the check doing
+# most of the real protecting, and the one reap cannot recover from.
+contains "…but uncommitted changes there still hold it back" \
+	"uncommitted changes" "$(risk "$NARROW" true)"
+
+# ── the squash-merged case (issue #31) ───────────────────────────────
+# A squash merge rewrites the commits, so the branch's own commits are
+# unreachable from any remote ref *by construction* — permanently, no matter how
+# the refspec is configured. Only content survives the rewrite, so a merged PR
+# whose tree matches the base has nothing left to lose.
+print "\nreap guard after a squash merge"
+MERGED_WT="$TMPROOT/wt/merged"
+PATH="$GBIN:$PATH" git clone -q "$REMOTE" "$MERGED_WT" 2>/dev/null
+(
+	cd "$MERGED_WT" || exit
+	export PATH="$GBIN:$PATH"
+	git config user.email t@t; git config user.name t
+	git config remote.origin.fetch '+refs/heads/main:refs/remotes/origin/main'
+	git checkout -qb mergedbranch
+	print feature > m; git add m; git commit -qm "the work"
+	git push -q origin mergedbranch
+) >/dev/null 2>&1
+# Squash it into main the way GitHub would, from a separate clone, then drop the
+# branch on the remote — so the worktree keeps commits nothing can reach.
+SQUASHER="$TMPROOT/squasher"
+PATH="$GBIN:$PATH" git clone -q "$REMOTE" "$SQUASHER" 2>/dev/null
+(
+	cd "$SQUASHER" || exit
+	export PATH="$GBIN:$PATH"
+	git config user.email t@t; git config user.name t
+	git checkout -q main
+	git merge -q --squash origin/mergedbranch
+	git commit -qm "the work (#1)"
+	git push -q origin main
+	git push -q origin --delete mergedbranch
+) >/dev/null 2>&1
+PATH="$GBIN:$PATH" git -C "$MERGED_WT" fetch -q origin 2>/dev/null
+
+# Premises: the commits really are unreachable, and the content really is in.
+eq "the merged branch's commits are unreachable from any remote ref" 1 \
+	"$(PATH="$GBIN:$PATH" git -C "$MERGED_WT" rev-list --count HEAD --not --remotes 2>/dev/null)"
+eq "…and its tree is identical to the base" "" \
+	"$(PATH="$GBIN:$PATH" git -C "$MERGED_WT" diff --name-only refs/remotes/origin/main HEAD 2>/dev/null)"
+
+eq "a merged PR whose content is in the base is safe to reap" "" \
+	"$(risk "$MERGED_WT" false MERGED)"
+
+# The content check is gated on the PR being merged, and that gate carries
+# weight: tree-equals-base on an open PR means the worker has not started, which
+# is not the same thing as its work being preserved. Fail closed.
+contains "the same tree on an open PR still holds" "1 unpushed commit(s)" \
+	"$(risk "$MERGED_WT" false OPEN)"
+contains "…and so does an unknown PR state" "1 unpushed commit(s)" \
+	"$(risk "$MERGED_WT" false)"
+
+# A merged PR the worker then kept working on is not safe: the extra commit is
+# content the base has never seen, which is the case this whole guard exists for.
+(
+	cd "$MERGED_WT" || exit
+	export PATH="$GBIN:$PATH"
+	print more > extra; git add extra; git commit -qm "kept going after the merge"
+) >/dev/null 2>&1
+contains "work added after the merge still holds it back" "unpushed commit(s)" \
+	"$(risk "$MERGED_WT" false MERGED)"
 
 # ─── 10. the guard where it actually matters: inside `reap` ──────────
 #
