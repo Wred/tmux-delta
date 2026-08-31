@@ -676,6 +676,13 @@ PATH="$GBIN:$PATH" git clone -q "$REMOTE" "$CLEAN" 2>/dev/null
 	git config user.email t@t; git config user.name t
 	print pushed > f; git add f; git commit -qm pushed; git push -q origin HEAD:main
 ) >/dev/null 2>&1
+# `git init --bare` points HEAD at init.defaultBranch, which is not the same
+# everywhere — main on this author's machine, master on the CI runner. Cloning a
+# bare repo whose HEAD names a ref that does not exist leaves an *unborn* branch
+# and no checkout, so the fixtures below quietly built root commits unrelated to
+# main and `merge --squash` died on unrelated histories. Say which branch is the
+# remote's default instead of inheriting an opinion from the environment.
+PATH="$GBIN:$PATH" git -C "$REMOTE" symbolic-ref HEAD refs/heads/main
 
 eq "a clean, fully pushed member is safe to reap" "" "$(risk "$CLEAN" false)"
 
@@ -722,11 +729,17 @@ PATH="$GBIN:$PATH" git clone -q "$REMOTE" "$NARROW" 2>/dev/null
 	git config user.email t@t; git config user.name t
 	# The whole point: only main is ever fetched into a tracking ref.
 	git config remote.origin.fetch '+refs/heads/main:refs/remotes/origin/main'
-	git checkout -qb narrowbranch
+	git checkout -qb narrowbranch origin/main
 	print work > n; git add n; git commit -qm "pushed on a narrow refspec"
 	git push -q origin narrowbranch
 	git fetch -q origin
 ) >/dev/null 2>&1
+
+# A fixture built on a root commit would make every count below an artefact of
+# the setup rather than a fact about the code, and it fails silently — so assert
+# the branch descends from the base before reading anything off it.
+eq "the narrow fixture's branch descends from main" 0 \
+	"$(PATH="$GBIN:$PATH" git -C "$NARROW" rev-list --count refs/remotes/origin/main --not HEAD 2>/dev/null)"
 
 # Premise first: the old signal really is wrong here, not merely unhelpful.
 # Without this the test below could pass because nothing was pushed at all.
@@ -753,10 +766,13 @@ PATH="$GBIN:$PATH" git clone -q "$REMOTE" "$MERGED_WT" 2>/dev/null
 	export PATH="$GBIN:$PATH"
 	git config user.email t@t; git config user.name t
 	git config remote.origin.fetch '+refs/heads/main:refs/remotes/origin/main'
-	git checkout -qb mergedbranch
+	git checkout -qb mergedbranch origin/main
 	print feature > m; git add m; git commit -qm "the work"
 	git push -q origin mergedbranch
 ) >/dev/null 2>&1
+eq "the merged fixture's branch descends from main before the squash" 0 \
+	"$(PATH="$GBIN:$PATH" git -C "$MERGED_WT" rev-list --count refs/remotes/origin/main --not HEAD 2>/dev/null)"
+
 # Squash it into main the way GitHub would, from a separate clone, then drop the
 # branch on the remote — so the worktree keeps commits nothing can reach.
 SQUASHER="$TMPROOT/squasher"
