@@ -2107,9 +2107,10 @@ _cmd_pending() {
 # session-scoped, a server crash marks every member dead and one `reap --yes`
 # takes the whole team's uncommitted work at once.
 _reap_risk() {
-	local facts="$1" wt dirty
+	local facts="$1" wt dirty pr_state
 	wt=$(printf '%s' "$facts" | jq -r '.worktree')
 	dirty=$(printf '%s' "$facts" | jq -r '.dirty')
+	pr_state=$(printf '%s' "$facts" | jq -r '.pr_state // "" | ascii_upcase')
 	# No worktree left means there is nothing to lose — that is `reap`'s job.
 	[[ -z $wt || ! -d $wt ]] && return 0
 
@@ -2119,10 +2120,55 @@ _reap_risk() {
 	# Deliberately not .commits_ahead: that is @{upstream}-relative, and a
 	# branch that was never pushed has no upstream, so rev-list fails and the
 	# count reads 0 — precisely the member whose work reap would destroy.
-	# `HEAD --not --remotes` asks the question that actually matters: is any of
-	# this reachable from a remote ref?
-	local unpushed
-	unpushed=$(git -C "$wt" rev-list --count HEAD --not --remotes 2>/dev/null) || unpushed=""
+	#
+	# `HEAD --not --remotes` was the replacement, and it asks a question one
+	# step removed from the one that matters: it consults *local
+	# remote-tracking refs*, not the remote. Where remote.origin.fetch is
+	# narrowed to a single branch — as it is in the repo this was found in — no
+	# origin/<worker-branch> ref is ever created, so every commit on every
+	# worker branch counts as unpushed forever, including after its PR merged.
+	# A guard that HOLDs unconditionally is not a guard; it is noise that
+	# trains you to pass --force (issue #31).
+	#
+	# So ask the remote. `reap` is explicitly invoked, destructive, and
+	# irreversible, which is exactly the budget one ls-remote is worth. When it
+	# cannot answer — offline, no such branch — fall back to the local view,
+	# which errs toward holding.
+	#
+	# Every git call below is guarded. This function is also eval'd into the
+	# test suite's shell, which runs under `err_return`, where an unguarded
+	# failing command substitution returns from the function *before it can
+	# report anything* — a guard that silently answers "safe to reap" on the
+	# exact input it exists to refuse. Found that way, not reasoned about.
+	local unpushed="" branch="" remote_sha=""
+	branch=$(git -C "$wt" symbolic-ref --short HEAD 2>/dev/null) || branch=""
+	if [[ -n $branch ]]; then
+		remote_sha=$(git -C "$wt" ls-remote origin "refs/heads/${branch}" 2>/dev/null | cut -f1) || remote_sha=""
+	fi
+	if [[ -n $remote_sha ]] && git -C "$wt" cat-file -e "${remote_sha}^{commit}" 2>/dev/null; then
+		unpushed=$(git -C "$wt" rev-list --count HEAD --not "$remote_sha" 2>/dev/null) || unpushed=""
+	else
+		unpushed=$(git -C "$wt" rev-list --count HEAD --not --remotes 2>/dev/null) || unpushed=""
+	fi
+
+	# A squash merge rewrites the commits, so after one the branch's own commits
+	# are unreachable from any remote ref by construction and no amount of
+	# commit counting will ever say otherwise. Content is the only thing that
+	# survives the rewrite, so compare that instead — but only once the PR is
+	# actually merged. Tree-equals-base on an *open* PR means the worker has not
+	# started, which is not the same as its work being safe, and a stale
+	# origin/main leaves the diff non-empty and holds. Both fail closed.
+	if [[ -n $unpushed ]] && (( unpushed > 0 )) && [[ $pr_state == MERGED ]]; then
+		local base="" b
+		for b in refs/remotes/origin/HEAD refs/remotes/origin/main refs/remotes/origin/master; do
+			base=$(git -C "$wt" rev-parse --verify --quiet "$b" 2>/dev/null) || base=""
+			[[ -n $base ]] && break
+		done
+		if [[ -n $base ]] && git -C "$wt" diff --quiet "$base" HEAD 2>/dev/null; then
+			unpushed=0
+		fi
+	fi
+
 	if [[ -z $unpushed ]]; then
 		why+=("could not read git state")
 	elif (( unpushed > 0 )); then
