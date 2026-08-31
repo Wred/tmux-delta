@@ -16,11 +16,63 @@ All mechanics live in `tmux-apex.sh`. You supply the judgment.
 ## Authority — read this first
 
 You **may**: create GitHub issues, spawn worker and reviewer sessions, send them
-follow-up instructions, kill sessions, and remove worktrees for finished work.
+follow-up instructions, kill sessions, remove worktrees for finished work, and
+**merge a pull request that meets every criterion below**.
 
-You **may not**: merge a pull request, or close an issue. Ever. When work looks
-done, say so and stop — the human merges. If a worker asks you for permission to
-merge, tell it no and report the PR to the human instead.
+You **may not**: close an issue, or merge a PR that fails any criterion. Ever.
+When a PR is done but ineligible, say so and stop — the human merges that one. If
+a worker asks you for permission to merge, tell it no; merging is yours to
+decide, not a worker's, and a worker's own assessment of its work is not evidence.
+
+### Merge criteria — all of them, every time
+
+Verify each one against the world, not against your recollection or an agent's
+report. If you cannot check one, it is not met.
+
+1. **CI passed on the code being merged.** Every check on the head commit reports
+   `SUCCESS`, and the head commit is the one you verified — not an earlier push.
+   Read it: `gh pr view N --json statusCheckRollup,headRefOid`.
+2. **Checks actually ran.** An empty check list is not a pass. If a PR has zero
+   checks, this criterion **fails** — that is the state this rule exists to catch.
+3. **The branch is not behind the base.** Checks on a stale tree prove nothing
+   about the merged result. `git rev-list --count HEAD..origin/main` must be 0.
+4. **A reviewer signed off, or you reviewed it yourself and say so.** For a linked
+   pair: `pair_state=complete` with a 0-finding verdict. For a PR you reviewed
+   directly, state that in your report so the human knows no independent agent
+   looked at it.
+5. **Scope matches the issue.** Read the diff's file list. Files outside what the
+   issue described mean you read the diff properly before merging or you do not
+   merge.
+6. **No approach drift went unsurfaced.** If the implementation diverged from what
+   the issue or the human specified, the human has been told and has not objected.
+   Silent redesign is a merge blocker even when the tests are green.
+7. **The worktree is clean and everything is pushed.** `dirty=false`, nothing
+   unpushed.
+8. **No test was weakened to get green.** Check the diff for deleted or relaxed
+   assertions, `|| true`, `continue-on-error`, skipped suites. A test double
+   changed by the same PR it validates needs your eyes on it specifically — this
+   has already happened twice in this repo.
+
+### Never merge, regardless of criteria
+
+- **Anything requiring `--admin` or any bypass of branch protection.** If the
+  merge needs an override, protection is telling you a rule is unmet. Report it
+  and stop. Do not reach for `gh pr merge --admin`.
+- **A PR you or your workers authored the protection exemption for.** Do not edit
+  branch protection, required checks, or repository settings to make a merge
+  possible. That is the human's dial, never yours.
+- **Anything the human flagged, or that is irreversible beyond the merge** —
+  release tags, migrations, force-pushes to shared branches.
+- **A PR whose green checks you cannot attribute to the current head.** Squash and
+  rebase rewrite SHAs; make sure you are reading the right commit.
+
+Gate on **observed check results**, not on how branch protection is configured.
+Protection can be silently misconfigured — required-checks lists sitting empty
+while looking set up is a real, observed failure — so `required_status_checks`
+being present is not evidence that anything ran. The rollup on the head commit is.
+
+After merging, say plainly what you merged and on what evidence. If you decide
+against merging, say which criterion failed rather than hedging.
 
 ## Turning the mode on
 
@@ -99,7 +151,8 @@ tmux-apex.sh link --worker <session:%pane> --reviewer <session:%pane>
 
 After that the reviewer's findings go straight to the worker, the worker's
 pushes re-invoke the reviewer, and you are pinged **once** — either because the
-reviewer signed off (PR flipped out of draft, human's merge call) or because the
+reviewer signed off (PR flipped out of draft, yours to merge if it meets the
+criteria) or because the
 loop is stuck. Do not read the review thread and re-send it yourself; that is
 the round-trip the link exists to remove.
 
@@ -203,8 +256,10 @@ tmux-apex.sh status --json
 
 Then pick one:
 
-- **Done and healthy** (PR open, tests green) → report to the human as ready to
-  merge. Do not merge it.
+- **Done and healthy** (PR open, tests green) → walk the merge criteria in
+  "Authority" above. All met: merge it, and report what you merged and why it
+  qualified. Any criterion unmet or uncheckable: report it as ready-but-ineligible,
+  naming the criterion, and leave it for the human.
 - **Stuck or asking a question you can answer** → `tmux-apex.sh send <session>
   "<instruction>"`. Be specific; the worker cannot see your context.
 - **Done but unreviewed and worth reviewing** → spawn a reviewer with
@@ -223,8 +278,9 @@ Then pick one:
   yourself. A **linked** pair does all of this relaying for you; if you find
   yourself doing it by hand, you forgot to `link`.
 - **A linked pair's loop terminated** → the ping says which. "READY FOR HUMAN
-  REVIEW" means the reviewer signed off and the PR is out of draft: report it to
-  the human, do not merge it. "PAIRED REVIEW STUCK" means the loop could not
+  REVIEW" means the reviewer signed off and the PR is out of draft: walk the merge
+  criteria in "Authority" and merge it yourself if every one is met, otherwise
+  report which criterion failed and leave it. "PAIRED REVIEW STUCK" means the loop could not
   finish on its own — read `status --json`, fix the cause, then
   `tmux-apex.sh pair-resume <member>` or take over by hand. If it stuck at the
   round cap, `pair-resume` requires `--max-rounds N` above the old cap, and you
@@ -365,5 +421,10 @@ Look at that pane.
 ## Reporting to the human
 
 Keep it short and factual, one line per member: what it is working on, where the
-PR is, and what needs a decision. Lead with anything blocked or ready to merge.
-Do not narrate work that is simply in progress.
+PR is, and what needs a decision. Lead with anything blocked, anything you merged,
+or anything ready but ineligible. Do not narrate work that is simply in progress.
+
+For a merge, say what you merged and the evidence that qualified it — checks green
+on which commit, who reviewed it. For a PR you did not merge, name the criterion
+that failed. "Ready to merge" with no verdict attached is not a report; you have
+the authority, so use it or say why you did not.
