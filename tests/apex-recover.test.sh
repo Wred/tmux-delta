@@ -297,10 +297,10 @@ argv_for() {
 	DELTA_AGENT_LIBDIR="$SCRIPTS/lib"
 	typeset -ga agent_argv=() agent_argv_fresh=(); unset agent_argv_fresh_set
 	DELTA_AGENT_MODEL="" DELTA_AGENT_FLAGS="" DELTA_AGENT_SYSTEM="" \
-	DELTA_AGENT_PROMPT="$1" DELTA_AGENT_RESUME="$2" \
+	DELTA_AGENT_PROMPT="$1" DELTA_AGENT_RESUME="$2" DELTA_AGENT_MANAGED="$3" \
 		source "$SCRIPTS/lib/agents/claude.sh"
 	DELTA_AGENT_MODEL="" DELTA_AGENT_FLAGS="" DELTA_AGENT_SYSTEM="" \
-	DELTA_AGENT_PROMPT="$1" DELTA_AGENT_RESUME="$2" delta_agent_argv
+	DELTA_AGENT_PROMPT="$1" DELTA_AGENT_RESUME="$2" DELTA_AGENT_MANAGED="$3" delta_agent_argv
 }
 
 argv_for "the task" "$WORKER_ID"
@@ -322,7 +322,30 @@ argv_for "" ""
 eq "a promptless launch still falls back" 1 "${+agent_argv_fresh_set}"
 eq "…from --continue" "--continue" "${(j: :)agent_argv}"
 
+# A managed pane is read back with capture-pane, where a grayed-out prompt
+# suggestion is byte-identical to real unsubmitted input (#20). Every apex
+# read of an input box — splice detection, box-drained confirmation, the
+# stuck-pane heuristics — trusts that box, so the suggestion has to be off.
+argv_for "the task" "" 1
+eq "a managed launch disables prompt suggestions" \
+	"--prompt-suggestions false the task" "${(j: :)agent_argv}"
+
+argv_for "the task" "$WORKER_ID" 1
+eq "…on the resume path too" \
+	"--prompt-suggestions false --resume $WORKER_ID" "${(j: :)agent_argv}"
+
+# The picker and dev-layout launch panes a human types into, and they pass no
+# managed flag. Suggestions are a typing convenience: leave them alone there.
+argv_for "the task" "" ""
+eq "an unmanaged launch leaves prompt suggestions alone" \
+	"the task" "${(j: :)agent_argv}"
+
 source "$SCRIPTS/lib/agent-launch.sh"
+contains "launch command exports the managed flag" "DELTA_AGENT_MANAGED=1" \
+	"$(delta_agent_launch_cmd claude '' '' '' p /tmp/w /a/adapter.sh sid-9 1)"
+contains "launch command exports an empty managed flag when omitted" \
+	"DELTA_AGENT_MANAGED=''" \
+	"$(delta_agent_launch_cmd claude '' '' '' p /tmp/w /a/adapter.sh)"
 contains "launch command exports the resume id" "DELTA_AGENT_RESUME=sid-9" \
 	"$(delta_agent_launch_cmd claude '' '' '' p /tmp/w /a/adapter.sh sid-9)"
 contains "launch command exports an empty resume id when omitted" \

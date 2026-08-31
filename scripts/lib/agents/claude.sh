@@ -5,6 +5,12 @@ delta_agent_argv() {
 	agent_argv=()
 	[[ -n $DELTA_AGENT_MODEL ]] && agent_argv+=(--model "$DELTA_AGENT_MODEL")
 
+	# Managed sessions are read back with `capture-pane`, and a grayed-out
+	# prompt suggestion captures identically to real typed-but-unsubmitted
+	# input. Suggestions are a human-typing convenience, so nothing is lost
+	# by turning them off where no human is typing.
+	[[ -n $DELTA_AGENT_MANAGED ]] && agent_argv+=(--prompt-suggestions false)
+
 	# Historically this slot held a bare --permission-mode value, and the README
 	# documents it that way. Keep accepting that; anything starting with a dash
 	# is agent-native argv and goes through untouched.
