@@ -285,7 +285,12 @@ Then pick one:
   `tmux-apex.sh pair-resume <member>` or take over by hand. If it stuck at the
   round cap, `pair-resume` requires `--max-rounds N` above the old cap, and you
   should decide whether another round is actually warranted: the two agents
-  disagreeing is a judgement call, not a retry.
+  disagreeing is a judgement call, not a retry. If it stuck on a relay whose
+  **delivery could not be confirmed**, read the partner's pane before anything
+  else: a pane that kept repainting usually *did* get the message, and the loop
+  disarmed itself around work still in progress. Let that work finish and push,
+  then resume — `pair-resume` refuses a worker that is still mid-change for
+  exactly this reason, and `--force` past it only if you have looked.
 - **Idle with nothing pushed and no blocker** → it probably stopped early.
   Send it a nudge naming what is still missing.
 - **A question only the human can answer** (product decisions, tradeoffs,

@@ -1390,6 +1390,23 @@ _PAIR_RELAY_WHY=""
 _pair_relay() {
 	local manager="$1" target="$2" text="$3" rc=0
 	_PAIR_RELAY_WHY=""
+	# `send`'s confirmation ceiling (APEX_SEND_SETTLE_TICKS, 25 ticks = 5s) is
+	# tuned for a human at a terminal: give up quickly and let them look at the
+	# pane themselves. Here nobody is going to look, and the thing being waited
+	# for — the box draining — is exactly the difference between continuing the
+	# loop and disarming it. So watch for a lot longer before giving up.
+	#
+	# This buys more *observation*, not more typing. The retype is still gated
+	# on the pane having gone completely quiet (issue #24), so a longer ceiling
+	# cannot turn into a duplicate turn; it can only turn a give-up into a
+	# confirmed delivery. That is what most of issue #29 was: a worker that had
+	# received the relay and was busy acting on it, reported as unreachable
+	# because 5s of redraw lag ran out.
+	# An explicitly-set APEX_SEND_SETTLE_TICKS still wins: it is the more
+	# specific knob, and silently overriding a ceiling someone tuned on purpose
+	# would make the delivery path behave differently here than everywhere else
+	# for no visible reason.
+	local APEX_SEND_SETTLE_TICKS=${APEX_SEND_SETTLE_TICKS:-${APEX_PAIR_SETTLE_TICKS:-150}}
 	_deliver "$target" "apex-pair" "$text" || rc=$?
 	local ev
 	ev=$(jq -nc --arg s "$target" --arg text "$text" \
@@ -1412,7 +1429,7 @@ _pair_relay() {
 	# of the other choice is a silent deadlock, which nothing recovers from.
 	if (( rc == 0 )) && [[ -n ${APEX_SEND_UNCONFIRMED:-} ]]; then
 		rc=5
-		_PAIR_RELAY_WHY="delivery to that pane could not be confirmed: the pane stayed busy and the relay never left its input box"
+		_PAIR_RELAY_WHY="delivery to that pane could not be confirmed: it kept repainting for the whole confirmation window and the relay never visibly left its input box. A busy pane is weak evidence *for* delivery, so the partner may well have the message and be working on it — read the pane before treating this as a failure. If it is working, let it finish and push first: 'pair-resume' re-invokes the reviewer immediately, so resuming against unpushed work burns a round on unchanged code"
 		ev=$(print -r -- "$ev" | jq -c '. + {rc:5}')
 	fi
 	if (( rc )); then
@@ -1688,27 +1705,29 @@ _cmd_unlink() {
 # pair-resume — hand a stuck loop back to the agents after a human has
 # unstuck whatever it was stuck on.
 _cmd_pair_resume() {
-	local member="" extend=""
+	local member="" extend="" force=""
 	while (( $# )); do
 		case "$1" in
 			--max-rounds) _need_val pair-resume "$1" $#; extend="$2"; shift 2 ;;
+			--force)      force=1; shift ;;
 			-*) _die "pair-resume: unknown argument '$1'" ;;
 			*)  member="$1"; shift ;;
 		esac
 	done
-	[[ -n $member ]] || _die "pair-resume: usage: pair-resume <session:%pane> [--max-rounds N]"
+	[[ -n $member ]] || _die "pair-resume: usage: pair-resume <session:%pane> [--max-rounds N] [--force]"
 	[[ -z $extend || $extend == <-> ]] || _die "pair-resume: --max-rounds must be a positive integer"
 
 	local manager
 	manager=$(_require_manager)
 	APEX_SESSION="$manager"
 
-	local pair pr role round max reviewer
+	local pair pr role round max reviewer worker
 	pair=$(apex_member_get "$manager" "$member" pair)
 	[[ -n $pair ]] || _die "pair-resume: '$member' is not linked to a partner"
 	pr=$(apex_member_get "$manager" "$member" pair_pr)
 	role=$(apex_member_get "$manager" "$member" pair_role)
 	[[ $role == reviewer ]] && reviewer="$member" || reviewer="$pair"
+	[[ $role == worker ]] && worker="$member" || worker="$pair"
 	round=$(apex_member_get "$manager" "$member" pair_round); [[ -n $round ]] || round=1
 	max=$(apex_member_get "$manager" "$member" pair_max_rounds); [[ -n $max ]] || max=$APEX_PAIR_MAX_ROUNDS
 
@@ -1721,6 +1740,28 @@ _cmd_pair_resume() {
 		max="$extend"
 	elif (( round >= max )); then
 		_die "pair-resume: round ${round} is already at the cap (${max}), so the loop would escalate again on the reviewer's first finding. Raise it: pair-resume ${member} --max-rounds $(( max + 2 ))"
+	fi
+
+	# A resume re-invokes the reviewer *now*, against whatever is on the branch
+	# now. That is what a human wants after fixing whatever the loop was stuck
+	# on, and wrong while the worker is still mid-change: the reviewer re-reads
+	# code that has not moved, spends one of the cap's rounds, and posts the
+	# findings it already posted.
+	#
+	# This is not a hypothetical ordering. The unconfirmed-relay escalation can
+	# fire while the worker is provably still working on the relay it just
+	# received (issue #29), and that escalation names `pair-resume` as the
+	# remedy — so the remedy has to refuse the state it is most often reached
+	# from, rather than warn about it in prose that goes unread.
+	if [[ -z $force ]]; then
+		local wstatus wdirty why=""
+		wstatus=$(apex_member_get "$manager" "$worker" status 2>/dev/null)
+		wdirty=$(_member_facts "$worker" 2>/dev/null | jq -r '.dirty // false')
+		[[ $wstatus == working ]] && why="its pane is still active"
+		if [[ $wdirty == true ]]; then
+			why="${why:+${why} and }its worktree is dirty"
+		fi
+		[[ -n $why ]] && _die "pair-resume: the worker ($worker) is still mid-change (${why}), so re-invoking the reviewer now would re-review unchanged code and spend a round doing it. Wait for it to finish and push, then resume. To resume anyway: pair-resume ${member} --force"
 	fi
 
 	local m
