@@ -170,6 +170,19 @@ case "$cmd" in
 	# path reads as a genuine stall (issue #24), so a test that wants the busy
 	# reading has to say so.
 	capture-pane)
+		# STUB_PANE_DRAIN_AFTER models the shape the relay's longer confirmation
+		# window exists for: the Enter *did* land, but the box only visibly
+		# drains after N reads because the pane was busy redrawing in between.
+		# Read with a ceiling below N it looks unconfirmed; with a ceiling above
+		# N, delivered. That difference is the whole of the issue #29 fix, so it
+		# needs a fixture that can be read both ways rather than one that is
+		# permanently undrainable.
+		if [[ -n ${STUB_PANE_DRAIN_AFTER:-} ]]; then
+			local reads
+			reads=$(( $(cat "$STUB_SENT.reads" 2>/dev/null || print 0) + 1 ))
+			print -n -- "$reads" > "$STUB_SENT.reads"
+			(( reads > STUB_PANE_DRAIN_AFTER )) && box_write ""
+		fi
 		busy_line() {
 			[[ -n ${STUB_PANE_BUSY:-} ]] || return 0
 			local n
@@ -229,7 +242,7 @@ reset() {
 	for a in "$@"; do
 		case "$a" in --no-link) nolink=true ;; --max=*) max="${a#--max=}" ;; esac
 	done
-	rm -rf "$XDG_CACHE_HOME" "$STUB_OPTS" "$STUB_PANES" "$STUB_SENT" "$STUB_GH" "$STUB_SENT.box" "$STUB_SENT.boxseed" "$STUB_SENT.busy"
+	rm -rf "$XDG_CACHE_HOME" "$STUB_OPTS" "$STUB_PANES" "$STUB_SENT" "$STUB_GH" "$STUB_SENT.box" "$STUB_SENT.boxseed" "$STUB_SENT.busy" "$STUB_SENT.reads"
 	mkdir -p "$MEMBERS"
 	: > "$STUB_OPTS"; : > "$STUB_SENT"; : > "$STUB_GH"
 	printf '%%1\n%%2\n' > "$STUB_PANES"
@@ -432,6 +445,54 @@ contains "and the worker gets the findings" "1 finding(s)" "$(sent_to %1)"
 eq "round advances past the old cap" 3 "$(mget "$WORKER" pair_round)"
 
 # A reaped partner must not be resurrected as a phantom member.
+# ── pair-resume refuses to resume onto live work (issue #29) ─────────
+# `pair-resume` re-invokes the reviewer immediately, against whatever is on the
+# branch at that moment. Every escalation message names it as the remedy, but
+# the unconfirmed-relay escalation can fire while the worker is provably still
+# working on the relay it did receive — and resuming there re-reviews unchanged
+# code, spends a round, and re-posts the same findings. So the remedy refuses
+# the state it is most often reached from.
+print "\npair-resume refuses to resume onto live work"
+reset --max=3
+jq -c '.status = "working"' "$MEMBERS/$WORKER.json" > "$TMPROOT/w" \
+	&& mv "$TMPROOT/w" "$MEMBERS/$WORKER.json"
+: > "$STUB_SENT"
+out=$(apex pair-resume "$WORKER")
+contains "an active worker pane blocks the resume" "still mid-change" "$out"
+contains "and the refusal says which signal fired" "pane is still active" "$out"
+contains "and names the override"                  "--force"            "$out"
+eq "the reviewer is not woken for nothing" "" "$(sent_to %2)"
+eq "and the verdict is left alone" 1 "$(mget "$REVIEWER" pair_round)"
+
+# --force exists because the signals are heuristics, not proof: a worker can sit
+# at status=working with a pane nobody is going to touch again. The human keeps
+# the last word, they just have to say so.
+out=$(apex pair-resume "$WORKER" --force)
+contains "--force resumes anyway" "Resumed the loop" "$out"
+contains "and the reviewer is re-invoked" "Re-review" "$(sent_to %2)"
+
+# The other half of the guard: an idle worker with uncommitted changes. Same
+# hazard — the reviewer would read a tree the worker has not finished with.
+print "\n…and equally on a dirty worktree"
+reset --max=3
+mkdir -p "$TMPROOT/dirtywt"
+git -C "$TMPROOT/dirtywt" init -q 2>/dev/null
+: > "$TMPROOT/dirtywt/untracked"
+jq -c --arg wt "$TMPROOT/dirtywt" '.worktree = $wt' "$MEMBERS/$WORKER.json" > "$TMPROOT/w" \
+	&& mv "$TMPROOT/w" "$MEMBERS/$WORKER.json"
+: > "$STUB_SENT"
+out=$(apex pair-resume "$WORKER")
+contains "a dirty worktree blocks the resume"    "still mid-change"      "$out"
+contains "and the refusal says which signal fired" "worktree is dirty"   "$out"
+eq "the reviewer is not woken" "" "$(sent_to %2)"
+
+# A clean, idle worker is the case the resume was designed for: no obstacle.
+print "\npair-resume still resumes a settled worker"
+reset --max=3
+: > "$STUB_SENT"
+out=$(apex pair-resume "$WORKER")
+contains "an idle worker with a clean tree resumes" "Resumed the loop" "$out"
+
 print "\npair-resume does not recreate a reaped partner"
 reset --max=3
 rm -f "$MEMBERS/$REVIEWER.json"
@@ -521,6 +582,59 @@ eq "the event marks it unconfirmed" true \
 	"$(print -r -- "$(ev pair-relay-failed)" | jq -r '.unconfirmed // false')"
 contains "and reports it as an unsubmitted-class failure" '"rc":5' \
 	"$(ev pair-relay-failed)"
+# The escalation is a fail-safe, not a diagnosis: a pane that kept repainting is
+# weak evidence *for* delivery. Saying "unconfirmed" and stopping there sent an
+# operator straight to `pair-resume`, which is the one thing that must not
+# happen while the partner is mid-turn on the relay it did receive (issue #29).
+contains "the ping says the partner may have it after all" \
+	"may well have the message" "$(apex pending)"
+contains "and gives the recovery order, not just the symptom" \
+	"finish and push first" "$(apex pending)"
+
+# ── the same pane, watched for longer (issue #29) ─────────────────────
+# The give-up above is a ceiling, not a fact about the pane, and the ceiling it
+# used was `send`'s: 5s, tuned for a human who can just look at the pane. On the
+# relay path nobody looks, so the loop was disarming itself over redraw lag. The
+# relay now watches far longer, which costs only observation — the retype is
+# still gated on the pane going quiet, so no extra ceiling can produce a
+# duplicate turn (issue #24).
+print "\na busy pane whose box drains late is delivered, not escalated"
+reset --max=3
+verdict --findings 2 >/dev/null
+export STUB_PANE_TEXT='[apex from:apex-pair] PAIRED REVIEW'
+export STUB_PANE_NO_DRAIN=1                     # Enter does not visibly drain it…
+export STUB_PANE_BUSY=1                         # …the pane repaints throughout…
+export STUB_PANE_DRAIN_AFTER=10                 # …and the box drains on read 11
+settle "$REVIEWER" >/dev/null
+unset STUB_PANE_TEXT STUB_PANE_NO_DRAIN STUB_PANE_BUSY STUB_PANE_DRAIN_AFTER
+eq "the loop stays active" active "$(mget "$REVIEWER" pair_state)"
+eq "the turn advances to the worker" worker "$(mget "$WORKER" pair_turn)"
+eq "the round is consumed, because a round happened" 2 "$(mget "$WORKER" pair_round)"
+contains "the findings reach the worker" "PAIRED REVIEW" "$(sent_to %1)"
+contains "and it is logged as an ordinary relay" '"event":"pair-relay"' \
+	"$(ev pair-relay)"
+eq "with no unconfirmed flag" false \
+	"$(print -r -- "$(ev pair-relay)" | jq -r '.unconfirmed // false')"
+eq "and no escalation was written" "" "$(mget "$WORKER" pair_message)"
+
+# Same pane, same drain, ceiling put back to `send`'s: escalates again. This is
+# the pair that shows the behaviour turns on the ceiling and nothing else — and
+# that an explicitly-set APEX_SEND_SETTLE_TICKS still wins, so an operator who
+# tuned it does not silently get the relay's default instead.
+print "\n…and the explicit ceiling still wins over the relay default"
+reset --max=3
+verdict --findings 2 >/dev/null
+export STUB_PANE_TEXT='[apex from:apex-pair] PAIRED REVIEW'
+export STUB_PANE_NO_DRAIN=1
+export STUB_PANE_BUSY=1
+export STUB_PANE_DRAIN_AFTER=10
+export APEX_SEND_SETTLE_TICKS=3                 # gives up before read 11
+settle "$REVIEWER" >/dev/null
+unset STUB_PANE_TEXT STUB_PANE_NO_DRAIN STUB_PANE_BUSY STUB_PANE_DRAIN_AFTER APEX_SEND_SETTLE_TICKS
+eq "the loop is marked stuck" stuck "$(mget "$REVIEWER" pair_state)"
+eq "the round is rolled back" 1 "$(mget "$WORKER" pair_round)"
+eq "the event marks it unconfirmed" true \
+	"$(print -r -- "$(ev pair-relay-failed)" | jq -r '.unconfirmed // false')"
 
 # The same pane, read by a human's `send`: delivered, with the NOTE and the
 # flag on the `send` event rather than an escalation.
