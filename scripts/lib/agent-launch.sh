@@ -37,7 +37,7 @@ typeset -g DELTA_AGENT_PANE_PCT_EXTRA=33
 
 delta_agent_launch_cmd() {
 	local agent_expr="$1" model="$2" flags="$3" system="$4" prompt="$5" dir="$6" adapter="$7"
-	local resume="${8:-}"
+	local resume="${8:-}" managed="${9:-}"
 	local -a agent_env=(
 		"DELTA_AGENT_MODEL=${(q)model}"
 		"DELTA_AGENT_FLAGS=${(q)flags}"
@@ -45,6 +45,7 @@ delta_agent_launch_cmd() {
 		"DELTA_AGENT_PROMPT=${(q)prompt}"
 		"DELTA_AGENT_DIR=${(q)dir}"
 		"DELTA_AGENT_RESUME=${(q)resume}"
+		"DELTA_AGENT_MANAGED=${(q)managed}"
 	)
 	print -r -- 'agent='${agent_expr}'; '${(j:; :)agent_env}'; source '${(q)adapter}'; delta_agent_exec "$agent"'
 }

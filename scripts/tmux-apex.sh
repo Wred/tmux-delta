@@ -2362,7 +2362,7 @@ _cmd_recover() {
 		local system prompt inner pane adapter="${SCRIPTS}/lib/agent-adapter.sh"
 		system=$(delta_managed_prompt "$role" "$manager")
 		prompt=$(delta_task_prompt "$issue" "$pr" "$mode")
-		inner=$(delta_agent_launch_cmd "${(q)agent}" "$model" "$perm" "$system" "$prompt" "$wt" "$adapter" "$sid")
+		inner=$(delta_agent_launch_cmd "${(q)agent}" "$model" "$perm" "$system" "$prompt" "$wt" "$adapter" "$sid" 1)
 		pane=$(tmux split-window -t "$session" -h -p $pct -c "$wt" -P -F '#{pane_id}' \
 			"direnv exec ${(q)wt} zsh -ic ${(q)inner}" 2>/dev/null)
 		if [[ -z $pane ]]; then
