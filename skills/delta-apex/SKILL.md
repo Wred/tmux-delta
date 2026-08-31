@@ -123,21 +123,36 @@ Protection can be silently misconfigured — required-checks lists sitting empty
 while looking set up is a real, observed failure — so `required_status_checks`
 being present is not evidence that anything ran. The rollup on the head commit is.
 
-### Why a required human approval cannot gate this
+### A reviewer agent can never supply a GitHub approval
 
-If the repo requires approving reviews, expect **every** agent merge to be
-blocked, permanently, and do not go looking for a bug. Workers, reviewers and
-you all authenticate as the same GitHub account, which is also the PR author,
-and GitHub forbids self-approval — so a reviewer agent's sign-off lands as
-`COMMENTED` and can never become `APPROVED`. Agent merges and a required
-approval cannot coexist on one identity; that needs a second account for
-reviewer agents.
+Your workers, your reviewers and you all authenticate as the same GitHub
+account, and that account authored every PR your workers open. GitHub forbids
+approving your own PR, so a reviewer agent's sign-off always lands as
+`COMMENTED` and can never become `APPROVED`. This is why criterion 4 is about a
+verdict *you verified* rather than about GitHub's review state.
 
-This is why criterion 4 is about a *verdict you verified*, not about GitHub's
-review state, and why the checks above are the gate. If you find
-`required_approving_review_count` set above 0 and merges failing on it, report
-it to the human as a configuration decision for them — raising or lowering that
-dial is never yours (see below).
+The prohibition is only on **self**-approval: a reviewer agent looking at a PR
+someone else authored can approve normally. It is your team's own PRs that can
+never collect an agent approval.
+
+What follows from that depends on the repo, and you must not guess which case
+you are in:
+
+- **Where you are effectively the only contributor.** Nothing can ever supply
+  the approval, so a non-zero `required_approving_review_count` blocks every
+  agent merge permanently. Report it to the human as a configuration decision
+  for them — that dial is never yours to turn (see below).
+- **Where other people work on the repo.** A teammate can approve, so the
+  requirement is satisfiable and is doing exactly what it was set up to do: put
+  a human in the loop before merge. Do **not** report it as broken, do not look
+  for a route around it, and do not merge on the strength of your own review.
+  Such a PR is ready and ineligible — say so, name the missing approval, and
+  leave it.
+
+Read which case applies rather than assuming, and default to the second: a
+repo with other humans on it is the normal situation, and treating their review
+requirement as an obstacle is a much worse failure than waiting unnecessarily.
+`gh pr view N --json reviewDecision,reviews` shows where a PR actually stands.
 
 After merging, say plainly what you merged and on what evidence. If you decide
 against merging, say which criterion failed rather than hedging.
