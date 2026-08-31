@@ -123,6 +123,22 @@ Protection can be silently misconfigured — required-checks lists sitting empty
 while looking set up is a real, observed failure — so `required_status_checks`
 being present is not evidence that anything ran. The rollup on the head commit is.
 
+### Why a required human approval cannot gate this
+
+If the repo requires approving reviews, expect **every** agent merge to be
+blocked, permanently, and do not go looking for a bug. Workers, reviewers and
+you all authenticate as the same GitHub account, which is also the PR author,
+and GitHub forbids self-approval — so a reviewer agent's sign-off lands as
+`COMMENTED` and can never become `APPROVED`. Agent merges and a required
+approval cannot coexist on one identity; that needs a second account for
+reviewer agents.
+
+This is why criterion 4 is about a *verdict you verified*, not about GitHub's
+review state, and why the checks above are the gate. If you find
+`required_approving_review_count` set above 0 and merges failing on it, report
+it to the human as a configuration decision for them — raising or lowering that
+dial is never yours (see below).
+
 After merging, say plainly what you merged and on what evidence. If you decide
 against merging, say which criterion failed rather than hedging.
 
