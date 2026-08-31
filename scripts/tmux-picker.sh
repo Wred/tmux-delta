@@ -111,15 +111,6 @@ _list_worktrees() {
 			printf 'wt:%s\t%s  \033[2m%s\033[0m\n' "$wt_path" "$branch" "$folder"
 		fi
 	done
-
-	local checked_out=$(git worktree list --porcelain \
-		| awk '/^branch refs\/heads\// { sub("^branch refs/heads/", ""); print }')
-	git branch -r --no-color 2>/dev/null | sed 's/^[* ]*//' | grep -v 'HEAD' \
-		| while read -r ref; do
-			local local_name=${ref#origin/}
-			echo "$checked_out" | grep -qxF "$local_name" && continue
-			printf 'remote:%s\t\033[36m%s\033[0m\n' "$local_name" "$ref"
-		done
 }
 
 _list_issues() {
@@ -541,17 +532,6 @@ _open_browser() {
 			local branch=$(git -C "$wt_path" branch --show-current 2>/dev/null)
 			[[ -n $branch ]] && _browse_repo "$wt_path" "$branch"
 			;;
-		remote:*)
-			local branch="${selected#remote:}"
-			local pr_number url
-			pr_number=$(gh pr view "$branch" --json number --jq '.number' 2>/dev/null)
-			if [[ -n $pr_number ]]; then
-				url=$(gh pr view "$branch" --json url --jq '.url' 2>/dev/null)
-			else
-				url=$(gh browse --branch "$branch" --no-browser 2>/dev/null)
-			fi
-			_open_url "$url"
-			;;
 	esac
 }
 
@@ -702,11 +682,6 @@ _delete_session() {
 
 _delete_wt() {
 	local raw="$1"
-	if [[ $raw == remote:* ]]; then
-		echo "Cannot delete a remote branch reference."
-		sleep 1
-		return
-	fi
 	local wt_path="${raw#wt:}"
 	local branch=$(git -C "$wt_path" symbolic-ref --short HEAD 2>/dev/null)
 	# gwtrm -f no longer prompts a second time for a dirty worktree, so the
@@ -808,18 +783,6 @@ _open_session() {
 		sleep 0.5
 		tmux send-keys -t "$selected_name" "${SCRIPTS}/tmux-dev-layout.sh" Enter
 	fi
-}
-
-_open_remote() {
-	local remote_branch="$1"
-	gwta "$remote_branch"
-	local sanitized=${${${remote_branch// /-}//\//-}:l}
-	local selected=$(git worktree list | grep -F "$sanitized" | awk '{print $1}')
-	if [[ -z $selected ]]; then
-		echo "Error: Failed to find newly created worktree"
-		exit 1
-	fi
-	_open_session "$selected"
 }
 
 _create_branch() {
@@ -1228,7 +1191,7 @@ fi
 
 # Parse structured output from become()
 # Line 1: mode (select | interactive | autonomous | review)
-# Line 2: prefixed item (dir:… | wt:… | remote:… | issue:…)
+# Line 2: prefixed item (dir:… | wt:… | issue:…)
 # Line 3: fzf query (worktrees tab only)
 mode=$(echo "$output" | sed -n '1p')
 selected=$(echo "$output" | sed -n '2p')
@@ -1243,7 +1206,6 @@ case "$selected" in
 	session:*) _switch_session "${${selected#session:}%%:*}" ;;
 	dir:*)     _open_session "${selected#dir:}" ;;
 	wt:*)      _open_session "${selected#wt:}" ;;
-	remote:*)  _open_remote "${selected#remote:}" ;;
 	issue:*)   _open_issue "${selected#issue:}" "$mode" ;;
 	pr:*)
 		if [[ $mode == review ]]; then
