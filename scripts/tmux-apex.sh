@@ -2036,6 +2036,26 @@ _cmd_status() {
 # "starting") has nothing actionable to say yet, and reporting on every seq
 # bump would spam every intermediate transition instead of just the state
 # that matters when the manager actually looks.
+# Reportability, defined once. Three things ask "would `pending` report this
+# member": `_cmd_pending` below, and both of `_apex_pending_sig`'s paths (the
+# slurped jq and its per-file fallback). They must agree exactly — the
+# watcher's whole job is to nudge precisely when `pending` has something to
+# say — and they cannot be checked against each other by any test that does
+# not already know the answer, so they share the expression instead.
+#
+# A member is reportable when its seq has moved past pinged_seq AND it is
+# either resting (idle/attention) or carrying a pair escalation. The
+# escalation clause is why `status` alone will not do: a terminal pair
+# escalation is reported on its own merit, because the partner's relay can
+# wake the member back into `working` before the manager next pulls, which
+# would otherwise defer "READY FOR HUMAN REVIEW" by a whole agent turn —
+# likeliest in exactly the cases that need it soonest.
+_APEX_REPORTABLE_JQ='def reportable:
+	((.seq // 0) != (.pinged_seq // -1))
+	and (((.pair_message // "") != "")
+	     or .status == "idle" or .status == "attention");
+'
+
 _cmd_pending() {
 	local mark=false a
 	for a in "$@"; do [[ $a == --mark-delivered ]] && mark=true; done
@@ -2044,25 +2064,32 @@ _cmd_pending() {
 	manager=$(_require_manager)
 	APEX_SESSION="$manager"
 
-	local s st seq rawseq pinged role task facts summary pair_msg
+	local s st seq rawseq role task facts summary pair_msg
 	for s in ${(f)"$(apex_members "$manager")"}; do
 		[[ -z $s ]] && continue
+
+		# Whether this member is reportable is decided by the *shared* jq
+		# definition, not re-expressed here. It used to be: this loop tested
+		# `status` and `seq != pinged_seq` in shell, while the watcher's gate
+		# tested the same thing in jq. Two copies of one decision is bad
+		# enough; two copies in two *languages* is worse, because no shared
+		# test can fail to compile and the byte-equality check that keeps the
+		# gate's own two jq paths honest cannot reach across to shell. That
+		# drift already happened once — the gate returned empty while
+		# `pending` said READY FOR HUMAN REVIEW, suppressing the handoff the
+		# whole ~1s tick exists to buy (issue #23).
+		#
+		# The watcher's gate keeps its slurped jq: it runs once a second and
+		# must not touch `_member_facts`, so the two still *enumerate* members
+		# differently. Only the predicate is shared, which is the part that
+		# drifted.
+		jq -e "$_APEX_REPORTABLE_JQ"'reportable' \
+			"$(apex_member_file "$manager" "$s")" >/dev/null 2>&1 || continue
+
 		st=$(apex_member_get "$manager" "$s" status)
 		pair_msg=$(apex_member_get "$manager" "$s" pair_message)
-
-		# A terminal pair escalation is reported on its own merit, not via
-		# the `status` field it forces: the partner's relay can wake this
-		# member back into `working` before the manager next pulls, which
-		# would otherwise defer "READY FOR HUMAN REVIEW" by a whole agent
-		# turn — likeliest in exactly the cases that need it soonest.
-		if [[ -z $pair_msg ]]; then
-			[[ $st == idle || $st == attention ]] || continue
-		fi
-
 		rawseq=$(apex_member_get "$manager" "$s" seq)
 		seq=$rawseq; [[ -z $seq ]] && seq=0
-		pinged=$(apex_member_get "$manager" "$s" pinged_seq); [[ -z $pinged ]] && pinged=-1
-		(( seq == pinged )) && continue
 
 		role=$(_sopt "$s" @apex_role); [[ -z $role ]] && role=worker
 		task=$(_sopt "$s" @apex_task)
@@ -2577,18 +2604,8 @@ _apex_watch_statefile() { printf '%s/watch-state.json' "$(apex_dir "$1")"; }
 # The seq is part of the fingerprint, not just the session: a worker that
 # settles, gets pinged, wakes and settles again is a new event to deliver,
 # and keying on session alone would swallow it as a duplicate.
-# The cheap gate has to answer the same question `_cmd_pending` does, or the
-# poller goes blind to whatever the two disagree about. Kept as one jq
-# definition spliced into both the slurped path and the per-file fallback so
-# they cannot drift apart. Mirrors _cmd_pending: a member is reportable when
-# its seq has moved past pinged_seq AND it is either resting (idle/attention)
-# or carrying a pair escalation — which `pending` reports on its own merit,
-# regardless of the `status` the escalation forces.
-_APEX_REPORTABLE_JQ='def reportable:
-	((.seq // 0) != (.pinged_seq // -1))
-	and (((.pair_message // "") != "")
-	     or .status == "idle" or .status == "attention");
-'
+# The predicate itself lives above `_cmd_pending` — all three readers of it
+# share that one definition, which is the point (issue #23).
 
 _apex_pending_sig() {
 	local manager="$1" dir
