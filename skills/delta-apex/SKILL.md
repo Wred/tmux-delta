@@ -72,7 +72,7 @@ spawning a worker** (see above). Ever.
 you plan around it:
 
 ```bash
-tmux-apex.sh authority          # or --json for {merge, answered}
+tmux-apex.sh authority          # or --json for {merge, self_review, answered}
 ```
 
 - **`merge: NOT granted`** — you never merge in this repo, however well a PR
@@ -83,7 +83,18 @@ tmux-apex.sh authority          # or --json for {merge, answered}
   a worker to merge on your behalf, and do not run `authority --grant` yourself
   — the grant is the human's to give, and granting it to yourself is the one
   move that empties it of meaning.
-- **`merge: GRANTED`** — you may merge a PR that meets every criterion below.
+- **`merge: GRANTED for reviewer-approved PRs; NOT on apex's own review`** — you
+  may merge a PR that meets every criterion below, and the review in criterion 4
+  has to be an independent reviewer's. A PR whose only review is your own reading
+  is ready and ineligible, exactly as above.
+- **`merge: GRANTED, including on apex's own review`** — both axes granted. Your
+  own review satisfies criterion 4, and criterion 5 is met.
+
+The two axes are separate because they are separate questions. The first is
+whether merging here is yours to do at all. The second is whether it is yours to
+do *without a second agent having looked* — and that one is about the weakest
+leg in the list below, not about trust in you. A repo can reasonably answer yes
+to the first and no to the second, and this is the shape that lets it.
 
 Why per repo: the criteria below are all mechanical, and none of them can see
 that someone expected to review before a change landed, that a release has a
@@ -107,26 +118,34 @@ report. If you cannot check one, it is not met.
    checks, this criterion **fails** — that is the state this rule exists to catch.
 3. **The branch is not behind the base.** Checks on a stale tree prove nothing
    about the merged result. `git rev-list --count HEAD..origin/main` must be 0.
-4. **A reviewer signed off, or you reviewed it yourself and say so.** For a linked
-   pair: `pair_state=complete` with a 0-finding verdict. For a PR you reviewed
-   directly, state that in your report so the human knows no independent agent
-   looked at it — and prefer spawning a reviewer to doing this, especially for
-   anything touching state machines, delivery, or a destructive path. On a repo
-   with other contributors, prefer it to the point of not merging: your own
-   reading is the weakest leg of this list, and substituting it for the review
-   someone expected is not undone by disclosing it afterwards.
-   **Never on a PR you authored.** You cannot review your own diff, so that PR
-   has had no reviewer at all; and if you authored it, you had already skipped
-   the step this criterion is about (see "Your job is delegation").
-5. **Scope matches the issue.** Read the diff's file list. Files outside what the
+4. **A review happened, and you name whose.** For a linked pair:
+   `pair_state=complete` with a 0-finding verdict — that is an independent
+   reviewer, and it is the strong form. Failing that, you read the PR yourself
+   and say so in your report, so the human knows no second agent looked at it.
+   Prefer spawning a reviewer, especially for anything touching state machines,
+   delivery, or a destructive path.
+5. **If the only review is your own, self-review is granted.** Your own reading
+   is the weakest leg of this list — a reviewer that shares the author's blind
+   spots finds nothing the author missed — so it is a separate grant, checked
+   the same way: `tmux-apex.sh authority`. Not granted, a PR whose only review
+   is yours fails this criterion however green it is, and is *ready and
+   ineligible*: report it, say a reviewer is what it is missing, and either spawn
+   one or leave it to the human. Do not talk yourself past this on the grounds
+   that you read the diff carefully; that is the reasoning the gate exists to
+   stop, and disclosing it afterwards does not undo substituting your reading
+   for the review someone expected.
+   **Never on a PR you authored, either way.** You cannot review your own diff,
+   so that PR has had no reviewer at all; and if you authored it, you had
+   already skipped the step criterion 4 is about (see "Your job is delegation").
+6. **Scope matches the issue.** Read the diff's file list. Files outside what the
    issue described mean you read the diff properly before merging or you do not
    merge.
-6. **No approach drift went unsurfaced.** If the implementation diverged from what
+7. **No approach drift went unsurfaced.** If the implementation diverged from what
    the issue or the human specified, the human has been told and has not objected.
    Silent redesign is a merge blocker even when the tests are green.
-7. **The worktree is clean and everything is pushed.** `dirty=false`, nothing
+8. **The worktree is clean and everything is pushed.** `dirty=false`, nothing
    unpushed.
-8. **No test was weakened to get green.** Check the diff for deleted or relaxed
+9. **No test was weakened to get green.** Check the diff for deleted or relaxed
    assertions, `|| true`, `continue-on-error`, skipped suites. A test double
    changed by the same PR it validates needs your eyes on it specifically — this
    has already happened twice in this repo.
@@ -135,6 +154,9 @@ report. If you cannot check one, it is not met.
 
 - **Anything in a repo where merge authority is not granted.** The criteria
   above only ever apply once `tmux-apex.sh authority` says granted.
+- **Anything whose only review is yours, in a repo where self-review is not
+  granted.** Spawning the reviewer is the fix; deciding your reading was good
+  enough is not.
 - **Anything requiring `--admin` or any bypass of branch protection.** If the
   merge needs an override, protection is telling you a rule is unmet. Report it
   and stop. Do not reach for `gh pr merge --admin`.

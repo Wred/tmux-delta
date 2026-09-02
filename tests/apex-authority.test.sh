@@ -54,6 +54,9 @@ contains() {
 
 export XDG_CACHE_HOME="$TMPROOT/cache"
 export APEX_ASSUME_NONINTERACTIVE=1
+# Granting needs a terminal, which a test run does not have. This is the same
+# opt-out a provisioning script uses; section 4 unsets it to test the gate.
+export APEX_AUTHORITY_UNATTENDED_GRANT=1
 export GIT_CONFIG_GLOBAL="$TMPROOT/gitconfig"
 export GIT_CONFIG_SYSTEM=/dev/null
 : > "$GIT_CONFIG_GLOBAL"
@@ -113,6 +116,18 @@ print -r -- '{"grants":{"":{"merge":true}}}' > "$AUTH_FILE"
 eq "an empty key never resolves to granted"        no "$(apex_authority_get "")"
 eq "setting an empty key is refused"               1 "$(rc apex_authority_set "" yes)"
 
+# The second axis (issue #41, Q2) is fail-closed on the same terms, and closed
+# twice over: it never grants anything unless the merge axis is also granted.
+print -r -- '{"grants":{"'"$KEY"'":{"merge":false,"self_review":true}}}' > "$AUTH_FILE"
+eq "self-review without merge authorises nothing" no \
+	"$(apex_authority_get "$KEY" self_review)"
+eq "…and the predicate agrees"                     1 "$(rc apex_authority_may_self_review "$KEY")"
+print -r -- '{"grants":{"'"$KEY"'":{"merge":true,"self_review":"yes"}}}' > "$AUTH_FILE"
+eq "a non-boolean self_review is no"               no "$(apex_authority_get "$KEY" self_review)"
+eq "…while merge itself still reads true"          yes "$(apex_authority_get "$KEY")"
+print -r -- '{"grants":{"'"$KEY"'":{"merge":true}}}' > "$AUTH_FILE"
+eq "a missing self_review is no"                   no "$(apex_authority_get "$KEY" self_review)"
+
 rm -f "$AUTH_FILE"
 eq "only yes/no are storable"                      1 "$(rc apex_authority_set "$KEY" reviewed)"
 eq "…so a rejected write records nothing"          1 "$(rc apex_authority_answered "$KEY")"
@@ -144,6 +159,53 @@ eq "a second repo's answer leaves the first alone" yes "$(apex_authority_get "$K
 eq "…and is itself independent"  no "$(apex_authority_get github.com/other/tmux-delta)"
 eq "a repo not in the file is unaffected by both"  no \
 	"$(apex_authority_get github.com/third/repo)"
+
+# The second axis round-trips independently, and cannot outlive the first.
+rm -f "$AUTH_FILE"
+apex_authority_set "$KEY" yes sess-a /p yes
+eq "both axes can be granted at once"  yes "$(apex_authority_get "$KEY" self_review)"
+eq "self_review is stored as a JSON boolean" boolean \
+	"$(jq -r --arg k "$KEY" '.grants[$k].self_review | type' "$AUTH_FILE")"
+apex_authority_set "$KEY" yes sess-a /p
+eq "a write that omits the axis leaves it alone" yes "$(apex_authority_get "$KEY" self_review)"
+apex_authority_set "$KEY" yes sess-a /p no
+eq "…and it can be dropped without touching merge" no \
+	"$(apex_authority_get "$KEY" self_review)"
+eq "…merge survives that"  yes "$(apex_authority_get "$KEY")"
+
+# Revoking merge must clear self-review rather than leave it stored: a stale yes
+# springing back to life on the next re-grant is the failure mode.
+apex_authority_set "$KEY" yes sess-a /p yes
+apex_authority_set "$KEY" no sess-a /p
+eq "revoking merge clears self-review in the store" false \
+	"$(jq -r --arg k "$KEY" '.grants[$k].self_review' "$AUTH_FILE")"
+apex_authority_set "$KEY" yes sess-a /p
+eq "…so re-granting merge alone does not revive it" no \
+	"$(apex_authority_get "$KEY" self_review)"
+eq "self-review yes with merge no is refused outright" 1 \
+	"$(rc apex_authority_set "$KEY" no sess-a /p yes)"
+
+# A write landing on a corrupt store used to discard every other repo's answer
+# silently. It still starts fresh — a broken file must not wedge the machine —
+# but the old file is kept and named, so deliberate answers are recoverable.
+rm -f "$AUTH_FILE"
+apex_authority_set github.com/wred/other yes sess-a /p
+print -r -- '{"grants":{"a":' > "$AUTH_FILE"
+err=$(apex_authority_set "$KEY" yes sess-a /p 2>&1 >/dev/null) || true
+eq "a write onto a corrupt store still records the answer" yes "$(apex_authority_get "$KEY")"
+contains "…and says so on stderr"  "unreadable" "$err"
+eq "…keeping the unreadable file aside"  1 \
+	"$(print -r -- "${AUTH_FILE}".corrupt-*(N) | wc -l | tr -d ' ')"
+contains "…naming where it went"  ".corrupt-" "$err"
+rm -f "${AUTH_FILE}".corrupt-*(N)
+
+# Literal `null` and `false` are parseable JSON, so they are not corruption —
+# they are just a file with no grants in it, and must not be moved aside.
+print -r -- 'null' > "$AUTH_FILE"
+apex_authority_set "$KEY" yes sess-a /p
+eq "a file holding literal null is treated as empty, not corrupt" "" \
+	"$(print -r -- "${AUTH_FILE}".corrupt-*(N))"
+eq "…and the write lands"  yes "$(apex_authority_get "$KEY")"
 
 # The grant has to outlive the manager session that recorded it: session names
 # are recycled and recreated, which is exactly what made per-session storage the
@@ -242,6 +304,53 @@ eq "--ask and --grant together are refused"  1 "$rc"
 out=$(apex init --merge maybe 2>&1) && rc=0 || rc=$?
 eq "init --merge validates its value too"  1 "$rc"
 contains "…with the same message"  "takes yes|no" "$out"
+# Validated on the flag having been seen, not on its value being non-empty: the
+# old guard let `--merge ''` through as though no flag had been passed.
+out=$(apex init --merge '' 2>&1) && rc=0 || rc=$?
+eq "an empty --merge value is a named error, not silence"  1 "$rc"
+
+# The second axis through the CLI.
+apex authority --grant >/dev/null
+out=$(apex authority --self-review yes --json)
+eq "--self-review yes grants the second axis"  true "$(j "$out" .self_review)"
+eq "…leaving merge granted"  true "$(j "$out" .merge)"
+out=$(apex authority --self-review no --json)
+eq "--self-review no drops it"  false "$(j "$out" .self_review)"
+eq "…without revoking merge"    true  "$(j "$out" .merge)"
+out=$(apex authority --revoke --json)
+eq "--revoke clears both"  false "$(j "$out" .self_review)"
+
+out=$(apex authority --self-review yes 2>&1) && rc=0 || rc=$?
+eq "self-review alone cannot bootstrap merge authority"  1 "$rc"
+contains "…and says why"  "authorises" "$out"
+eq "…and nothing was written"  false "$(j "$(apex authority --json)" .self_review)"
+
+out=$(apex authority --self-review perhaps 2>&1) && rc=0 || rc=$?
+eq "an unparseable --self-review value fails"  1 "$rc"
+
+out=$(apex init --merge no --self-review yes 2>&1) && rc=0 || rc=$?
+eq "init refuses self-review without merge too"  1 "$rc"
+
+out=$(apex authority --grant --self-review yes --json)
+eq "both axes in one call"  true "$(j "$out" .self_review)"
+contains "the human-readable form distinguishes the axes" "own review" \
+	"$(apex authority 2>&1)"
+apex authority --revoke >/dev/null
+
+# Granting needs a terminal: the skill says the grant is the human's to give, and
+# an agent invoking this from a tool call has no terminal. Revoking is
+# deliberately not gated — it moves toward the default.
+noauth() { ( cd "$REPO" && unset APEX_AUTHORITY_UNATTENDED_GRANT && "$SCRIPTS/tmux-apex.sh" "$@" ) }
+out=$(noauth authority --grant 2>&1) && rc=0 || rc=$?
+eq "granting from a non-terminal is refused"  1 "$rc"
+contains "…naming the opt-out for provisioning"  "APEX_AUTHORITY_UNATTENDED_GRANT" "$out"
+eq "…and grants nothing"  false "$(j "$(apex authority --json)" .merge)"
+out=$(noauth authority --revoke 2>&1) && rc=0 || rc=$?
+eq "revoking from a non-terminal is fine"  0 "$rc"
+apex authority --grant >/dev/null
+out=$(noauth authority --self-review yes 2>&1) && rc=0 || rc=$?
+eq "granting the second axis is gated the same way"  1 "$rc"
+apex authority --revoke >/dev/null
 
 # ─── 5. asking without hanging ───────────────────────────────────────
 
@@ -269,6 +378,20 @@ eq "an empty answer declines"  no "$(ask '')"
 eq "an unrecognised answer declines" no "$(ask 'sure, whatever')"
 eq "a shaped answer this version cannot honour declines" no "$(ask reviewed)"
 
+# The second question is only put once the first is yes — ungranted, it would be
+# asking a human to rule on a hypothetical — and it is a no unless answered.
+ask2() {
+	rm -f "$AUTH_FILE"
+	printf '%s\n' "$1" "$2" | _apex_ask_merge_authority "$KEY" sess "$REPO" >/dev/null 2>&1
+	apex_authority_get "$KEY" self_review
+}
+eq "yes then yes grants self-review"  yes "$(ask2 y y)"
+eq "yes then no does not"             no  "$(ask2 y n)"
+eq "yes then silence does not"        no  "$(ask2 y '')"
+out=$(printf 'n\ny\n' | _apex_ask_merge_authority "$KEY" sess "$REPO" 2>&1)
+eq "declining merge means self-review is never asked" 1 \
+	"$(rc grep -qF "own review" <<< "$out")"
+
 rm -f "$AUTH_FILE"
 _apex_ask_merge_authority "$KEY" sess "$REPO" >/dev/null 2>&1 < /dev/null || true
 eq "EOF declines"  no "$(apex_authority_get "$KEY")"
@@ -290,12 +413,27 @@ print "\nreporting it back"
 rm -f "$AUTH_FILE"
 out=$(apex doctor 2>&1) || true
 contains "doctor reports the authority"  "Merge authority:" "$out"
-contains "…says it was never answered"   "Never answered for this repo" "$out"
+contains "…says it was never answered"   "Never answered for that repo" "$out"
+contains "…and names which repo the answer is about"  "github.com/wred/tmux-delta" "$out"
 contains "…and names the command"        "authority --grant" "$out"
 
 apex authority --grant >/dev/null
 out=$(apex doctor 2>&1) || true
 contains "doctor reflects a grant"  "GRANTED" "$out"
+contains "…and that self-review is not part of it"  "NOT on apex's own review" "$out"
+apex authority --self-review yes >/dev/null
+contains "…and reflects the second axis when granted"  "including on apex's own review" \
+	"$(apex doctor 2>&1 || true)"
+apex authority --revoke >/dev/null
+
+# The fallback that used to sit here read the answer off $PWD when the manager
+# had no usable repo record, so `status` in an unrelated granted repo reported
+# the manager as having authority it did not have — fail-open, in a fail-closed
+# feature. An authority we cannot resolve now reports as unknown.
+eq "an unresolvable manager reports unknown, not the local repo's answer" unknown \
+	"$(_apex_status_authority no-such-manager)"
+contains "…and unknown renders as no authority"  "treat as not granted" \
+	"$(apex_authority_describe unknown)"
 
 print ""
 print "  $PASS passed, $FAIL failed"
