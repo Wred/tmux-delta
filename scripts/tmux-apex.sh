@@ -1068,14 +1068,14 @@ _claude_session_for() {
 			cwd=$(jq -r 'select(.cwd != null) | .cwd' "$f" 2>/dev/null | head -n1)
 			[[ ${cwd:A} == ${wt:A} ]] || continue
 			if [[ -n $marker ]]; then
-				# gsub before head: an expanded slash command spans three lines,
-				# and `head -n1` on raw output would keep only the first of them.
+			# gsub before head: an expanded slash command spans three lines,
+			# and `head -n1` on raw output would keep only the first of them.
 				first=$(jq -r 'select(.type=="user" and (.message.content|type=="string"))
 					| (.message.content | gsub("\n"; " "))' "$f" 2>/dev/null | head -n1)
 				first=$(_claude_normalize_prompt "$first")
-				# End of string or a space, never a bare prefix: "/my-pr-review 4"
-				# prefixes "/my-pr-review 43", and resuming the wrong PR's review
-				# looks like it worked.
+			# End of string or a space, never a bare prefix: "/my-pr-review 4"
+			# prefixes "/my-pr-review 43", and resuming the wrong PR's review
+			# looks like it worked.
 				[[ $first == "$marker" || $first == "$marker "* ]] || continue
 			fi
 			print -r -- "${f:t:r}"
@@ -2193,33 +2193,50 @@ _reap_risk() {
 	# but the wrong answer for any PR that does not target the default branch
 	# (release branches, maintenance branches, stacked PRs). Comparing against
 	# the wrong base costs work in one direction — a false clear — so ask
-	# `gh pr view` for baseRefName first and keep the chain only for when there
-	# is no PR to ask, or gh cannot answer (issue #40).
+	# `gh pr view` for baseRefName first and keep the chain strictly for when
+	# there is no PR to ask, or gh cannot answer (issue #40).
 	if [[ -n $unpushed ]] && (( unpushed > 0 )) && [[ $pr_state == MERGED ]]; then
-		local base="" b
+		local base="" b base_ref=""
 		local -a bases=()
 		if [[ -n $pr_number ]]; then
-			local base_ref=""
 			base_ref=$(cd "$wt" && gh pr view "$pr_number" --json baseRefName -q .baseRefName 2>/dev/null) || base_ref=""
-			if [[ -n $base_ref && $base_ref != null ]]; then
-				# Knowing the base by name is not the same as having a ref for
-				# it. Under the narrow remote.origin.fetch of issue #31 the only
-				# remote-tracking ref that exists is origin/main, so asking the
-				# PR and then rev-parsing origin/<base> falls straight through
-				# to the fallback chain and lands on origin/main — the wrong
-				# base this function was just fixed to stop using. Fetch the ref
-				# by name so the answer exists to be read.
-				#
-				# The explicit refspec, not a bare `git fetch origin <base>`:
-				# that one only populates FETCH_HEAD, which is per-repository
-				# and therefore shared by every worker's worktree — two members
-				# reaped at once would race over it.
-				git -C "$wt" fetch -q origin \
-					"+refs/heads/${base_ref}:refs/remotes/origin/${base_ref}" 2>/dev/null
-				bases+=("refs/remotes/origin/${base_ref}")
-			fi
+			[[ $base_ref == null ]] && base_ref=""
 		fi
-		bases+=(refs/remotes/origin/HEAD refs/remotes/origin/main refs/remotes/origin/master)
+		if [[ -n $base_ref ]]; then
+			# Knowing the base by name is not the same as having a ref for
+			# it. Under the narrow remote.origin.fetch of issue #31 the only
+			# remote-tracking ref that exists is origin/main, so asking the
+			# PR and then rev-parsing origin/<base> falls straight through
+			# to the fallback chain and lands on origin/main — the wrong
+			# base this function was just fixed to stop using. Fetch the ref
+			# by name so the answer exists to be read.
+			#
+			# The explicit refspec, not a bare `git fetch origin <base>`:
+			# that one only populates FETCH_HEAD, which is per-repository
+			# and therefore shared by every worker's worktree — two members
+			# reaped at once would race over it.
+			#
+			# `|| true`, like every other git call here: this function is
+			# eval'd into the test suite's shell under `err_return`, where a
+			# bare failing command returns from the function before it can
+			# print anything — and an empty return is what _cmd_reap reads
+			# as "safe to reap". 2>/dev/null hides the message, not the exit
+			# status.
+			git -C "$wt" fetch -q origin \
+				"+refs/heads/${base_ref}:refs/remotes/origin/${base_ref}" 2>/dev/null || true
+			# And nothing else. The chain is what you consult when you have
+			# no answer; once the PR has given one, substituting a different
+			# base is not a fallback, it is a wrong answer with a fallback's
+			# manners. A fetch that fails — offline, expired auth, deleted
+			# base branch — used to fall through to origin/main here, which
+			# is the pre-fix bug reached by a narrower door. Leaving `base`
+			# empty instead skips the tree comparison, keeps `unpushed`
+			# non-zero, and holds the member: unknown is not fine, which is
+			# the same rule this change put in criterion 3.
+			bases=("refs/remotes/origin/${base_ref}")
+		else
+			bases=(refs/remotes/origin/HEAD refs/remotes/origin/main refs/remotes/origin/master)
+		fi
 		for b in "${bases[@]}"; do
 			base=$(git -C "$wt" rev-parse --verify --quiet "$b" 2>/dev/null) || base=""
 			[[ -n $base ]] && break
@@ -2978,9 +2995,9 @@ _cmd_watch() {
 	case $mode in
 		status)
 			if pid=$(_apex_watch_running "$manager"); then
-				# The knobs the *daemon* was started with, not this process's
-				# defaults — they are different values read in different shells,
-				# and the daemon's are the ones actually in force.
+			# The knobs the *daemon* was started with, not this process's
+			# defaults — they are different values read in different shells,
+			# and the daemon's are the ones actually in force.
 				local iv gr rn
 				iv=$(_apex_watch_state "$manager" interval);  [[ -z $iv ]] && iv='?'
 				gr=$(_apex_watch_state "$manager" box_grace); [[ -z $gr ]] && gr='?'
