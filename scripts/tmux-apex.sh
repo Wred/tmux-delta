@@ -771,6 +771,14 @@ _cmd_authority() {
  nobody has been asked about this repo, and --self-review must not answer for
  them. Run 'authority --ask', or pass --grant/--revoke alongside it."
 		fi
+		# Caught here rather than left to `apex_authority_set`'s return code, which
+		# surfaced a flat contradiction as "could not write <file>" — an I/O error
+		# for what is a contradictory request.
+		if [[ $self == yes && $want == no ]]; then
+			_die "authority: --revoke and --self-review yes contradict each other —
+ self-review authorises nothing without merge authority, and revoking merge
+ clears it. Pick one."
+		fi
 		# `--self-review yes` alone is refused rather than silently upgrading the
 		# merge axis: self-review is not a way to acquire merge authority.
 		if [[ $self == yes && -z $want ]] && ! apex_authority_may_merge "$rkey"; then

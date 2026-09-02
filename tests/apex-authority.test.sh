@@ -199,6 +199,16 @@ eq "…keeping the unreadable file aside"  1 \
 contains "…naming where it went"  ".corrupt-" "$err"
 rm -f "${AUTH_FILE}".corrupt-*(N)
 
+# A zero-byte file is an interrupted write, not corruption: quarantining it
+# would warn about answers it never held.
+rm -f "$AUTH_FILE" "${AUTH_FILE}".corrupt-*(N)
+: > "$AUTH_FILE"
+err=$(apex_authority_set "$KEY" yes sess-a /p 2>&1 >/dev/null) || true
+eq "an empty file is treated as absent, not corrupt" "" \
+	"$(print -r -- "${AUTH_FILE}".corrupt-*(N))"
+eq "…and says nothing about lost answers" "" "$err"
+eq "…and the write lands" yes "$(apex_authority_get "$KEY")"
+
 # Literal `null` and `false` are parseable JSON, so they are not corruption —
 # they are just a file with no grants in it, and must not be moved aside.
 print -r -- 'null' > "$AUTH_FILE"
@@ -324,6 +334,13 @@ out=$(apex authority --self-review yes 2>&1) && rc=0 || rc=$?
 eq "self-review alone cannot bootstrap merge authority"  1 "$rc"
 contains "…and says why"  "authorises" "$out"
 eq "…and nothing was written"  false "$(j "$(apex authority --json)" .self_review)"
+
+# A flat contradiction gets a named error, not `apex_authority_set`'s return
+# code surfacing as "could not write <file>".
+out=$(apex authority --revoke --self-review yes 2>&1) && rc=0 || rc=$?
+eq "--revoke with --self-review yes is a named contradiction"  1 "$rc"
+contains "…named as such, not as an I/O failure"  "contradict" "$out"
+ne "…and not reported as a write failure"  "*could not write*" "$out"
 
 out=$(apex authority --self-review perhaps 2>&1) && rc=0 || rc=$?
 eq "an unparseable --self-review value fails"  1 "$rc"

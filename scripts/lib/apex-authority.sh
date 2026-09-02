@@ -172,7 +172,10 @@ apex_authority_answered() {
 _apex_authority_read() {
 	setopt localoptions no_err_return
 	local f="$1" cur aside
-	if [[ ! -e $f ]]; then
+	# A zero-byte file is an interrupted write, not a corrupt store: quarantining
+	# it would warn about answers it never held and leave a useless file behind.
+	# Treated as absent, which is what it is.
+	if [[ ! -s $f ]]; then
 		print -r -- '{"grants":{}}'
 		return 0
 	fi
