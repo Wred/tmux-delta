@@ -400,6 +400,8 @@ drive it yourself:
 
 ```zsh
 tmux-apex.sh init                    # this session is now the manager
+tmux-apex.sh authority               # may apex merge in this repo? (default: no)
+tmux-apex.sh authority --self-review yes  # ...on its own review too (needs --grant)
 tmux-apex.sh profiles                # list available {agent,model,agent-flags} presets
 tmux-apex.sh spawn --issue 42 --profile standard
 tmux-apex.sh spawn --issue 43 --profile hard
@@ -427,9 +429,58 @@ naming, the already-has-an-open-PR check, session labelling and the dev layout
 are exactly the same as a manual `C-g` spawn. It defaults to not switching
 clients, so the manager keeps focus; pass `--switch` to jump to the new session.
 
-**The manager may not merge or close anything.** It spawns, instructs, kills and
-reaps; when work is done it reports "ready to merge" and stops. That boundary
-lives in the skill.
+**The manager may not close anything, and may not merge unless you have said it
+may — per repo.** It spawns, instructs, kills and reaps; when work is done it
+reports "ready to merge" and stops. That boundary lives in the skill.
+
+Merge authority is a separate, deliberately fail-closed switch, because it is
+the one decision no mechanical check can stand in for: the criteria in the skill
+can tell you CI is green and the diff is in scope, but not that a teammate
+expected to review it first. So it defaults to **not granted** in every repo,
+and stays that way until you say otherwise:
+
+```zsh
+tmux-apex.sh authority                 # what is in force here, and how it was decided
+tmux-apex.sh authority --grant         # yes, apex may merge reviewer-approved PRs here
+tmux-apex.sh authority --revoke        # no (also the default, and what silence means)
+tmux-apex.sh authority --self-review yes   # ...and on its own review, with no second agent
+tmux-apex.sh init --merge yes|no [--self-review yes|no]   # answer it at init time
+```
+
+There are two axes, because they are two questions. `--grant` says merging here
+is apex's to do. `--self-review` says it is apex's to do *without a second agent
+having looked* — apex can review a PR either by spawning an independent reviewer
+or by reading it itself, and its own reading is the weakest leg in the criteria
+list. Many repos will want the first and not the second, which is the default
+pairing: granted, apex merges what a reviewer signed off on and reports anything
+it only reviewed itself as ready-and-ineligible. Self-review authorises nothing
+on its own and is refused unless merging is granted; revoking merge clears it,
+so a stale yes cannot come back to life the next time someone re-grants merging.
+
+`init` asks both questions once, interactively, only when there is a terminal on
+the other end — it also runs from Claude Code hooks and on session recreation,
+and a prompt that hangs an unattended start would be worse than not having the
+feature. An unasked repo simply has no authority. `status` and `doctor` both
+report what is in force, so an agent cannot quietly forget it lacks the grant.
+
+Granting requires a terminal at both ends; revoking works from anywhere. The
+asymmetry is the point: the grant is yours to give, and an agent invoking the
+script from a tool call is not you, while nothing should make taking authority
+away harder than giving it. Set `APEX_AUTHORITY_UNATTENDED_GRANT=1` when a
+provisioning script is carrying your decision. It is a speed bump against an
+agent granting itself authority in passing, not a security boundary — an agent
+that sets that variable has bypassed it, and claiming otherwise would be the
+more dangerous claim.
+
+The answer is stored once per repo in
+`${XDG_CACHE_HOME:-~/.cache}/tmux-delta/apex/authority.json`, keyed on the
+normalised origin URL rather than the directory name so that a fork and its
+upstream are different trust contexts, and so that every worker worktree
+resolves to the same answer as the main tree. Anything unreadable, missing or
+unrecognised there reads as *not granted*. If that file is ever found corrupt it
+is moved aside to `authority.json.corrupt-<epoch>` and named on stderr rather
+than silently rewritten, so answers you gave are recoverable — every repo falls
+back to *not granted* in the meantime.
 
 ### Linked pairs: automatic fix/re-review loop
 

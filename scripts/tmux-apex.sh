@@ -20,12 +20,13 @@
 # manager's pane only when `pending` has something — see `watch`.
 #
 # Subcommands: init stop relink recover spawn send event status pending reap
-#              profiles watch doctor
+#              profiles watch doctor authority
 
 SELF="${0:A}"
 SCRIPTS="${SELF:h}"
 
 source "${SCRIPTS}/lib/apex-state.sh"
+source "${SCRIPTS}/lib/apex-authority.sh"
 source "${SCRIPTS}/lib/apex-profiles.sh"
 source "${SCRIPTS}/lib/pr-cache.sh"
 
@@ -624,11 +625,288 @@ _facts_line() {
 		] | join(" ")'
 }
 
+# ─── merge authority ─────────────────────────────────────────────────
+
+# _apex_interactive — is there a human at the other end of this run?
+#
+# Both ends have to be a terminal: init is also run from a Claude Code hook and
+# from `relink`, where stdin is closed or a pipe, and a `read` there either
+# returns instantly (looking like an answer nobody gave) or blocks a session
+# start forever. APEX_ASSUME_NONINTERACTIVE is the escape hatch for tests and
+# for anyone scripting init.
+_apex_interactive() {
+	[[ -z ${APEX_ASSUME_NONINTERACTIVE:-} ]] || return 1
+	[[ -t 0 && -t 1 ]]
+}
+
+# _apex_grant_allowed — may *this* run hand out authority?
+#
+# The skill says the grant is the human's to give and that granting it to itself
+# is the one move that empties it of meaning. That was only ever wording, and an
+# agent with a shell can run `authority --grant` as easily as a human can, so the
+# wording now has a mechanism behind it: a grant needs a terminal at both ends,
+# which an agent invoking the script from a tool call does not have.
+#
+# It gates grants only. Revoking needs no ceremony — it moves toward the default,
+# and anything that makes taking authority away harder than giving it is backwards.
+#
+# APEX_AUTHORITY_UNATTENDED_GRANT is the deliberate opt-out for provisioning
+# scripts and config management, where the human's decision is in the script.
+# Naming it in the refusal keeps the gate honest: it is a speed bump against an
+# agent granting itself authority in passing, not a security boundary, and
+# pretending otherwise would be the more dangerous claim.
+_apex_grant_allowed() {
+	_apex_interactive && return 0
+	[[ -n ${APEX_AUTHORITY_UNATTENDED_GRANT:-} ]]
+}
+
+# _apex_ask_merge_authority <repo-key> <session> <main-tree>
+# Only ever called behind _apex_interactive. Every non-answer — a bare newline,
+# an unrecognised word, EOF from a terminal that went away mid-question — is
+# recorded as `no`, because the point of asking is to reach a decision and the
+# only safe decision without one is the ungranted default.
+_apex_ask_merge_authority() {
+	local rkey="$1" session="$2" main="$3" reply="" ans=no self=no
+	print ""
+	print "Apex merge authority is not set for this repo. It defaults to NOT granted."
+	print "  repo: $main"
+	print "  key : $rkey"
+	print ""
+	print "Granted, apex may merge a PR that meets every criterion in its skill without"
+	print "asking you first. Ungranted, it reports such a PR as ready-and-ineligible and"
+	print "you merge it yourself; nothing else about apex changes."
+	print ""
+	print "Say yes only if merging here is genuinely yours to delegate. On a repo with"
+	print "other contributors, an agent merge cuts across review expectations that no"
+	print "mechanical criterion can see."
+	print -n "Grant apex merge authority in this repo? [y/N] "
+	if ! read -r reply; then print ""; reply=""; fi
+	ans=$(apex_authority_normalise "$reply" 2>/dev/null) || ans=no
+
+	# The second axis is only worth a question once the first is yes: ungranted,
+	# self-review authorises nothing, and asking about it would be asking a
+	# human to rule on a hypothetical.
+	if [[ $ans == yes ]]; then
+		print ""
+		print "Second question. Apex can review a PR two ways: spawn an independent"
+		print "reviewer, or read it itself. The grant above covers merging a PR a"
+		print "reviewer signed off on. Merging on the strength of apex's own reading"
+		print "is separate, and it is the weaker of the two — a reviewer that shares"
+		print "the author's blind spots finds nothing the author missed."
+		print -n "Also allow merging on apex's own review, with no second agent? [y/N] "
+		if ! read -r reply; then print ""; reply=""; fi
+		self=$(apex_authority_normalise "$reply" 2>/dev/null) || self=no
+	fi
+
+	apex_authority_set "$rkey" "$ans" "$session" "$main" "$self" \
+		|| print -u2 "tmux-apex: warning — could not record the answer; it will be asked again"
+	apex_event "$session" "$(jq -nc --arg k "$rkey" --arg a "$ans" --arg s "$self" \
+		'{event:"merge-authority", repo_key:$k, merge:($a == "yes"),
+		  self_review:($s == "yes"), source:"prompt"}')"
+	print ""
+	print "Recorded: $(apex_authority_describe "$ans" "$self")"
+	print "Change it any time with '${SELF##*/} authority --grant|--revoke'"
+	print "and '${SELF##*/} authority --self-review yes|no'."
+}
+
+# _cmd_authority [--grant|--revoke] [--self-review yes|no] [--ask] [--json]
+#
+# The read-back path the feature needs in order to be usable at all: an authority
+# the agent cannot see is one it will forget it does not have. Keys on the repo
+# rather than on a manager session, so a worker pane can check it too, and works
+# from a linked worktree since every worktree shares the repo's origin.
+_cmd_authority() {
+	local want="" self="" ask=false as_json=false
+	while (( $# )); do
+		case "$1" in
+			--grant)   want=yes; shift ;;
+			--revoke)  want=no; shift ;;
+			# --grant=WORD stays accepted so a script can pass a variable through
+			# without branching on its value.
+			--grant=*) want=$(apex_authority_normalise "${1#--grant=}" 2>/dev/null) \
+				|| _die "authority: --grant takes yes|no (got '${1#--grant=}')"; shift ;;
+			--self-review) _need_val authority --self-review $#
+				self=$(apex_authority_normalise "$2" 2>/dev/null) \
+					|| _die "authority: --self-review takes yes|no (got '$2')"; shift 2 ;;
+			--self-review=*) self=$(apex_authority_normalise "${1#--self-review=}" 2>/dev/null) \
+				|| _die "authority: --self-review takes yes|no (got '${1#--self-review=}')"; shift ;;
+			--grant-self-review)  self=yes; shift ;;
+			--revoke-self-review) self=no; shift ;;
+			--ask)     ask=true; shift ;;
+			--json)    as_json=true; shift ;;
+			*) _die "authority: unknown option '$1'" ;;
+		esac
+	done
+	[[ -n $want || -n $self ]] && $ask \
+		&& _die "authority: --ask cannot be combined with --grant/--revoke/--self-review"
+
+	local main rkey
+	main=$(_main_tree) || true
+	[[ -z $main ]] && _die "authority: not inside a git repository"
+	rkey=$(apex_repo_key "$main") || _die "authority: cannot identify this repo"
+
+	local session
+	session=$(_cur_session 2>/dev/null) || session=""
+
+	if [[ -n $want || -n $self ]]; then
+		# Only grants are gated; either axis moving to `yes` is a grant.
+		if [[ $want == yes || $self == yes ]] && ! _apex_grant_allowed; then
+			_die "authority: granting needs a terminal — the grant is the human's to give,\
+ and granting it to yourself empties it of meaning. Run this from a shell\
+ prompt, or set APEX_AUTHORITY_UNATTENDED_GRANT=1 if a provisioning script\
+ is carrying the human's decision. Revoking works from anywhere."
+		fi
+		# `--self-review` on its own has nothing to attach to until the merge
+		# question has been answered, and it must not answer it by implication.
+		# Backfilling the merge axis from `apex_authority_get` did exactly that:
+		# `get` returns `no` both for "the human declined" and for "nobody has
+		# been asked", so `--self-review no` on a fresh repo stored `merge:false`
+		# and flipped `apex_authority_answered` to true — turning a pending
+		# question into a recorded decline that nobody gave. `init` then stops
+		# asking and `doctor` says "declined" instead of "never answered". Nothing
+		# gained authority, but a `no` nobody said is indistinguishable from one
+		# they did, which is the whole failure this feature exists to avoid.
+		if [[ -z $want ]] && ! apex_authority_answered "$rkey"; then
+			_die "authority: --self-review needs the merge question answered first —
+ nobody has been asked about this repo, and --self-review must not answer for
+ them. Run 'authority --ask', or pass --grant/--revoke alongside it."
+		fi
+		# Caught here rather than left to `apex_authority_set`'s return code, which
+		# surfaced a flat contradiction as "could not write <file>" — an I/O error
+		# for what is a contradictory request.
+		if [[ $self == yes && $want == no ]]; then
+			_die "authority: --revoke and --self-review yes contradict each other —
+ self-review authorises nothing without merge authority, and revoking merge
+ clears it. Pick one."
+		fi
+		# `--self-review yes` alone is refused rather than silently upgrading the
+		# merge axis: self-review is not a way to acquire merge authority.
+		if [[ $self == yes && -z $want ]] && ! apex_authority_may_merge "$rkey"; then
+			_die "authority: --self-review yes needs merge authority first (it authorises
+ nothing on its own). Grant merging too, or pass --grant with it."
+		fi
+		# An unspecified merge axis keeps its stored answer, so `--self-review no`
+		# does not revoke merging as a side effect. Safe to read with `get` now:
+		# the guard above established that the answer on record is a real one.
+		local wmerge="$want"
+		if [[ -z $wmerge ]]; then
+			wmerge=$(apex_authority_get "$rkey")
+		fi
+		apex_authority_set "$rkey" "$wmerge" "$session" "$main" "$self" \
+			|| _die "authority: could not write $(APEX_AUTHORITY_FILE)"
+		[[ -n $session ]] && apex_event "$session" \
+			"$(jq -nc --arg k "$rkey" --arg a "$wmerge" --arg s "$self" \
+				'{event:"merge-authority", repo_key:$k, merge:($a == "yes"),
+				  self_review:$s, source:"cli"}')"
+	elif $ask; then
+		_apex_interactive || _die "authority: --ask needs a terminal (use --grant or --revoke)"
+		_apex_ask_merge_authority "$rkey" "$session" "$main"
+	fi
+
+	local ans sans answered=false
+	ans=$(apex_authority_get "$rkey")
+	sans=$(apex_authority_get "$rkey" self_review)
+	apex_authority_answered "$rkey" && answered=true
+
+	if $as_json; then
+		jq -nc --arg k "$rkey" --arg r "$main" --arg f "$(APEX_AUTHORITY_FILE)" \
+			--argjson merge "$([[ $ans == yes ]] && print true || print false)" \
+			--argjson self_review "$([[ $sans == yes ]] && print true || print false)" \
+			--argjson answered "$answered" \
+			'{repo:$r, repo_key:$k, merge:$merge, self_review:$self_review,
+			  answered:$answered, file:$f}'
+		return 0
+	fi
+
+	print "repo     : $main"
+	print "repo key : $rkey"
+	print "authority: $(apex_authority_describe "$ans" "$sans")"
+	$answered || print "           (never answered for this repo — the default stands)"
+	print "recorded : $(APEX_AUTHORITY_FILE)"
+	if [[ $ans == yes ]]; then
+		print "revoke   : ${SELF##*/} authority --revoke"
+		if [[ $sans == yes ]]; then
+			print "           ${SELF##*/} authority --self-review no   (keep merging, drop self-review)"
+		else
+			print "self-rev : ${SELF##*/} authority --self-review yes"
+		fi
+	else
+		print "grant    : ${SELF##*/} authority --grant"
+	fi
+	return 0
+}
+
+# _apex_authority_repo <manager> — the repo a manager's authority is keyed on.
+#
+# Fails rather than falling back to $PWD. The fallback was wrong in the one
+# direction that matters: `status`/`doctor` run from an unrelated repo that
+# happens to be granted would report the manager as having authority it does not
+# have, which is a fail-*open* answer inside a fail-closed feature. Callers
+# render the failure as `unknown` and treat it as no authority.
+_apex_authority_repo() {
+	setopt localoptions no_err_return
+	local manager="$1" repo=""
+	[[ -n $manager ]] || return 1
+	repo=$(jq -r '.repo // empty' "$(apex_file "$manager")" 2>/dev/null) || return 1
+	[[ -n $repo && -d $repo ]] || return 1
+	print -r -- "$repo"
+}
+
+# _apex_status_authority <manager> [axis] — `yes`/`no`/`unknown` for the
+# manager's repo. Resolved from the manager's recorded repo, so `status` run
+# inside a worker worktree still reports the manager's authority.
+_apex_status_authority() {
+	setopt localoptions no_err_return
+	local manager="$1" axis="${2:-merge}" repo key
+	repo=$(_apex_authority_repo "$manager") || { print -r -- unknown; return 0 }
+	key=$(apex_repo_key "$repo" 2>/dev/null) || key=""
+	[[ -n $key ]] || { print -r -- unknown; return 0 }
+	apex_authority_get "$key" "$axis"
+}
+
 # ─── init / stop ─────────────────────────────────────────────────────
 
 _cmd_init() {
-	local force=false a
-	for a in "$@"; do [[ $a == --force ]] && force=true; done
+	local force=false grant="" raw="" saw_merge=false
+	local selfgrant="" selfraw="" saw_self=false
+	while (( $# )); do
+		case "$1" in
+			--force) force=true; shift ;;
+			--merge) _need_val init --merge $#; raw="$2"; saw_merge=true; shift 2 ;;
+			--merge=*) raw="${1#--merge=}"; saw_merge=true; shift ;;
+			--self-review) _need_val init --self-review $#; selfraw="$2"; saw_self=true; shift 2 ;;
+			--self-review=*) selfraw="${1#--self-review=}"; saw_self=true; shift ;;
+			*) shift ;;
+		esac
+	done
+	# Validated on the flag having been *seen*, not on its value being non-empty:
+	# `--merge ''` is a mistake worth naming, and the old guard let it through to
+	# be silently treated as "no flag given", i.e. as the default answer.
+	if $saw_merge; then
+		grant=$(apex_authority_normalise "$raw" 2>/dev/null) \
+			|| _die "init: --merge takes yes|no (got '$raw')"
+	fi
+	if $saw_self; then
+		selfgrant=$(apex_authority_normalise "$selfraw" 2>/dev/null) \
+			|| _die "init: --self-review takes yes|no (got '$selfraw')"
+		# Only reaches storage alongside an explicit --merge, so on its own it was
+		# parsed, validated, and then silently dropped — and `--self-review no` on
+		# a repo where self-review *is* granted read as a revocation that never
+		# happened. Same bug as `--merge ''`, on the sibling flag, and the same
+		# rule settles it: a flag that was seen either takes effect or is named as
+		# an error. Named here rather than honoured, because standalone axis edits
+		# are what `authority --self-review` is for, and doing them from `init`
+		# would mean re-deriving the stored merge answer in a second place.
+		$saw_merge || _die "init: --self-review needs --merge (change it on its own with
+ '${SELF##*/} authority --self-review ${selfgrant}')"
+		[[ $selfgrant == yes && $grant != yes ]] \
+			&& _die "init: --self-review yes needs --merge yes (it authorises nothing alone)"
+	fi
+	if [[ $grant == yes || $selfgrant == yes ]] && ! _apex_grant_allowed; then
+		_die "init: --merge yes needs a terminal, or APEX_AUTHORITY_UNATTENDED_GRANT=1
+ if a provisioning script is carrying the human's decision. Merge authority is
+ the human's to give; an init running from a hook is not the human."
+	fi
 
 	local session main other
 	session=$(_cur_session) || _die "not inside tmux"
@@ -657,12 +935,44 @@ _cmd_init() {
 			'{session:$s, repo:$r, agent_pane:$p, created_at:$t}')"
 	apex_event "$session" "$(jq -nc --arg s "$session" '{event:"manager-init", session:$s}')"
 
+	# Merge authority is a per-repo decision with a default of "not granted"
+	# (issue #41). Settled here because init is where a human is most likely to
+	# be watching, but it must never *depend* on one: init also runs from hooks
+	# on session recreation, and a prompt that hangs an unattended start is worse
+	# than not having the feature. So: an explicit --merge wins, an
+	# already-answered repo is left alone, and a question we cannot ask
+	# interactively is simply not asked — the unanswered default is no authority.
+	local rkey rans rself
+	rkey=$(apex_repo_key "$main") || rkey=""
+	if [[ -n $rkey ]]; then
+		if [[ -n $grant ]]; then
+			apex_authority_set "$rkey" "$grant" "$session" "$main" "$selfgrant" \
+				|| print -u2 "tmux-apex: warning — could not record the merge grant; it will be asked again"
+			apex_event "$session" "$(jq -nc --arg k "$rkey" --arg a "$grant" --arg s "$selfgrant" \
+				'{event:"merge-authority", repo_key:$k, merge:($a == "yes"),
+				  self_review:$s, source:"flag"}')"
+		elif ! apex_authority_answered "$rkey" && _apex_interactive; then
+			_apex_ask_merge_authority "$rkey" "$session" "$main"
+		fi
+		rans=$(apex_authority_get "$rkey")
+		rself=$(apex_authority_get "$rkey" self_review)
+	else
+		rans=no
+		rself=no
+	fi
+
 	tmux refresh-client -S 2>/dev/null
 	print "Apex manager active."
 	print "  session : $session"
 	print "  repo    : $main"
 	print "  pane    : ${TMUX_PANE:-<unknown>}"
 	print "  state   : $(apex_dir "$session")"
+	print "  authority: $(apex_authority_describe "$rans" "$rself")"
+	[[ -n $rkey ]] && print "  repo key : $rkey"
+	if [[ $rans == no && -n $rkey ]] && ! apex_authority_answered "$rkey"; then
+		print "  (nobody has been asked about this repo yet — grant with:"
+		print "   ${SELF##*/} authority --grant)"
+	fi
 
 	# Hooks only fire on the manager's own turns; the watcher is what notices a
 	# worker transition in between them. Started before the check below so that
@@ -690,6 +1000,12 @@ _cmd_stop() {
 
 # relink — re-derive @apex_role/@apex_session/@apex_task/@apex_repo for the
 # CURRENT session from durable state.
+#
+# Merge authority (issue #41) needs no re-deriving here, by construction: it is
+# keyed on the repo and stored once at $APEX_ROOT/authority.json, and every
+# reader resolves it on demand rather than caching it onto a tmux option. So a
+# recreated session cannot silently revert to the ungranted default the way a
+# lost @apex_role loses a manager — there is nothing session-shaped to lose.
 #
 # @-options are tmux session options: they never survive a killed-and-
 # recreated session (a crash, `claude --continue` picking the session back
@@ -1958,12 +2274,17 @@ _cmd_status() {
 		[[ -z $events ]] && events='[]'
 		printf '%s\n' "${rows[@]}" \
 			| jq -s --arg m "$manager" --argjson ev "$events" \
-				'{manager:$m, members:., recent_events:$ev}'
+				--arg auth "$(_apex_status_authority "$manager")" \
+				--arg selfrev "$(_apex_status_authority "$manager" self_review)" \
+				'{manager:$m, merge_authority:$auth, self_review_authority:$selfrev,
+				  members:., recent_events:$ev}'
 		return
 	fi
 
 	print "Apex manager: $manager"
 	print "State: $(apex_dir "$manager")"
+	print "Authority: $(apex_authority_describe "$(_apex_status_authority "$manager")" \
+		"$(_apex_status_authority "$manager" self_review)")"
 	if (( ${#rows} == 0 )); then
 		print "\nNo members yet. Spawn one with: ${SELF##*/} spawn --issue N"
 		return
@@ -3218,9 +3539,35 @@ _cmd_doctor() {
   (init does this automatically, and relink restarts it on every manager hook)."
 	fi
 
+	# Authority is advisory here too, and for the same reason as the poller: not
+	# having it is a correct state, not a broken one, so it never moves the exit
+	# code. It is reported because an authority the agent cannot see is one it
+	# will forget it does not have (issue #41).
+	# Both the answer and the hint come off one key, and the line says which repo
+	# that key is. The first cut read the answer from the manager's repo and the
+	# hint from $PWD's, so run from a worker worktree with a different origin it
+	# could report "granted" and "never answered for this repo" together, each
+	# true of a different repo and the pair true of neither.
+	local auth_line ans self akey arepo
+	arepo=$(_apex_authority_repo "$mgr" 2>/dev/null) || arepo="$PWD"
+	akey=$(apex_repo_key "$arepo" 2>/dev/null) || akey=""
+	if [[ -n $akey ]]; then
+		ans=$(apex_authority_get "$akey")
+		self=$(apex_authority_get "$akey" self_review)
+	else
+		ans=unknown
+		self=no
+	fi
+	auth_line="Merge authority: $(apex_authority_describe "$ans" "$self")"
+	auth_line+=$'\n  for '"$arepo"$' ('"${akey:-not a git repository}"$')'
+	if [[ $ans == no ]] && ! apex_authority_answered "$akey"; then
+		auth_line+=$'\n  Never answered for that repo. Grant it with\n  '"'${SELF} authority --grant'"$' — apex never decides this for itself.'
+	fi
+
 	if (( ${#missing} == 0 )); then
 		$quiet || print "Ping delivery: all hooks wired (${(j:, :)present})."
 		$quiet || print "$watch_line"
+		$quiet || print "$auth_line"
 		return 0
 	fi
 
@@ -3238,6 +3585,7 @@ _cmd_doctor() {
 	print -u2 ""
 	print -u2 "  until then, run '${SELF} pending' by hand — it reports the same events."
 	print -u2 "$watch_line"
+	print -u2 "$auth_line"
 	return 1
 }
 
@@ -3245,6 +3593,7 @@ _cmd_doctor() {
 
 case "${1:-}" in
 	init)     shift; _cmd_init "$@" ;;
+	authority) shift; _cmd_authority "$@" ;;
 	doctor)   shift; _cmd_doctor "$@" ;;
 	stop)     shift; _cmd_stop "$@" ;;
 	relink)   shift; _cmd_relink "$@" ;;
@@ -3266,7 +3615,16 @@ case "${1:-}" in
 	*)
 		print "tmux-apex.sh — apex mode for tmux-delta"
 		print ""
-		print "  init [--force]                 mark this session as the apex manager"
+		print "  init [--force] [--merge yes|no] mark this session as the apex manager"
+		print "       [--self-review yes|no]    --merge answers the merge-authority question"
+		print "                                 non-interactively; with no flag init asks only"
+		print "                                 if a human is watching, and an unasked repo"
+		print "                                 gets no merge authority. --self-review adds the"
+		print "                                 second axis and needs --merge yes"
+		print "  authority [--grant|--revoke]   show or set this repo's merge authority"
+		print "            [--self-review yes|no] (every repo starts with none; the two axes are"
+		print "            [--ask] [--json]     separate — merging a reviewed PR vs merging on"
+		print "                                 apex's own review). Granting needs a terminal."
 		print "  stop                           leave manager mode (members keep running)"
 		print "  relink                         re-derive role/linkage after a session restart"
 		print "  spawn --issue N [opts]         spawn a worker on a GitHub issue"
