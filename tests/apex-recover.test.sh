@@ -902,6 +902,32 @@ contains "…while with no PR number to ask about it holds" "unpushed commit(s)"
 GH_BASE_REF=""
 contains "…and it holds when gh cannot answer" "unpushed commit(s)" \
 	"$(risk "$RELWT" false MERGED 7)"
+
+# ── the same PR in a narrow-refspec repo ────────────────────────────
+# Knowing the base by name is not having a ref for it. Where
+# remote.origin.fetch covers only main (issue #31), origin/release never
+# exists, so asking the PR and then rev-parsing it falls through to the chain
+# and lands back on origin/main — the exact wrong base, reached the long way
+# round. The guard has to fetch the ref it was told to compare against.
+NARROWREL="$TMPROOT/wt/release-narrow"
+cp -R "$RELWT" "$NARROWREL"
+(
+	cd "$NARROWREL" || exit
+	export PATH="$GBIN:$PATH"
+	git config remote.origin.fetch '+refs/heads/main:refs/remotes/origin/main'
+	git update-ref -d refs/remotes/origin/release
+) >/dev/null 2>&1
+eq "the narrow release fixture has no tracking ref for its base" "" \
+	"$(PATH="$GBIN:$PATH" git -C "$NARROWREL" rev-parse --verify --quiet refs/remotes/origin/release 2>/dev/null)"
+neq "…and origin/main is there to be wrongly picked" "" \
+	"$(PATH="$GBIN:$PATH" git -C "$NARROWREL" rev-parse --verify --quiet refs/remotes/origin/main 2>/dev/null)"
+
+GH_BASE_REF=release
+eq "a non-default base is fetched rather than assumed to be present" "" \
+	"$(risk "$NARROWREL" false MERGED 7)"
+eq "…which leaves the base's own tip behind as the tracking ref" \
+	"$(PATH="$GBIN:$PATH" git -C "$NARROWREL" ls-remote origin refs/heads/release 2>/dev/null | cut -f1)" \
+	"$(PATH="$GBIN:$PATH" git -C "$NARROWREL" rev-parse --verify --quiet refs/remotes/origin/release 2>/dev/null)"
 unset GH_BASE_REF
 
 # ─── 10. the guard where it actually matters: inside `reap` ──────────

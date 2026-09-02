@@ -89,9 +89,14 @@ report. If you cannot check one, it is not met.
    all:
    ```
    base=$(gh pr view N --json baseRefName -q .baseRefName)
-   git fetch -q origin "$base"
-   git rev-list --count "HEAD..origin/${base}"   # must be 0, and must not be empty
+   git fetch -q origin "+refs/heads/${base}:refs/remotes/origin/${base}"
+   git rev-list --count "HEAD..refs/remotes/origin/${base}"   # 0, and not empty
    ```
+   Fetch into that ref by name, explicitly. A plain `git fetch origin "$base"`
+   only lands in `FETCH_HEAD`, and creates `origin/<base>` solely when
+   `remote.origin.fetch` already covers the branch — which in a repo whose
+   refspec is narrowed to `main` (see issue #31) it does not, for every base
+   this criterion was extended to handle.
    An empty count is **not** 0: it means the ref did not resolve and the check
    never ran. Treat unknown as not met. That is the general rule for every
    criterion here — if the broken form of a check returns the passing value, the

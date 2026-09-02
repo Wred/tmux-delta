@@ -2201,7 +2201,23 @@ _reap_risk() {
 		if [[ -n $pr_number ]]; then
 			local base_ref=""
 			base_ref=$(cd "$wt" && gh pr view "$pr_number" --json baseRefName -q .baseRefName 2>/dev/null) || base_ref=""
-			[[ -n $base_ref && $base_ref != null ]] && bases+=("refs/remotes/origin/${base_ref}")
+			if [[ -n $base_ref && $base_ref != null ]]; then
+				# Knowing the base by name is not the same as having a ref for
+				# it. Under the narrow remote.origin.fetch of issue #31 the only
+				# remote-tracking ref that exists is origin/main, so asking the
+				# PR and then rev-parsing origin/<base> falls straight through
+				# to the fallback chain and lands on origin/main — the wrong
+				# base this function was just fixed to stop using. Fetch the ref
+				# by name so the answer exists to be read.
+				#
+				# The explicit refspec, not a bare `git fetch origin <base>`:
+				# that one only populates FETCH_HEAD, which is per-repository
+				# and therefore shared by every worker's worktree — two members
+				# reaped at once would race over it.
+				git -C "$wt" fetch -q origin \
+					"+refs/heads/${base_ref}:refs/remotes/origin/${base_ref}" 2>/dev/null
+				bases+=("refs/remotes/origin/${base_ref}")
+			fi
 		fi
 		bases+=(refs/remotes/origin/HEAD refs/remotes/origin/main refs/remotes/origin/master)
 		for b in "${bases[@]}"; do
