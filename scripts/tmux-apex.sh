@@ -756,6 +756,21 @@ _cmd_authority() {
  prompt, or set APEX_AUTHORITY_UNATTENDED_GRANT=1 if a provisioning script\
  is carrying the human's decision. Revoking works from anywhere."
 		fi
+		# `--self-review` on its own has nothing to attach to until the merge
+		# question has been answered, and it must not answer it by implication.
+		# Backfilling the merge axis from `apex_authority_get` did exactly that:
+		# `get` returns `no` both for "the human declined" and for "nobody has
+		# been asked", so `--self-review no` on a fresh repo stored `merge:false`
+		# and flipped `apex_authority_answered` to true — turning a pending
+		# question into a recorded decline that nobody gave. `init` then stops
+		# asking and `doctor` says "declined" instead of "never answered". Nothing
+		# gained authority, but a `no` nobody said is indistinguishable from one
+		# they did, which is the whole failure this feature exists to avoid.
+		if [[ -z $want ]] && ! apex_authority_answered "$rkey"; then
+			_die "authority: --self-review needs the merge question answered first —
+ nobody has been asked about this repo, and --self-review must not answer for
+ them. Run 'authority --ask', or pass --grant/--revoke alongside it."
+		fi
 		# `--self-review yes` alone is refused rather than silently upgrading the
 		# merge axis: self-review is not a way to acquire merge authority.
 		if [[ $self == yes && -z $want ]] && ! apex_authority_may_merge "$rkey"; then
@@ -763,7 +778,8 @@ _cmd_authority() {
  nothing on its own). Grant merging too, or pass --grant with it."
 		fi
 		# An unspecified merge axis keeps its stored answer, so `--self-review no`
-		# does not revoke merging as a side effect.
+		# does not revoke merging as a side effect. Safe to read with `get` now:
+		# the guard above established that the answer on record is a real one.
 		local wmerge="$want"
 		if [[ -z $wmerge ]]; then
 			wmerge=$(apex_authority_get "$rkey")
@@ -865,6 +881,16 @@ _cmd_init() {
 	if $saw_self; then
 		selfgrant=$(apex_authority_normalise "$selfraw" 2>/dev/null) \
 			|| _die "init: --self-review takes yes|no (got '$selfraw')"
+		# Only reaches storage alongside an explicit --merge, so on its own it was
+		# parsed, validated, and then silently dropped — and `--self-review no` on
+		# a repo where self-review *is* granted read as a revocation that never
+		# happened. Same bug as `--merge ''`, on the sibling flag, and the same
+		# rule settles it: a flag that was seen either takes effect or is named as
+		# an error. Named here rather than honoured, because standalone axis edits
+		# are what `authority --self-review` is for, and doing them from `init`
+		# would mean re-deriving the stored merge answer in a second place.
+		$saw_merge || _die "init: --self-review needs --merge (change it on its own with
+ '${SELF##*/} authority --self-review ${selfgrant}')"
 		[[ $selfgrant == yes && $grant != yes ]] \
 			&& _die "init: --self-review yes needs --merge yes (it authorises nothing alone)"
 	fi

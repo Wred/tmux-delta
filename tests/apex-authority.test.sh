@@ -328,6 +328,23 @@ eq "…and nothing was written"  false "$(j "$(apex authority --json)" .self_rev
 out=$(apex authority --self-review perhaps 2>&1) && rc=0 || rc=$?
 eq "an unparseable --self-review value fails"  1 "$rc"
 
+# `--self-review` on an unanswered repo used to backfill the merge axis from
+# `apex_authority_get`, which returns `no` both for "declined" and for "nobody
+# asked" — so it recorded a decline nobody gave, `init` stopped asking, and
+# `doctor` said declined instead of never-answered.
+rm -f "$AUTH_FILE"
+out=$(apex authority --self-review no 2>&1) && rc=0 || rc=$?
+eq "--self-review on an unanswered repo is refused"  1 "$rc"
+contains "…saying it must not answer for the human"  "must not answer" "$out"
+eq "…and the merge question is still open"  false "$(j "$(apex authority --json)" .answered)"
+out=$(apex authority --revoke --self-review no --json)
+eq "…while an explicit answer alongside it is fine"  true "$(j "$out" .answered)"
+
+# init: a flag that was seen either takes effect or is named as an error. On its
+# own, --self-review was parsed, validated, then silently dropped.
+out=$(apex init --self-review no 2>&1) && rc=0 || rc=$?
+eq "init --self-review without --merge is a named error"  1 "$rc"
+contains "…pointing at the subcommand that does it"  "authority --self-review" "$out"
 out=$(apex init --merge no --self-review yes 2>&1) && rc=0 || rc=$?
 eq "init refuses self-review without merge too"  1 "$rc"
 
