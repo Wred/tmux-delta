@@ -38,6 +38,10 @@ eq() {
 	else bad "$1" "expected: ${(qqq)2}
        actual  : ${(qqq)3}"; fi
 }
+neq() {
+	if [[ $2 != $3 ]]; then ok "$1"
+	else bad "$1" "expected anything but: ${(qqq)2}"; fi
+}
 contains() {
 	if [[ $3 == *$2* ]]; then ok "$1"
 	else bad "$1" "expected to contain: ${(qqq)2}
@@ -658,12 +662,21 @@ GBIN="$TMPROOT/realbin"; mkdir -p "$GBIN"
 REAL_GIT=$(PATH="/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin" whence -p git)
 ln -sf "$REAL_GIT" "$GBIN/git"
 
-facts_for() {  # facts_for <worktree> <dirty-bool> [pr-state]
-	jq -nc --arg wt "$1" --argjson d "$2" --arg ps "${3:-}" \
-		'{worktree:$wt, dirty:$d, commits_ahead:0, pr_state:$ps}'
+facts_for() {  # facts_for <worktree> <dirty-bool> [pr-state] [pr-number]
+	jq -nc --arg wt "$1" --argjson d "$2" --arg ps "${3:-}" --arg pn "${4:-}" \
+		'{worktree:$wt, dirty:$d, commits_ahead:0, pr_state:$ps, pr_number:$pn}'
 }
 
-risk() { PATH="$GBIN:$PATH" _reap_risk "$(facts_for "$1" "$2" "${3:-}")" }
+risk() { PATH="$GBIN:$PATH" _reap_risk "$(facts_for "$1" "$2" "${3:-}" "${4:-}")" }
+
+# A `gh` that answers only what the guard asks it. GH_BASE_REF empty means "gh
+# cannot answer", which is the case the fallback chain has to cover.
+cat > "$GBIN/gh" <<'EOF'
+#!/bin/sh
+[ -n "$GH_BASE_REF" ] || exit 1
+printf '%s\n' "$GH_BASE_REF"
+EOF
+chmod +x "$GBIN/gh"
 
 # A bare "remote" plus a clone whose one commit is pushed: nothing to lose.
 REMOTE="$TMPROOT/remote.git"
@@ -815,6 +828,149 @@ contains "…and so does an unknown PR state" "1 unpushed commit(s)" \
 ) >/dev/null 2>&1
 contains "work added after the merge still holds it back" "unpushed commit(s)" \
 	"$(risk "$MERGED_WT" false MERGED)"
+
+# ── a PR that does not target the default branch (issue #40) ─────────
+# The base was resolved by trying origin/HEAD, then origin/main, then
+# origin/master — a fallback chain with no input from the PR. For a PR merged
+# into a release branch that answers about main, and the tree comparison then
+# says "still differs" for work that is fully merged. Where the PR number is
+# known, its baseRefName is the real answer.
+print "\nreap guard for a PR merged into a non-default base"
+RELREMOTE="$TMPROOT/relremote.git"
+PATH="$GBIN:$PATH" git init -q --bare "$RELREMOTE"
+RELSEED="$TMPROOT/relseed"
+(
+	export PATH="$GBIN:$PATH"
+	git clone -q "$RELREMOTE" "$RELSEED"
+	cd "$RELSEED" || exit
+	git config user.email t@t; git config user.name t
+	print seed > s; git add s; git commit -qm seed; git push -q origin HEAD:main
+	git fetch -q origin
+	git checkout -qB release origin/main
+	print rel > r; git add r; git commit -qm "release line"; git push -q origin release
+	# main moves on independently, so tree-vs-main can never match the branch.
+	git checkout -qB main origin/main
+	print drift > d; git add d; git commit -qm "main drifts"; git push -q origin main
+) >/dev/null 2>&1
+PATH="$GBIN:$PATH" git -C "$RELREMOTE" symbolic-ref HEAD refs/heads/main
+
+RELWT="$TMPROOT/wt/release"
+PATH="$GBIN:$PATH" git clone -q "$RELREMOTE" "$RELWT" 2>/dev/null
+(
+	cd "$RELWT" || exit
+	export PATH="$GBIN:$PATH"
+	git config user.email t@t; git config user.name t
+	git checkout -qb relbranch origin/release
+	print fix > hotfix; git add hotfix; git commit -qm "the hotfix"
+	git push -q origin relbranch
+) >/dev/null 2>&1
+
+# Squash it into release, GitHub-style, from elsewhere, then drop the branch.
+RELSQ="$TMPROOT/relsquasher"
+(
+	export PATH="$GBIN:$PATH"
+	git clone -q "$RELREMOTE" "$RELSQ"
+	cd "$RELSQ" || exit
+	git config user.email t@t; git config user.name t
+	git checkout -qB release origin/release
+	git merge -q --squash origin/relbranch
+	git commit -qm "the hotfix (#7)"
+	git push -q origin release
+	git push -q origin --delete relbranch
+) >/dev/null 2>&1
+PATH="$GBIN:$PATH" git -C "$RELWT" fetch -q --prune origin 2>/dev/null
+
+# Premises: the commits are unreachable, the content is in release, and main —
+# the branch the old chain would have picked — genuinely disagrees.
+eq "the release fixture's commits are unreachable from any remote ref" 1 \
+	"$(PATH="$GBIN:$PATH" git -C "$RELWT" rev-list --count HEAD --not --remotes 2>/dev/null)"
+eq "…and its tree matches the release base it merged into" "" \
+	"$(PATH="$GBIN:$PATH" git -C "$RELWT" diff --name-only refs/remotes/origin/release HEAD 2>/dev/null)"
+neq "…but not origin/main, so the old fallback chain answers wrongly" "" \
+	"$(PATH="$GBIN:$PATH" git -C "$RELWT" diff --name-only refs/remotes/origin/main HEAD 2>/dev/null)"
+
+export GH_BASE_REF=release
+eq "a PR merged into a non-default base is safe to reap" "" \
+	"$(risk "$RELWT" false MERGED 7)"
+
+# With no PR number there is nothing to ask, and with no answer from gh the
+# chain is all there is — both must fail closed rather than clear on the wrong
+# base. This is the pre-fix behaviour, kept deliberately as the floor.
+contains "…while with no PR number to ask about it holds" "unpushed commit(s)" \
+	"$(risk "$RELWT" false MERGED)"
+export GH_BASE_REF=""
+contains "…and it holds when gh cannot answer" "unpushed commit(s)" \
+	"$(risk "$RELWT" false MERGED 7)"
+
+# ── the same PR in a narrow-refspec repo ────────────────────────────
+# Knowing the base by name is not having a ref for it. Where
+# remote.origin.fetch covers only main (issue #31), origin/release never
+# exists, so asking the PR and then rev-parsing it falls through to the chain
+# and lands back on origin/main — the exact wrong base, reached the long way
+# round. The guard has to fetch the ref it was told to compare against.
+NARROWREL="$TMPROOT/wt/release-narrow"
+cp -R "$RELWT" "$NARROWREL"
+(
+	cd "$NARROWREL" || exit
+	export PATH="$GBIN:$PATH"
+	git config remote.origin.fetch '+refs/heads/main:refs/remotes/origin/main'
+	git update-ref -d refs/remotes/origin/release
+) >/dev/null 2>&1
+eq "the narrow release fixture has no tracking ref for its base" "" \
+	"$(PATH="$GBIN:$PATH" git -C "$NARROWREL" rev-parse --verify --quiet refs/remotes/origin/release 2>/dev/null)"
+neq "…and origin/main is there to be wrongly picked" "" \
+	"$(PATH="$GBIN:$PATH" git -C "$NARROWREL" rev-parse --verify --quiet refs/remotes/origin/main 2>/dev/null)"
+
+export GH_BASE_REF=release
+eq "a non-default base is fetched rather than assumed to be present" "" \
+	"$(risk "$NARROWREL" false MERGED 7)"
+eq "…which leaves the base's own tip behind as the tracking ref" \
+	"$(PATH="$GBIN:$PATH" git -C "$NARROWREL" ls-remote origin refs/heads/release 2>/dev/null | cut -f1)" \
+	"$(PATH="$GBIN:$PATH" git -C "$NARROWREL" rev-parse --verify --quiet refs/remotes/origin/release 2>/dev/null)"
+unset GH_BASE_REF
+
+# ── and when that fetch cannot succeed ───────────────────────────────
+# The fetch closes the common case; it does not make the base ref certain.
+# Offline, expired auth, a deleted base branch — any of those leave the derived
+# base unresolvable, and the question the guard should then answer is *unknown*,
+# not "here is a different branch's answer". Two ways that used to go wrong at
+# once, so one fixture pins both:
+#
+#   - the fallback chain was appended even when the PR had answered, so a failed
+#     fetch fell through to origin/main — the pre-fix bug by a narrower door;
+#   - the fetch was unguarded, and this function is eval'd into this file's
+#     shell under `err_return`, where a failing bare command returns before the
+#     guard can print anything. _cmd_reap reads that empty string as "safe to
+#     reap" and force-removes the worktree (the shape of issue #37).
+#
+# Both fail *open*, so the fixture has to be one where falling through would
+# clear rather than hold: main is moved to the same tree as the branch, which is
+# what makes the difference between the two answers observable at all.
+(
+	export PATH="$GBIN:$PATH"
+	cd "$RELSQ" || exit
+	git push -q -f origin release:main
+) >/dev/null 2>&1
+GONEREL="$TMPROOT/wt/release-gone"
+cp -R "$RELWT" "$GONEREL"
+(
+	cd "$GONEREL" || exit
+	export PATH="$GBIN:$PATH"
+	git fetch -q origin '+refs/heads/main:refs/remotes/origin/main'
+	git update-ref -d refs/remotes/origin/release
+	git remote set-url origin "$TMPROOT/gone.git"
+) >/dev/null 2>&1
+eq "the unreachable fixture has no tracking ref for its base" "" \
+	"$(PATH="$GBIN:$PATH" git -C "$GONEREL" rev-parse --verify --quiet refs/remotes/origin/release 2>/dev/null)"
+eq "…and origin/main now agrees with HEAD, so falling through would clear" "" \
+	"$(PATH="$GBIN:$PATH" git -C "$GONEREL" diff --name-only refs/remotes/origin/main HEAD 2>/dev/null)"
+neq "…and its origin really is unreachable" 0 \
+	"$(PATH="$GBIN:$PATH" git -C "$GONEREL" fetch -q origin '+refs/heads/release:refs/remotes/origin/release' >/dev/null 2>&1; print $?)"
+
+export GH_BASE_REF=release
+contains "a known base that will not resolve holds rather than clearing" \
+	"unpushed commit(s)" "$(risk "$GONEREL" false MERGED 7)"
+unset GH_BASE_REF
 
 # ─── 10. the guard where it actually matters: inside `reap` ──────────
 #
