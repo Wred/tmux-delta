@@ -83,7 +83,19 @@ report. If you cannot check one, it is not met.
 2. **Checks actually ran.** An empty check list is not a pass. If a PR has zero
    checks, this criterion **fails** — that is the state this rule exists to catch.
 3. **The branch is not behind the base.** Checks on a stale tree prove nothing
-   about the merged result. `git rev-list --count HEAD..origin/main` must be 0.
+   about the merged result. Derive the base from the PR — never assume `main`,
+   because a repo whose default branch is `master`/`develop`, or a PR targeting
+   a release branch, makes `origin/main` the wrong question or no question at
+   all:
+   ```
+   base=$(gh pr view N --json baseRefName -q .baseRefName)
+   git fetch -q origin "$base"
+   git rev-list --count "HEAD..origin/${base}"   # must be 0, and must not be empty
+   ```
+   An empty count is **not** 0: it means the ref did not resolve and the check
+   never ran. Treat unknown as not met. That is the general rule for every
+   criterion here — if the broken form of a check returns the passing value, the
+   check has to distinguish "unknown" from "fine" or it passes vacuously.
 4. **A reviewer signed off, or you reviewed it yourself and say so.** For a linked
    pair: `pair_state=complete` with a 0-finding verdict. For a PR you reviewed
    directly, state that in your report so the human knows no independent agent
@@ -220,7 +232,7 @@ for a reason you can name out loud:
   you two PRs that cannot both merge. Sequence them, or re-cut the issues.
 - **One issue's result is the other's premise.** If B can only be written
   against the interface A introduces, B waits for A to **merge** — not for A to
-  be finished, since B branches from `main`.
+  be finished, since B branches from the repo's default branch, not from A.
 - **An unresolved decision underneath both.** If two issues hinge on a question
   the human has not answered, spawning either buys a guess. Ask, then spawn.
 

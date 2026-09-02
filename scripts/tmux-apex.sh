@@ -2134,10 +2134,11 @@ _cmd_pending() {
 # session-scoped, a server crash marks every member dead and one `reap --yes`
 # takes the whole team's uncommitted work at once.
 _reap_risk() {
-	local facts="$1" wt dirty pr_state
+	local facts="$1" wt dirty pr_state pr_number
 	wt=$(printf '%s' "$facts" | jq -r '.worktree')
 	dirty=$(printf '%s' "$facts" | jq -r '.dirty')
 	pr_state=$(printf '%s' "$facts" | jq -r '.pr_state // "" | ascii_upcase')
+	pr_number=$(printf '%s' "$facts" | jq -r '.pr_number // ""')
 	# No worktree left means there is nothing to lose — that is `reap`'s job.
 	[[ -z $wt || ! -d $wt ]] && return 0
 
@@ -2185,9 +2186,25 @@ _reap_risk() {
 	# actually merged. Tree-equals-base on an *open* PR means the worker has not
 	# started, which is not the same as its work being safe, and a stale
 	# origin/main leaves the diff non-empty and holds. Both fail closed.
+	#
+	# Which base, though, is not a guess where the PR number is known: the PR
+	# says what it targets. The old fallback chain assumed origin/HEAD ->
+	# origin/main -> origin/master, which is the right *shape* for a fallback
+	# but the wrong answer for any PR that does not target the default branch
+	# (release branches, maintenance branches, stacked PRs). Comparing against
+	# the wrong base costs work in one direction — a false clear — so ask
+	# `gh pr view` for baseRefName first and keep the chain only for when there
+	# is no PR to ask, or gh cannot answer (issue #40).
 	if [[ -n $unpushed ]] && (( unpushed > 0 )) && [[ $pr_state == MERGED ]]; then
 		local base="" b
-		for b in refs/remotes/origin/HEAD refs/remotes/origin/main refs/remotes/origin/master; do
+		local -a bases=()
+		if [[ -n $pr_number ]]; then
+			local base_ref=""
+			base_ref=$(cd "$wt" && gh pr view "$pr_number" --json baseRefName -q .baseRefName 2>/dev/null) || base_ref=""
+			[[ -n $base_ref && $base_ref != null ]] && bases+=("refs/remotes/origin/${base_ref}")
+		fi
+		bases+=(refs/remotes/origin/HEAD refs/remotes/origin/main refs/remotes/origin/master)
+		for b in "${bases[@]}"; do
 			base=$(git -C "$wt" rev-parse --verify --quiet "$b" 2>/dev/null) || base=""
 			[[ -n $base ]] && break
 		done
