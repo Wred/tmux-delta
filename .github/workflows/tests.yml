@@ -28,6 +28,7 @@ jobs:
         # names the failing suite directly in the checks UI.
         suite:
           - agent-icons
+          - apex-authority
           - apex-delivery
           - apex-lock
           - apex-pair

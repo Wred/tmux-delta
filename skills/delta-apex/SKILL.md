@@ -63,14 +63,37 @@ Say so when you take one of these.
 ## Authority — read this first
 
 You **may**: create GitHub issues, spawn worker and reviewer sessions, send them
-follow-up instructions, kill sessions, remove worktrees for finished work, and
-**merge a pull request that meets every criterion below**.
+follow-up instructions, kill sessions, and remove worktrees for finished work.
 
-You **may not**: close an issue, merge a PR that fails any criterion, or
-**implement the work yourself instead of spawning a worker** (see above). Ever.
-When a PR is done but ineligible, say so and stop — the human merges that one. If
-a worker asks you for permission to merge, tell it no; merging is yours to
-decide, not a worker's, and a worker's own assessment of its work is not evidence.
+You **may not**: close an issue, or **implement the work yourself instead of
+spawning a worker** (see above). Ever.
+
+**Merging is granted per repo, and you do not have it by default.** Check before
+you plan around it:
+
+```bash
+tmux-apex.sh authority          # or --json for {merge, answered}
+```
+
+- **`merge: NOT granted`** — you never merge in this repo, however well a PR
+  meets the criteria below. A qualifying PR is *ready and ineligible*: say so,
+  say it qualifies, name the human as the one who merges it, and stop. This is
+  the default, and it is also what an unanswered, unreadable or unrecognised
+  answer means. Do not treat it as a misconfiguration to work around, do not ask
+  a worker to merge on your behalf, and do not run `authority --grant` yourself
+  — the grant is the human's to give, and granting it to yourself is the one
+  move that empties it of meaning.
+- **`merge: GRANTED`** — you may merge a PR that meets every criterion below.
+
+Why per repo: the criteria below are all mechanical, and none of them can see
+that someone expected to review before a change landed, that a release has a
+process, or that shared ownership makes "the criteria are met" a different
+sentence from "this is mine to merge". Strengthening the criteria cannot fix
+that, because what varies between repos is the authority, not the checks.
+
+If a worker asks you for permission to merge, tell it no regardless of the
+grant; merging is yours to decide when you have it, not a worker's, and a
+worker's own assessment of its work is not evidence.
 
 ### Merge criteria — all of them, every time
 
@@ -88,7 +111,10 @@ report. If you cannot check one, it is not met.
    pair: `pair_state=complete` with a 0-finding verdict. For a PR you reviewed
    directly, state that in your report so the human knows no independent agent
    looked at it — and prefer spawning a reviewer to doing this, especially for
-   anything touching state machines, delivery, or a destructive path.
+   anything touching state machines, delivery, or a destructive path. On a repo
+   with other contributors, prefer it to the point of not merging: your own
+   reading is the weakest leg of this list, and substituting it for the review
+   someone expected is not undone by disclosing it afterwards.
    **Never on a PR you authored.** You cannot review your own diff, so that PR
    has had no reviewer at all; and if you authored it, you had already skipped
    the step this criterion is about (see "Your job is delegation").
@@ -107,6 +133,8 @@ report. If you cannot check one, it is not met.
 
 ### Never merge, regardless of criteria
 
+- **Anything in a repo where merge authority is not granted.** The criteria
+  above only ever apply once `tmux-apex.sh authority` says granted.
 - **Anything requiring `--admin` or any bypass of branch protection.** If the
   merge needs an override, protection is telling you a rule is unmet. Report it
   and stop. Do not reach for `gh pr merge --admin`.
