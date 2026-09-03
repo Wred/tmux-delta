@@ -1802,11 +1802,18 @@ _cmd_send() {
 #   pair_state      active | complete | stuck
 #   pair_worker_head  remote tip of the worker's branch when its turn began;
 #                   unchanged at its idle means it pushed nothing (issue #48)
-#   pair_message    escalation text for `pending` to surface, once terminal
+#   pair_message    text for `pending` to surface. Either a terminal
+#                   escalation (pair_state complete | stuck), or the
+#                   non-terminal no-push advisory of issue #48, which
+#                   leaves the loop active and the turn where it was
 #   verdict_round / verdict_findings / verdict_note   last recorded verdict
 #   verdict_override  "1" iff that verdict bypassed the published-comment guard
 
 APEX_PAIR_MAX_ROUNDS=${APEX_PAIR_MAX_ROUNDS:-5}
+# Wall-clock bound, in seconds, on the one `ls-remote` the loop makes per
+# turn (see `_pair_pushed_head`). Overridable so the tests can exercise the
+# timeout path without waiting on it.
+APEX_PAIR_HEAD_TIMEOUT=${APEX_PAIR_HEAD_TIMEOUT:-5}
 
 _pair_worker_msg() {
 	local pr="$1" round="$2" findings="$3" note="$4" override="$5"
@@ -2455,6 +2462,52 @@ _pair_finish() {
 		"READY FOR HUMAN REVIEW: the paired reviewer found no further findings worth addressing on PR #${pr} after ${round} round(s). ${ready_note} ${next_step}"
 }
 
+# _git_bounded <secs> <git-args...> — `git "$@"` under a hard wall-clock bound.
+#
+# On success prints git's stdout and returns 0. On failure prints nothing and
+# returns git's exit status, or 124 when the bound was hit rather than reached.
+# GIT_TERMINAL_PROMPT=0 throughout: a call worth bounding is by definition one
+# nobody is watching, so a credential prompt is only ever a stall.
+#
+# `timeout(1)` is not shelled out to on purpose. It is GNU coreutils, absent
+# from a stock macOS base system, and this plugin does not otherwise require
+# coreutils — so on the very platform it is developed on the bound would
+# silently not exist. A watchdog child needs nothing that is not already here.
+#
+# git's stdout goes to a temp file rather than up the caller's command
+# substitution, and this is load-bearing, not tidiness. Over a real transport
+# git spawns a helper (ssh, git-remote-https) that inherits stdout, so TERMing
+# git alone leaves the helper holding the write end of the substitution's pipe
+# — the caller then blocks on EOF for exactly as long as the stall it was
+# trying to bound, and the ceiling quietly does nothing. Verified: with a
+# transport that accepts and then says nothing, the pipe form runs past a 2s
+# bound indefinitely while this form returns 124 at 2s.
+#
+# The watchdog's `sleep` may outlive its TERM as an orphan. Harmless: the
+# `kill` it would have gone on to run died with its parent.
+_git_bounded() {
+	local secs="$1"; shift
+	local tmp rc=0
+	tmp=$(mktemp "${TMPDIR:-/tmp}/tmux-apex-git.XXXXXX") || return 1
+	(
+		export GIT_TERMINAL_PROMPT=0
+		git "$@" >"$tmp" 2>/dev/null &
+		gitpid=$!
+		{ sleep "$secs"; kill -TERM $gitpid 2>/dev/null; } >/dev/null 2>&1 &
+		dogpid=$!
+		wait $gitpid
+		gitrc=$?
+		kill -TERM $dogpid 2>/dev/null
+		exit $gitrc
+	) || rc=$?
+	# A watchdog TERM surfaces as 143. Report the conventional 124 instead, so
+	# a caller can tell "the bound was hit" from "git answered, negatively".
+	(( rc == 143 )) && rc=124
+	(( rc == 0 )) && cat "$tmp"
+	rm -f "$tmp"
+	return $rc
+}
+
 # _pair_pushed_head <worktree> — what the remote currently reports for this
 # worktree's branch, as the loop's answer to "did the work actually move?"
 #
@@ -2474,14 +2527,29 @@ _pair_finish() {
 # `--not --remotes` has no `origin/<branch>` ref to consult at all. Both would
 # answer confidently and wrongly. Ask the remote.
 #
-# GIT_TERMINAL_PROMPT=0 so a remote wanting credentials fails fast instead of
-# blocking an unattended settle callback on a prompt nobody will answer.
+# This is a network round trip, which `_commits_ahead` makes opt-in rather than
+# automatic. That rule is not being quietly crossed here — it is about *where*
+# the round trip lands. `_commits_ahead` declines to pay on the per-hook path
+# behind `_record_status` and `pending`, which runs constantly for every member
+# and whose answer is a cosmetic number on a ping line, so the honest `null`
+# costs nothing. This probe runs at most twice per round of a single linked
+# pair, and its answer is not cosmetic: without it the loop takes the wrong
+# branch, which is the whole of issue #48. The deliberately-invoked callers
+# (`status --ask-remote`, `_reap_risk`) pay for the same trip already.
+#
+# Bounded, though, because unlike those two this one has no human watching it:
+# it runs from `_cmd_settle` under `tmux run-shell -b -d`. GIT_TERMINAL_PROMPT=0
+# only covers a remote that *asks* for something; a remote that accepts the
+# connection and then says nothing stalls for the transport's own timeout,
+# which is minutes, and stalls the settle callback with it. Hitting the bound
+# is a non-zero exit, so it lands in the existing unknown case and fails open.
 _pair_pushed_head() {
 	local wt="$1" branch out rc=0 sha
 	[[ -n $wt && -d $wt ]] || return 1
 	branch=$(git -C "$wt" symbolic-ref --short HEAD 2>/dev/null) || return 1
 	[[ -n $branch ]] || return 1
-	out=$(GIT_TERMINAL_PROMPT=0 git -C "$wt" ls-remote origin "refs/heads/${branch}" 2>/dev/null) || rc=$?
+	out=$(_git_bounded "$APEX_PAIR_HEAD_TIMEOUT" \
+		-C "$wt" ls-remote origin "refs/heads/${branch}") || rc=$?
 	(( rc == 0 )) || return 1
 	sha=$(printf '%s' "$out" | head -1 | cut -f1)
 	print -r -- "${sha:--}"
@@ -2715,13 +2783,14 @@ _cmd_link() {
 		--arg pair "$reviewer" --arg pr "$pr" --argjson max "$max" \
 		'{pair:$pair, pair_role:"worker", pair_pr:$pr, pair_round:1,
 		  pair_max_rounds:$max, pair_turn:"reviewer", pair_state:"active",
-		  pair_message:""}')"
+		  pair_message:"", pair_worker_head:""}')"
 	apex_member_merge "$manager" "$reviewer" "$(jq -nc \
 		--arg pair "$worker" --arg pr "$pr" --argjson max "$max" --argjson b "$rbaseline" \
 		'{pair:$pair, pair_role:"reviewer", pair_pr:$pr, pair_round:1,
 		  pair_max_rounds:$max, pair_turn:"reviewer", pair_state:"active",
-		  pair_message:"", verdict_round:"", verdict_findings:"", verdict_note:"",
-		  verdict_override:"", pair_comment_baseline:$b}')"
+		  pair_message:"", pair_worker_head:"", verdict_round:"",
+		  verdict_findings:"", verdict_note:"", verdict_override:"",
+		  pair_comment_baseline:$b}')"
 
 	apex_event "$manager" "$(jq -nc --arg w "$worker" --arg r "$reviewer" \
 		--arg pr "$pr" --argjson max "$max" \

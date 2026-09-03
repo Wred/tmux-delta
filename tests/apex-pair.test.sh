@@ -239,12 +239,20 @@ chmod +x "$BIN/tmux" "$BIN/gh"
 # case, which is what almost every test in this file means by "the worker went
 # idle". Tests that mean "nothing was pushed" pin STUB_GIT_HEAD to a fixed
 # value; STUB_GIT_ABSENT models a branch the remote does not have at all, and
-# STUB_GIT_LSREMOTE_FAIL an unreachable one.
+# STUB_GIT_LSREMOTE_FAIL an unreachable one. STUB_GIT_HANG models the nastier
+# case the bound exists for: a remote that accepts and then says nothing. The
+# stub keeps a child holding stdout open while it stalls, because that is what
+# git's transport helper does and what makes the stall survive killing git.
 cat > "$BIN/git" <<'EOF'
 #!/usr/bin/env bash
 for a in "$@"; do
 	[ "$a" = "ls-remote" ] || continue
 	[ -n "${STUB_GIT_LSREMOTE_FAIL:-}" ] && exit 128
+	if [ -n "${STUB_GIT_HANG:-}" ]; then
+		sleep 60 &
+		sleep 60
+		exit 0
+	fi
 	[ -n "${STUB_GIT_ABSENT:-}" ] && exit 0
 	if [ -n "${STUB_GIT_HEAD:-}" ]; then
 		printf '%s\trefs/heads/stub\n' "$STUB_GIT_HEAD"
@@ -318,7 +326,7 @@ reset() {
 		/usr/bin/git -C "$TMPROOT/wt" -c user.email=t@t -c user.name=t \
 			commit -q --allow-empty -m seed
 	fi
-	unset STUB_GIT_HEAD STUB_GIT_ABSENT STUB_GIT_LSREMOTE_FAIL
+	unset STUB_GIT_HEAD STUB_GIT_ABSENT STUB_GIT_LSREMOTE_FAIL STUB_GIT_HANG
 	rm -f "$STUB_GIT.n"
 	for m in "$WORKER" "$REVIEWER"; do
 		jq -nc --arg wt "$TMPROOT/wt" --argjson t 1 '{agent:"claude", worktree:$wt, status:"idle",
@@ -474,6 +482,25 @@ settle "$WORKER" >/dev/null
 contains "the relay still goes out" "Re-review" "$(sent_to %2)"
 eq "and the turn still passes" reviewer "$(mget "$WORKER" pair_turn)"
 unset STUB_GIT_LSREMOTE_FAIL
+
+# The settle path is unattended, so a remote that accepts the connection and
+# then goes quiet must not hold the loop for the transport's own timeout. A
+# 1s bound here; the assertion that matters is that it returns at all, and
+# that hitting the bound lands in the same fail-open case as unreachable.
+print "\na silent remote is bounded rather than waited on"
+reset
+verdict --findings 1 >/dev/null
+settle "$REVIEWER" >/dev/null
+: > "$STUB_SENT"
+export STUB_GIT_HANG=1 APEX_PAIR_HEAD_TIMEOUT=1
+t0=$SECONDS
+settle "$WORKER" >/dev/null
+elapsed=$(( SECONDS - t0 ))
+if (( elapsed < 20 )); then bounded=bounded; else bounded="waited ${elapsed}s"; fi
+eq "the probe gives up quickly" bounded "$bounded"
+contains "and a silent remote falls open too" "Re-review" "$(sent_to %2)"
+eq "with the turn passed" reviewer "$(mget "$WORKER" pair_turn)"
+unset STUB_GIT_HANG APEX_PAIR_HEAD_TIMEOUT
 
 print "\nand so does a baseline that was never stamped"
 reset
