@@ -71,7 +71,13 @@ local project_dir=$PWD
 local adapter="${SELF:h}/lib/agent-adapter.sh"
 source "${SELF:h}/lib/agent-launch.sh"
 local inner
-inner=$(delta_agent_launch_cmd '${CODING_AGENT:-claude}' "$agent_model" "$agent_perm" "$managed_prompt" "$prompt" "$project_dir" "$adapter")
+# The trailing arguments are the resume id (never used here — this is a fresh
+# session) and the managed marker. The marker is derived from
+# CODING_AGENT_APEX_SESSION rather than passed in, so it is set for exactly the
+# panes apex spawned and stays unset for a human's own `o`pen (#45): #35 set it
+# only on the recover path, so every *spawned* worker and monitor was launched
+# without it.
+inner=$(delta_agent_launch_cmd '${CODING_AGENT:-claude}' "$agent_model" "$agent_perm" "$managed_prompt" "$prompt" "$project_dir" "$adapter" "" "${apex_session:+1}")
 
 # -P -F publishes the agent pane id so other sessions (and tmux-apex.sh) can
 # address this agent with send-keys.

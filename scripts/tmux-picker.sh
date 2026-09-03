@@ -589,7 +589,10 @@ _add_agent_pane() {
 	local system
 	system=$(delta_managed_prompt "$role" "$manager")
 	local inner
-	inner=$(delta_agent_launch_cmd "${(q)agent}" "$model" "$perm" "$system" "$prompt" "$worktree" "$adapter")
+	# Managed marker (last argument) gated on _APEX_SPAWN, which is set only by
+	# the --spawn-* subcommands: an apex-spawned pane gets prompt suggestions
+	# turned off, a human's own agent pane keeps them (#45).
+	inner=$(delta_agent_launch_cmd "${(q)agent}" "$model" "$perm" "$system" "$prompt" "$worktree" "$adapter" "" "${_APEX_SPAWN:+1}")
 
 	local pane
 	pane=$(tmux split-window -t "$session" -h -p $DELTA_AGENT_PANE_PCT_EXTRA \

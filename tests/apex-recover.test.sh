@@ -166,6 +166,21 @@ list-panes)
 		awk -F'\t' -v s="$s" '$2==s{print $1}' "$STUB/panes" 2>/dev/null
 	fi
 	;;
+show-environment)
+	# show-environment [-t SESSION] NAME -> "NAME=value", or exit 1 when unset,
+	# which is how tmux-dev-layout.sh reads its per-spawn configuration.
+	local session="" name=""
+	shift
+	while (( $# )); do
+		case "$1" in
+			-t) session="$2"; shift 2 ;;
+			*)  name="$1"; shift ;;
+		esac
+	done
+	local f="$STUB/env.$(_key "$session").$(_key "$name")"
+	[[ -r $f ]] || exit 1
+	print -r -- "${name}=$(cat "$f")"
+	;;
 list-sessions) cat "$STUB/sessions" 2>/dev/null ;;
 kill-pane|kill-session|refresh-client|switch-client|run-shell|list-clients) : ;;
 *) : ;;
@@ -333,6 +348,12 @@ eq "…from --continue" "--continue" "${(j: :)agent_argv}"
 argv_for "the task" "" 1
 eq "a managed launch disables prompt suggestions" \
 	"--prompt-suggestions false the task" "${(j: :)agent_argv}"
+# The CLI flag alone is a no-op for the interactive TUI — it only governs the
+# print/SDK prompt_suggestion message, which is why #35 shipped it and the
+# workers kept painting ghost text. The env var is the half that actually
+# suppresses the suggestion, so pin it separately (#45).
+eq "…via the env var the interactive TUI actually reads" false \
+	"$CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION"
 
 argv_for "the task" "$WORKER_ID" 1
 eq "…on the resume path too" \
@@ -340,9 +361,12 @@ eq "…on the resume path too" \
 
 # The picker and dev-layout launch panes a human types into, and they pass no
 # managed flag. Suggestions are a typing convenience: leave them alone there.
+unset CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION
 argv_for "the task" "" ""
 eq "an unmanaged launch leaves prompt suggestions alone" \
 	"the task" "${(j: :)agent_argv}"
+eq "…and plants no suppression env var" 0 \
+	"${+CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION}"
 
 source "$SCRIPTS/lib/agent-launch.sh"
 contains "launch command exports the managed flag" "DELTA_AGENT_MANAGED=1" \
@@ -590,12 +614,58 @@ review_pane=$(awk -F'\t' -v s="$SESSION_NAME" '$2==s{p=$1} END{print p}' "$STUB/
 cmd=$(pane_cmd_plain "$review_pane")
 contains "the new pane runs the review"        "/my-pr-review 43" "$cmd"
 contains "the new pane is told it is managed"  "managed monitor agent" "$cmd"
+# The gap #35 left: its tests asserted the adapter's argv given the managed
+# flag, and that delta_agent_launch_cmd exports the flag it is handed — but
+# nothing asserted that the *spawn* path hands one over, and it did not. Every
+# spawned worker and monitor launched with suggestions on. Assert here, on the
+# argv the spawn actually put in the pane (#45).
+contains "the new pane is launched with the managed marker" \
+	"DELTA_AGENT_MANAGED=1" "$cmd"
 
 # Re-spawning the same review reuses the pane rather than stacking another.
 before=$(grep -c '' "$STUB/panes")
 "$SCRIPTS/tmux-picker.sh" --spawn-pr-review fix-issue-42 no-switch \
 	CODING_AGENT_ROLE=monitor "CODING_AGENT_APEX_SESSION=$MANAGER" >/dev/null 2>&1
 eq "re-spawning the same review adds no pane" "$before" "$(grep -c '' "$STUB/panes")"
+
+# ─── 7b. the fresh-session spawn path ────────────────────────────────
+
+print "\nfresh-session spawn (tmux-dev-layout.sh)"
+
+# The path above covers a spawn into an ALREADY-EXISTING session. The common
+# case is the other one: the picker creates a session and send-keys
+# tmux-dev-layout.sh into it, and that script builds its own launch command.
+# #35 patched neither, so both spawned panes with prompt suggestions on (#45).
+# Pin the argv here too, and pin that a human's own open is left alone —
+# dev-layout derives "managed" from CODING_AGENT_APEX_SESSION, so the two cases
+# differ only by that one session env var.
+DL_WT="$TMPROOT/dl-worktree"; mkdir -p "$DL_WT"
+dl_launch_cmd() {
+	# dl_launch_cmd <session-name> — run dev-layout in a fresh fake session
+	# carrying whatever env the caller planted, and return the pane's command.
+	local sess="$1"
+	print -r -- "$sess" >> "$STUB/sessions"
+	( cd "$DL_WT" && STUB_SESSION="$sess" TMUX=fake-socket DEV_EDITOR=true \
+		"$SCRIPTS/tmux-dev-layout.sh" ) >/dev/null 2>&1 || true
+	# dev-layout splits the current window with no -t, so the stub records the
+	# new pane with an empty session field — it is just the newest row.
+	pane_cmd_plain "$(awk -F'\t' 'END{print $1}' "$STUB/panes")"
+}
+
+APEX_SPAWNED=dl-apex-session
+print -r -- 42 > "$STUB/env.$(print -r -- "${APEX_SPAWNED//[^a-zA-Z0-9]/_}").CODING_AGENT_ISSUE"
+print -r -- "$MANAGER" > "$STUB/env.$(print -r -- "${APEX_SPAWNED//[^a-zA-Z0-9]/_}").CODING_AGENT_APEX_SESSION"
+print -r -- worker > "$STUB/env.$(print -r -- "${APEX_SPAWNED//[^a-zA-Z0-9]/_}").CODING_AGENT_ROLE"
+dl_cmd=$(dl_launch_cmd "$APEX_SPAWNED")
+contains "an apex-spawned session launches its agent as managed" \
+	"DELTA_AGENT_MANAGED=1" "$dl_cmd"
+contains "…and still gets its task prompt" "GitHub issue #42" "$dl_cmd"
+
+HUMAN_OPENED=dl-human-session
+print -r -- 42 > "$STUB/env.$(print -r -- "${HUMAN_OPENED//[^a-zA-Z0-9]/_}").CODING_AGENT_ISSUE"
+dl_cmd=$(dl_launch_cmd "$HUMAN_OPENED")
+contains "a human's own open is not marked managed" \
+	"DELTA_AGENT_MANAGED=''" "$dl_cmd"
 
 # ─── summary ─────────────────────────────────────────────────────────
 
