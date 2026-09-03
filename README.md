@@ -550,11 +550,15 @@ woken. `APEX_PAIR_DEFER_SECS` (30) sets the re-check interval and
 `APEX_PAIR_DEFER_IDLE_TICKS` (10) how many 0.2s frames of stillness count as
 quiet. All three are clamped to a positive integer with a warning, since a zero
 or non-numeric value would switch off the very bound it was set to tune. The
-whole adjudication runs under one lock, so a deferral is decided once even when
-the timer and an idle transition arrive together; the trigger that loses skips
-its turn rather than relaying underneath the one that is deciding, and the
-record stays in state until a terminal decision is written, so a hook process
-killed mid-decision leaves the deferral for the next trigger. `pair-resume` on a loop that stuck *at the cap* requires a higher
+whole adjudication runs under one lock, keyed on the deferral's sender so it
+excludes that pair's two triggers and no others. A deferral is therefore decided
+once even when the timer and an idle transition arrive together: the trigger
+that loses hands its transition back — re-armed, not spent — rather than
+relaying underneath the one that is deciding, and the record stays in state
+until a terminal decision is written, so a hook process killed mid-decision
+leaves the deferral for the next trigger. The sample is also clamped to stay
+inside `APEX_LOCK_WAIT`, since a sample longer than the wait would make that
+contention the rule rather than the exception. `pair-resume` on a loop that stuck *at the cap* requires a higher
 `--max-rounds`: resuming at `round == max` would burn a full review turn and
 re-escalate on the reviewer's first finding. Resuming also clears the reviewer's
 last verdict, so a stale one cannot pass for the resumed round's. The terminal

@@ -751,8 +751,24 @@ export APEX_PAIR_DEFER_IDLE_TICKS=2
 # case proves only idempotence, which every terminal path had already; what the
 # lock is for is the trigger that arrives *during* the sample, and that one must
 # not relay and flip the turn while the holder is about to roll the round back.
-export APEX_HAVE_FLOCK=1 APEX_LOCK_WAIT=1
-mkdir -p "$XDG_CACHE_HOME/tmux-delta/apex/$MGR/.pair-defer.lock.d"
+# The lock is keyed on the deferral's sender, which both halves carry, so it
+# excludes this pair's two triggers and not an unrelated pair's.
+DEFER_LOCK="$XDG_CACHE_HOME/tmux-delta/apex/$MGR/.pair-defer-${REVIEWER//[^A-Za-z0-9_-]/_}.lock"
+# Hold it on the flock path, which is what production takes — the lockdir
+# fallback has different semantics (a staleness rule rather than kernel
+# liveness), so testing contention only there tests the wrong mechanism. flock
+# has to be held by a live process, hence the backgrounded holder.
+: > "$XDG_CACHE_HOME/holder-ready"; rm -f "$XDG_CACHE_HOME/holder-ready"
+(
+	zmodload zsh/system
+	: >> "$DEFER_LOCK"
+	zsystem flock -f hfd "$DEFER_LOCK"
+	: > "$XDG_CACHE_HOME/holder-ready"
+	sleep 5
+) &
+HOLDER=$!
+for _i in {1..50}; do [[ -f "$XDG_CACHE_HOME/holder-ready" ]] && break; sleep 0.1; done
+export APEX_LOCK_WAIT=1
 settle "$WORKER" >/dev/null
 eq "a contended trigger does not adjudicate" "$WORKER" \
 	"$(mget "$REVIEWER" pair_defer_target)"
@@ -760,7 +776,24 @@ eq "and leaves the loop where it was" active "$(mget "$REVIEWER" pair_state)"
 eq "and does not advance the turn" worker "$(mget "$WORKER" pair_turn)"
 contains "the skip is in the event log, not silent" '"event":"lock_timeout"' \
 	"$(ev lock_timeout)"
-rmdir "$XDG_CACHE_HOME/tmux-delta/apex/$MGR/.pair-defer.lock.d"
+# The transition is handed back, not spent: settled_seq is cleared so the same
+# seq is eligible again. Dropped instead, nothing would re-derive it and the
+# loop would sit still.
+eq "and the transition is left retryable" "" "$(mget "$WORKER" settled_seq)"
+# `wait` on a killed job reports 143, and err_return would take the suite with
+# it, so swallow both statuses explicitly.
+kill "$HOLDER" 2>/dev/null || true
+wait "$HOLDER" 2>/dev/null || true
+unset APEX_LOCK_WAIT
+# The lockdir fallback is the other acquire path, and a contended one there has
+# to reach the same verdict.
+export APEX_HAVE_FLOCK=1 APEX_LOCK_WAIT=1
+mkdir -p "$DEFER_LOCK.d"
+settle "$WORKER" >/dev/null
+eq "the lockdir fallback contends the same way" "$WORKER" \
+	"$(mget "$REVIEWER" pair_defer_target)"
+eq "and still does not advance the turn" worker "$(mget "$WORKER" pair_turn)"
+rmdir "$DEFER_LOCK.d"
 unset APEX_HAVE_FLOCK APEX_LOCK_WAIT
 # Uncontended, the same trigger decides — the record survived the skip, which
 # is the durability the lock-held-throughout shape buys: the decision writes to

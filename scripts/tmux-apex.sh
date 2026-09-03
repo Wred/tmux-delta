@@ -2015,6 +2015,21 @@ _pair_defer_knobs() {
 		print -u2 "tmux-apex: APEX_PAIR_DEFER_IDLE_TICKS='${APEX_PAIR_DEFER_IDLE_TICKS}' is not a positive integer; using 10"
 		_PAIR_DEFER_TICKS=10
 	fi
+	# The sample runs inside the lock, so its length has to stay under the wait
+	# a second trigger is willing to serve: at five 0.2s frames per second a
+	# sample of APEX_LOCK_WAIT × 5 ticks or more guarantees the waiter times
+	# out, which is the "an idle threshold above the ceiling can never be
+	# reached" relationship _send_to_pane clamps for its own two ticks. A
+	# timeout is recoverable now (see _cmd_settle), but a knob that makes it
+	# the certain outcome is still a knob that switches the loop off.
+	local -i wait_ceiling
+	wait_ceiling=${APEX_LOCK_WAIT:-5}
+	(( wait_ceiling < 1 )) && wait_ceiling=1
+	(( wait_ceiling = wait_ceiling * 5 - 1 ))
+	if (( _PAIR_DEFER_TICKS > wait_ceiling )); then
+		print -u2 "tmux-apex: APEX_PAIR_DEFER_IDLE_TICKS='${APEX_PAIR_DEFER_IDLE_TICKS}' would outlast APEX_LOCK_WAIT='${APEX_LOCK_WAIT:-5}'; using ${wait_ceiling}"
+		_PAIR_DEFER_TICKS=$wait_ceiling
+	fi
 }
 
 # _pair_defer_write <manager> <from> <pair> <target> <prev-round> <prev-turn> <text> <residue> <checks>
@@ -2114,8 +2129,9 @@ _pair_defer_clear() {
 #
 # Returns 0 when there is nothing outstanding — no record, or one this call
 # resolved as delivered — so the caller can carry on with the normal loop; 1
-# when the deferral consumed the moment, either because it is still deferred,
-# because it escalated, or because another trigger holds the decision.
+# when the deferral consumed the moment, by deferring again or by escalating;
+# and 3 when another trigger holds the decision, which the caller must hand
+# back rather than treat as either.
 #
 # The whole adjudication runs under one lock, not just the read. A deferral has
 # two independent triggers by design — the timer and either half's idle
@@ -2131,11 +2147,19 @@ _pair_defer_clear() {
 # roll the round back" is worse than the double escalation the lock removes.
 _pair_defer_settle() {
 	setopt localoptions no_err_return
-	local manager="$1" member="$2" lock rc
+	local manager="$1" member="$2" lock key rc
 	# Nothing to serialise if there is no record; the recheck under the lock is
 	# what decides, so this only keeps the uncontended common path cheap.
 	[[ -n $(apex_member_get "$manager" "$member" pair_defer_target 2>/dev/null) ]] || return 0
-	lock="$APEX_ROOT/$manager/.pair-defer.lock"
+	# Keyed on the deferral's sender, which both halves carry identically, so
+	# the lock excludes the two triggers of *this* deferral and no others: with
+	# one lock per manager an unrelated pair's re-check would queue behind a
+	# sample it has no stake in, and every added pair would widen the timeout
+	# window below for all of them.
+	key=$(apex_member_get "$manager" "$member" pair_defer_from 2>/dev/null)
+	[[ -n $key ]] || key="$member"
+	key=${key//[^A-Za-z0-9_-]/_}
+	lock="$APEX_ROOT/$manager/.pair-defer-${key}.lock"
 	if ! apex_lock_acquire "$lock"; then
 		# Recorded rather than silent, the way _apex_authority_set records its
 		# own: an unexplained skip here reads as a lost deferral, and if this
@@ -2143,7 +2167,13 @@ _pair_defer_settle() {
 		# follows needs something in the log pointing at why.
 		apex_event "$manager" "$(jq -nc --arg s "$member" \
 			'{event:"lock_timeout", file:"pair-defer.lock", session:$s}')" 2>/dev/null
-		return 1
+		# 3, not 1: the caller has to be able to tell "another trigger is
+		# deciding, hand this transition back" from "decided, nothing to
+		# advance on". Dropping it outright would leave nothing driving the
+		# loop, since the lock holder's own re-check chain is the only other
+		# thing armed and a sample that outlasts the wait makes the timeout the
+		# rule rather than the exception.
+		return 3
 	fi
 	_pair_defer_adjudicate "$manager" "$member"
 	rc=$?
@@ -2277,7 +2307,11 @@ _cmd_pair_defer_check() {
 	[[ -n $member && -n $manager ]] || return 0
 	APEX_SESSION="$manager"
 	[[ -f $(apex_member_file "$manager" "$member") ]] || return 0
-	_pair_defer_settle "$manager" "$member" || return 0
+	local rc=0
+	_pair_defer_settle "$manager" "$member" || rc=$?
+	# Contended: the timer chain is one of the two triggers, so returning here
+	# would end it and leave the deferral riding transitions alone. Re-arm it.
+	if (( rc == 3 )); then _pair_defer_schedule "$manager" "$member"; fi
 	return 0
 }
 
@@ -2912,7 +2946,21 @@ _cmd_settle() {
 	# having just finished the relayed work — or it consumed the transition, by
 	# escalating or by deferring again, and there is nothing for the loop to
 	# advance on top of.
-	_pair_defer_settle "$manager" "$session" || return 0
+	local drc=0
+	_pair_defer_settle "$manager" "$session" || drc=$?
+	if (( drc == 3 )); then
+		# Another trigger is mid-decision. Give the transition back rather than
+		# spending it: put settled_seq back so this seq is eligible again, and
+		# re-arm the callback. Without that the transition is gone for good —
+		# nothing else re-derives it — and the loop would sit still waiting on a
+		# partner it never relayed to. The cost is one extra idle status event
+		# per retry, which is the honest record of what happened.
+		apex_member_merge "$manager" "$session" '{"settled_seq":""}'
+		tmux run-shell -b -d "$APEX_QUIET_SECS" \
+			"${SELF} _settle ${(q)session} ${(q)manager} ${seq}" 2>/dev/null || true
+		return 0
+	fi
+	if (( drc )); then return 0; fi
 
 	# A linked pair relays this idle transition to its partner and marks the
 	# ping consumed, so the manager is not woken once per round-trip. The
