@@ -542,14 +542,28 @@ all of it. So `recover --yes` waits for each resumed pane's agent to come up and
 delivers a short continuation message itself — not the task, just "carry on,
 check what is already committed first". Read the per-member lines it prints:
 
-- `Nudged it to continue (…)` — that member is working again.
-- `NOT nudged: …` — that member is sitting at an empty prompt and **will not
-  start on its own**. The line says why and gives you the `send` to run. Do not
-  assume recovery worked because the pane exists.
+Every line reports what was *verified*, never what was merely typed — after
+delivering the nudge it watches the member's own state for the start of a turn,
+because keystrokes sent into an agent that has execed but is still restoring a
+long conversation are silently dropped:
+
+- `Nudged it to continue (…) — it has started a turn.` — that member is working
+  again. This is the only line that means recovery finished.
+- `Nudged it (…), but it has NOT started a turn after Ns.` — the message went
+  out and nothing happened, most likely typed while the agent was still
+  restoring. The following lines give you the `send` to re-deliver it.
+- `NOT nudged: …` — no message was delivered at all. The line says why and gives
+  you the `send` to run.
+
+The last two both mean a member is sitting at an empty prompt and **will not
+start on its own**. Do not assume recovery worked because the pane exists — read
+the line. An unnudged or unconfirmed member also stays `status=starting`, so
+`pending` surfaces it once it goes stale even if you lose these lines.
 
 Set `APEX_RECOVER_NUDGE=0` to skip the nudge (it then tells you to send one),
-and `APEX_RECOVER_NUDGE_WAIT` to change how long it waits for an agent to come
-up before giving up.
+`APEX_RECOVER_NUDGE_WAIT` to change how long it waits for an agent to come up
+before giving up, and `APEX_RECOVER_NUDGE_CONFIRM` to change how long it then
+waits for that member to start a turn.
 
 Read the dry run before you act on it, and tell the human what it found. Two
 lines matter:

@@ -2505,11 +2505,14 @@ _cmd_status() {
 # the whole point — it breaks the silence and hands the manager a member key.
 # It deliberately does not keep repeating, because a manager that has been
 # told and has chosen to wait should not be re-interrupted every minute.
-_APEX_REPORTABLE_JQ='def stalled_start:
+_APEX_REPORTABLE_JQ='def stale_after:
+	(env.APEX_STARTING_STALE | tonumber?)
+	// (env._APEX_STARTING_STALE_DEFAULT | tonumber);
+def stalled_start:
 	.status == "starting"
 	and (.seq // 0) == 0
 	and (.spawned_at != null)
-	and ($now - .spawned_at) >= $stale;
+	and (now - .spawned_at) >= stale_after;
 def reportable:
 	((.seq // 0) != (.pinged_seq // -1))
 	and (((.pair_message // "") != "")
@@ -2518,35 +2521,29 @@ def reportable:
 '
 
 # How long a member may sit at `starting`, never having taken a turn, before
-# reportable calls it a failure. Generous by default: a cold agent launch on a
+# `reportable` calls it a failure. Generous by default: a cold agent launch on a
 # loaded machine is seconds, not minutes, but a spawn that is merely slow must
 # never be reported as broken.
-APEX_STARTING_STALE=${APEX_STARTING_STALE:-900}
-
-# _apex_reportable_args — the jq bindings `reportable` needs, into
-# $_APEX_REPORTABLE_ARGS.
 #
-# The predicate is shared by three readers precisely so they cannot drift, and
-# it now takes two bindings; handing each reader the job of assembling them
-# would put the drift straight back, one call site at a time. `now` is read per
-# call rather than once at startup because the watcher holds one process open
-# for days.
+# Exported because the predicate reads it out of the environment rather than
+# taking it as a `--argjson` binding, and a value set in the invoking shell
+# without `export` would otherwise be invisible to jq while looking configured.
 #
-# The knob is clamped here rather than validated at some door, because there is
-# no single door: `pending` runs from the manager's hooks, the sig runs from the
-# watcher, and each per-file read runs on its own. A non-numeric value would
-# make `--argjson` fail, which makes every jq in this file exit non-zero, which
-# reads as "nothing to report" everywhere at once — the exact silence this
-# check exists to end.
-typeset -ga _APEX_REPORTABLE_ARGS
-_apex_reportable_args() {
-	local stale=$APEX_STARTING_STALE
-	if [[ $stale != <-> ]]; then
-		print -u2 "tmux-apex: APEX_STARTING_STALE='${APEX_STARTING_STALE}' is not a whole number of seconds; using 900"
-		stale=900
-	fi
-	_APEX_REPORTABLE_ARGS=(--argjson now "$(date +%s)" --argjson stale "$stale")
-}
+# Reading it there, and reading the clock via jq's own `now`, is what keeps the
+# predicate a *self-contained* string. The alternative — two bindings every
+# reader has to remember to pass — puts back exactly the drift the shared
+# definition exists to prevent (issue #23), and fails in the worst available
+# direction: a reader that forgets them makes jq exit non-zero, which reads as
+# "nothing to report" on every path at once. `tonumber? // 900` is the same
+# argument for a garbage value: clamp in the predicate, where no caller can
+# skip it, rather than at a door there is no single one of.
+# One binding for the number, referenced everywhere it is needed — the
+# predicate's fallback, the default itself, and any message that quotes it.
+# Written out three times it would drift, and the failure is quiet in the worst
+# way: a clamp that reverts to one value while the warning names another.
+_APEX_STARTING_STALE_DEFAULT=900
+APEX_STARTING_STALE=${APEX_STARTING_STALE:-$_APEX_STARTING_STALE_DEFAULT}
+export APEX_STARTING_STALE _APEX_STARTING_STALE_DEFAULT
 
 _cmd_pending() {
 	local mark=false a
@@ -2555,8 +2552,6 @@ _cmd_pending() {
 	local manager
 	manager=$(_require_manager)
 	APEX_SESSION="$manager"
-
-	_apex_reportable_args
 
 	local s st seq rawseq role task facts summary pair_msg spawned age
 	for s in ${(f)"$(apex_members "$manager")"}; do
@@ -2577,7 +2572,7 @@ _cmd_pending() {
 		# must not touch `_member_facts`, so the two still *enumerate* members
 		# differently. Only the predicate is shared, which is the part that
 		# drifted.
-		jq -e "${_APEX_REPORTABLE_ARGS[@]}" "$_APEX_REPORTABLE_JQ"'reportable' \
+		jq -e "$_APEX_REPORTABLE_JQ"'reportable' \
 			"$(apex_member_file "$manager" "$s")" >/dev/null 2>&1 || continue
 
 		st=$(apex_member_get "$manager" "$s" status)
@@ -2936,6 +2931,47 @@ _apex_session_label() {
 	delta_session_label "$1" "$2" "${3:-}"
 }
 
+# How long `recover` waits, after a nudge is delivered, for the member to
+# actually start a turn. Any turn moves it — `event set` fires on the first tool
+# call and `event clear` on Stop, and both bump seq and write status — so this
+# covers "the agent accepted the keystrokes", not the whole turn.
+APEX_RECOVER_NUDGE_CONFIRM=${APEX_RECOVER_NUDGE_CONFIRM:-45}
+
+# _apex_nudge_confirmed <manager> <member> <seconds> — did the member actually
+# start a turn?
+#
+# `_pane_is_agent` is the strongest precondition available before typing, and it
+# is not strong enough to justify the claim `recover` prints: it compares
+# `#{pane_current_command}`, which proves the agent process execed, not that its
+# TUI is accepting input. On the `--resume` path specifically that gap is wide —
+# claude execs and then spends time restoring the conversation, and the longer
+# the transcript the wider it gets, which is exactly the case `recover` exists
+# for. Keystrokes typed into that window are dropped, and `_send_to_pane` cannot
+# tell: an empty `_pane_input_line` reads the same whether the box is ready and
+# empty or has not been drawn yet, and its post-send "our text is no longer
+# pending" check is trivially satisfied by text that was never accepted.
+#
+# So do not infer the outcome from the delivery. Read the member's own state,
+# which its hooks write and nothing here can fake, and report what it says.
+# Costs a few file reads and the wait, and turns a confident wrong line into a
+# hedged right one.
+_apex_nudge_confirmed() {
+	local manager="$1" member="$2" secs="$3"
+	[[ $secs == <-> ]] || secs=45
+	local -i i st_seq
+	local st
+	for (( i = 0; i <= secs; i++ )); do
+		st=$(apex_member_get "$manager" "$member" status 2>/dev/null)
+		st_seq=$(apex_member_get "$manager" "$member" seq 2>/dev/null) || st_seq=0
+		# An unreadable record is not confirmation: an empty status must not
+		# pass for "no longer starting". Fail towards the hedged line — the
+		# stale-start report picks the member up either way.
+		[[ ( -n $st && $st != starting ) || $st_seq -gt 0 ]] && return 0
+		(( i < secs )) && sleep 1
+	done
+	return 1
+}
+
 # How long `recover` waits for a resumed agent's pane to actually be running an
 # agent before it gives up on nudging it. A cold launch is seconds; this is the
 # ceiling for "something went wrong", and it is what a `recover --yes` of a
@@ -3017,12 +3053,27 @@ _apex_continue_resumed() {
 		return 0
 	fi
 
-	print "  Nudged it to continue (${_DELIVER_VIA})."
-	[[ -n ${APEX_SEND_UNCONFIRMED:-} ]] \
-		&& print "  NOTE: its input box never drained; assumed submitted, not re-sent."
+	local confirmed=true
+	_apex_nudge_confirmed "$manager" "$member" "$APEX_RECOVER_NUDGE_CONFIRM" || confirmed=false
+
+	if $confirmed; then
+		print "  Nudged it to continue (${_DELIVER_VIA}) — it has started a turn."
+	else
+		# Delivered but never acted on. The likeliest cause is the one
+		# _pane_is_agent cannot rule out: the agent had execed but was still
+		# restoring its conversation, and the keystrokes went nowhere.
+		print "  Nudged it (${_DELIVER_VIA}), but it has NOT started a turn after ${APEX_RECOVER_NUDGE_CONFIRM}s."
+		[[ -n ${APEX_SEND_UNCONFIRMED:-} ]] \
+			&& print "  Its input box never drained either, so the keystrokes may never have been accepted."
+		print "  It was probably still restoring its conversation when the nudge was typed. Look at the pane; if it is idle at an empty prompt, ${SELF} send ${member} <continue where you left off>"
+		print "  If it really never starts, it stays status=starting and \`pending\` reports it after ${APEX_STARTING_STALE}s."
+	fi
+
 	apex_event "$manager" "$(jq -nc "${ev[@]}" --arg text "$text" \
 		--arg via "${_DELIVER_VIA:-}" --arg unconf "${APEX_SEND_UNCONFIRMED:-}" \
-		'{event:"recover-continue", session:$s, delivered:true, via:$via, text:$text}
+		--argjson conf "$confirmed" \
+		'{event:"recover-continue", session:$s, delivered:true, confirmed:$conf,
+		  via:$via, text:$text}
 		 + (if $unconf != "" then {unconfirmed:true} else {} end)')"
 }
 
@@ -3306,7 +3357,6 @@ _apex_watch_statefile() { printf '%s/watch-state.json' "$(apex_dir "$1")"; }
 
 _apex_pending_sig() {
 	local manager="$1" dir
-	_apex_reportable_args
 	dir=$(apex_members_dir "$manager")
 	local -a files=("$dir"/*.json(N)) names=()
 	(( ${#files} )) || return 0
@@ -3321,8 +3371,7 @@ _apex_pending_sig() {
 	# legal), which would split one name into two and misalign every name after
 	# it, but they cannot contain a newline.
 	local sig rc=0
-	sig=$(jq -rs --arg names "${(pj:\n:)names}" \
-		"${_APEX_REPORTABLE_ARGS[@]}" "$_APEX_REPORTABLE_JQ"'
+	sig=$(jq -rs --arg names "${(pj:\n:)names}" "$_APEX_REPORTABLE_JQ"'
 		($names | split("\n")) as $n
 		| [ range(0; length) as $i
 		    | .[$i]
@@ -3345,7 +3394,7 @@ _apex_pending_sig() {
 	local -a out=()
 	local i one
 	for (( i = 1; i <= ${#files}; i++ )); do
-		one=$(jq -r "${_APEX_REPORTABLE_ARGS[@]}" "$_APEX_REPORTABLE_JQ"'
+		one=$(jq -r "$_APEX_REPORTABLE_JQ"'
 			select(reportable)
 			| "#\(.seq // 0)\(if (.pair_message // "") != "" then "!" else "" end)"
 			' "${files[$i]}" 2>/dev/null) || continue

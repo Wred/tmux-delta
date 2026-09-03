@@ -62,6 +62,9 @@ export TMUX=fake-socket
 # stub pane never execs anything, so every recover of a resumable member would
 # otherwise pay the full real-world ceiling before giving up.
 export APEX_RECOVER_NUDGE_WAIT=1
+# Likewise for the confirmation wait: no stub pane ever starts a turn, so every
+# nudge here is delivered-but-unconfirmed and would pay the full ceiling.
+export APEX_RECOVER_NUDGE_CONFIRM=1
 export STUB_PANE_CMD=""
 export XDG_CACHE_HOME="$TMPROOT/cache"
 APEX_ROOT="$XDG_CACHE_HOME/tmux-delta/apex"
@@ -541,8 +544,18 @@ member "resumed:%21" "$(jq -nc --arg wt "$WT" \
 
 stub_reset_log
 out=$(STUB_PANE_CMD=node apex recover --yes resumed:%21 2>&1)
-contains "the resumed member is nudged" "Nudged it to continue" "$out"
-lacks "…and recover does not report it as unnudged" "NOT nudged" "$out"
+# The stub pane runs no agent, so nothing ever writes a turn to the new
+# member's record: the nudge is delivered and *not* confirmed. That is the
+# honest reading here, and the line has to say so — see section 4c.
+contains "the resumed member is nudged" "Nudged it" "$out"
+contains "…and the unconfirmed nudge is not claimed as a start" \
+	"has NOT started a turn" "$out"
+lacks "…so it never says the member started" "started a turn." \
+	"${out%%has NOT started*}"
+contains "…and it hands over the send to re-deliver it" "send resumed:" "$out"
+contains "…and points at the stale-start report as the backstop" \
+	"status=starting" "$out"
+lacks "…and does not also claim nothing was delivered" "NOT nudged" "$out"
 
 keys=$(grep -F 'send-keys' "$STUB/log")
 contains "the continuation is typed into the new pane" "[apex from:recover]" "$keys"
@@ -558,6 +571,8 @@ lacks "…so it cannot re-assign the issue to itself" "--add-assignee" "$keys"
 
 cev=$(grep -F '"event":"recover-continue"' "$APEX_ROOT/$MANAGER/events.jsonl" | tail -1)
 eq "the delivery is recorded" true "$(print -r -- "$cev" | jq -r '.delivered')"
+eq "…separately from whether it was acted on" false \
+	"$(print -r -- "$cev" | jq -r '.confirmed')"
 contains "…against the new member key" "resumed:%" \
 	"$(print -r -- "$cev" | jq -r '.session')"
 
@@ -582,6 +597,54 @@ member "optout:%22" "$(jq -nc --arg wt "$WT" \
 out=$(STUB_PANE_CMD=node APEX_RECOVER_NUDGE=0 apex recover --yes optout:%22 2>&1)
 contains "the nudge can be turned off"      "NOT nudged (APEX_RECOVER_NUDGE=0)" "$out"
 contains "…and it still says who needs one" "send optout:" "$out"
+
+# ─── 4c. the nudge is confirmed, not assumed (issue #42, review) ─────
+
+print "\na delivered nudge is confirmed against member state"
+
+# `_pane_is_agent` is the strongest precondition available before typing, and it
+# proves the agent *execed* — not that its TUI accepts input. On the --resume
+# path claude then spends time restoring the conversation, and the longer the
+# transcript the wider that window; keystrokes typed into it are dropped and
+# `_send_to_pane` cannot tell, because an undrawn input box reads exactly like a
+# ready empty one. Asserting "Nudged it to continue" off a successful delivery
+# would relocate the false claim this whole change exists to delete one step
+# later, so the outcome is read back off the member's own state instead.
+confirmed() {  # confirmed <key> — "yes" if the member is judged to have started
+	zsh -c 'source "'"$SCRIPTS"'/tmux-apex.sh" >/dev/null 2>&1
+		if _apex_nudge_confirmed "'"$MANAGER"'" "'"$1"'" 0; then
+			print yes
+		else
+			print no
+		fi'
+}
+
+member "confirm-working:%40" '{"status":"working","seq":1}'
+eq "a member that took a turn counts as started" yes \
+	"$(confirmed confirm-working:%40)"
+
+member "confirm-idle:%41" '{"status":"idle","seq":2}'
+eq "…and so does one that already finished one" yes \
+	"$(confirmed confirm-idle:%41)"
+
+member "confirm-attention:%42" '{"status":"attention","seq":3}'
+eq "…and one that stopped to ask something" yes \
+	"$(confirmed confirm-attention:%42)"
+
+member "confirm-stuck:%43" '{"status":"starting","seq":0}'
+eq "a member still at seq 0 has not started" no \
+	"$(confirmed confirm-stuck:%43)"
+
+# seq is what the hooks bump, and a bump can land before the status write is
+# read back; either half is enough, so neither can strand a working member.
+member "confirm-raced:%44" '{"status":"starting","seq":1}'
+eq "…but a bumped seq alone is enough" yes \
+	"$(confirmed confirm-raced:%44)"
+
+# Fail towards "not confirmed": an unreadable record must not license the
+# claim. The stale-start report picks the member up either way.
+eq "an absent record is never confirmation" no \
+	"$(confirmed confirm-missing:%45)"
 
 # ─── 5. recycled pane ids ────────────────────────────────────────────
 

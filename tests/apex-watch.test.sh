@@ -275,16 +275,28 @@ eq "pending and the gate agree on stalled starts" "" "${(j:; :)SDISAGREE}"
 eq "…over all 8 states"           8 "$SCHECKED"
 eq "…and some of them do report"  5 "$SREPORTED"
 
-# A garbage threshold must not silently disable every reporting path at once.
-# `--argjson` would fail, which makes every jq in the file exit non-zero,
-# which reads as "nothing to report" everywhere — the exact silence this
-# clause exists to end. So it is clamped, loudly, not trusted.
+# The threshold is read out of the environment by the predicate itself, not
+# passed in as a binding every reader has to remember — a reader that forgot
+# would make jq exit non-zero, which reads as "nothing to report" on every
+# path at once. Same argument for a garbage value: clamped inside the
+# predicate, where no caller can skip it.
 reset
+member_started 'w:%7' starting 0 -1 5000
+eq "a garbage threshold falls back to the default" "w:%7#0" \
+	"$(APEX_STARTING_STALE=soon _apex_pending_sig "$MGR")"
+member_started 'w:%7' starting 0 -1 5
+eq "…the default, not zero" "" "$(APEX_STARTING_STALE=soon _apex_pending_sig "$MGR")"
+
 member 'w:%7' idle 3 -1
-err=$(APEX_STARTING_STALE=soon _apex_pending_sig "$MGR" 2>&1 >/dev/null)
-contains "a non-numeric threshold is reported" "APEX_STARTING_STALE" "$err"
-eq "…and does not take the rest of reportability down with it" "w:%7#3" \
-	"$(APEX_STARTING_STALE=soon _apex_pending_sig "$MGR" 2>/dev/null)"
+eq "…and takes nothing else down with it" "w:%7#3" \
+	"$(APEX_STARTING_STALE=soon _apex_pending_sig "$MGR")"
+
+# Set in the invoking shell without `export`, the knob would be invisible to
+# jq while looking configured — a threshold that silently is not the one you
+# set. The script exports it for exactly that reason.
+member_started 'w:%7' starting 0 -1 60
+eq "the knob reaches jq from a plain shell assignment" "w:%7#0" \
+	"$(APEX_STARTING_STALE=30 zsh -c 'source "'"$SCRIPTS"'/tmux-apex.sh" >/dev/null 2>&1; _apex_pending_sig "'"$MGR"'"')"
 
 # ── nudging ──────────────────────────────────────────────────────────
 print "_apex_watch_tick"
