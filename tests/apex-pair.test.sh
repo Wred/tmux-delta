@@ -208,6 +208,9 @@ cat > "$BIN/gh" <<'EOF'
 #!/usr/bin/env bash
 printf '%s\n' "$*" >> "$STUB_GH"
 [ -n "${STUB_GH_FAIL:-}" ] && exit 1
+case "$*" in
+	*"pr view"*"--jq"*) printf '%s\n' "${STUB_GH_COMMENTS:-1}" ;;
+esac
 exit 0
 EOF
 chmod +x "$BIN/tmux" "$BIN/gh"
@@ -319,7 +322,7 @@ eq "verdict count is stored"           3 "$(mget "$REVIEWER" verdict_findings)"
 settle "$REVIEWER" >/dev/null
 relayed=$(sent_to %1)
 contains "worker is told the finding count" "3 finding(s)"      "$relayed"
-contains "worker is told how to read them"  "gh pr view 42"     "$relayed"
+contains "worker is told how the finding was recorded" "noted inline" "$relayed"
 contains "the reviewer's note is passed on" "unquoted vars"     "$relayed"
 contains "worker is told not to wait"       "Do NOT message the manager" "$relayed"
 eq "round advances on both halves (worker)"   2 "$(mget "$WORKER" pair_round)"
@@ -398,7 +401,7 @@ contains "cap ping names the cap"        "round 2 of 2" "$out"
 contains "cap ping says they diverged"   "not converging" "$out"
 eq "loop is marked stuck" stuck "$(mget "$WORKER" pair_state)"
 eq "no third round is relayed" "" "$(sent_to %1)"
-eq "the PR is left as a draft" "" "$(cat "$STUB_GH")"
+lacks "the PR is left as a draft" "pr ready" "$(cat "$STUB_GH")"
 
 # Resuming at the cap without raising it would re-invoke the reviewer for a
 # full turn, collect duplicate PR comments, and land back in `stuck` on its
@@ -789,6 +792,59 @@ contains "verdict rejects a non-integer" "non-negative integer" "$out"
 # The worker must not be able to close out its own review.
 out=$(worker_verdict --none)
 contains "only the reviewer may record a verdict" "only the reviewer" "$out"
+
+# ── verdict refuses to trust findings nobody can read (issue #47) ────
+# A reviewer could run `verdict --findings N` having only thought about the
+# findings, without ever posting them anywhere outside its own pane — the
+# relay would then send the fixer to read comments that don't exist.
+print "\nverdict refuses findings with nothing published to back them"
+reset
+export STUB_GH_COMMENTS=0
+out=$(verdict --findings 2 2>&1)
+contains "the die names the PR" "PR #42" "$out"
+contains "the die says nothing was published" "zero published comments" "$out"
+contains "the die offers --note" "--note" "$out"
+contains "the die offers --override" "--override" "$out"
+eq "no verdict was recorded" "" "$(mget "$REVIEWER" verdict_findings)"
+unset STUB_GH_COMMENTS
+
+print "\n...but a --note is accepted as the evidence instead"
+reset
+export STUB_GH_COMMENTS=0
+out=$(verdict --findings 2 --note 'no network, recording inline' 2>&1)
+eq "verdict is recorded" 2 "$(mget "$REVIEWER" verdict_findings)"
+contains "the reviewer sees it went through" "recorded for round" "$out"
+unset STUB_GH_COMMENTS
+
+print "\n...and --override records it anyway without a note"
+reset
+export STUB_GH_COMMENTS=0
+out=$(verdict --findings 2 --override 2>&1)
+eq "verdict is recorded despite no published comments" 2 "$(mget "$REVIEWER" verdict_findings)"
+contains "the reviewer sees it went through" "recorded for round" "$out"
+unset STUB_GH_COMMENTS
+
+print "\n...and a real published comment satisfies the guard"
+reset
+export STUB_GH_COMMENTS=1
+out=$(verdict --findings 3 2>&1)
+eq "verdict is recorded" 3 "$(mget "$REVIEWER" verdict_findings)"
+unset STUB_GH_COMMENTS
+
+print "\n...and --none never needs published comments"
+reset
+export STUB_GH_COMMENTS=0
+out=$(verdict --none 2>&1)
+eq "an empty verdict is recorded" 0 "$(mget "$REVIEWER" verdict_findings)"
+unset STUB_GH_COMMENTS
+
+print "\n...and a GitHub query failure refuses rather than assumes"
+reset
+export STUB_GH_FAIL=1
+out=$(verdict --findings 1 2>&1)
+contains "the die says it could not confirm" "could not confirm" "$out"
+eq "no verdict was recorded" "" "$(mget "$REVIEWER" verdict_findings)"
+unset STUB_GH_FAIL
 
 # ── two-argument option guards ───────────────────────────────────────
 # zsh's `shift 2` with one positional left fails *and leaves $# unchanged*, so

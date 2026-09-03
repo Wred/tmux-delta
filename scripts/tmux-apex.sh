@@ -1666,7 +1666,11 @@ APEX_PAIR_MAX_ROUNDS=${APEX_PAIR_MAX_ROUNDS:-5}
 
 _pair_worker_msg() {
 	local pr="$1" round="$2" findings="$3" note="$4"
-	print -r -- "PAIRED REVIEW round ${round}: the reviewer on PR #${pr} recorded ${findings} finding(s) worth addressing${note:+ — \"${note}\"}. Read them with 'gh pr view ${pr} --comments' and 'gh api repos/{owner}/{repo}/pulls/${pr}/comments'. Fix every BUG/CONCERN finding and push to the PR branch; for anything you disagree with, reply on that review thread saying why rather than silently skipping it. Do NOT message the manager or wait for a human — when your commits are pushed, just stop. The reviewer is re-invoked automatically."
+	if [[ -n $note ]]; then
+		print -r -- "PAIRED REVIEW round ${round}: the reviewer on PR #${pr} recorded ${findings} finding(s) worth addressing, noted inline (no PR comments were required for this verdict): \"${note}\". Fix every BUG/CONCERN finding and push to the PR branch; for anything you disagree with, reply on that review thread saying why rather than silently skipping it. Do NOT message the manager or wait for a human — when your commits are pushed, just stop. The reviewer is re-invoked automatically."
+	else
+		print -r -- "PAIRED REVIEW round ${round}: the reviewer on PR #${pr} recorded ${findings} finding(s) worth addressing. Check 'gh pr view ${pr} --comments' and 'gh api repos/{owner}/{repo}/pulls/${pr}/comments' for them; if nothing readable turns up there, report that back rather than assuming you're looking in the wrong place. Fix every BUG/CONCERN finding and push to the PR branch; for anything you disagree with, reply on that review thread saying why rather than silently skipping it. Do NOT message the manager or wait for a human — when your commits are pushed, just stop. The reviewer is re-invoked automatically."
+	fi
 }
 
 _pair_reviewer_msg() {
@@ -2111,16 +2115,17 @@ _cmd_pair_resume() {
 # verdict — run by the *reviewer* in its own pane. This is the loop's only
 # termination signal, and deliberately a structured one.
 _cmd_verdict() {
-	local findings="" note=""
+	local findings="" note="" override=0
 	while (( $# )); do
 		case "$1" in
 			--findings) _need_val verdict "$1" $#; findings="$2"; shift 2 ;;
 			--none)     findings=0; shift ;;
 			--note)     _need_val verdict "$1" $#; note="$2"; shift 2 ;;
+			--override) override=1; shift ;;
 			*) _die "verdict: unknown argument '$1'" ;;
 		esac
 	done
-	[[ -n $findings ]] || _die "verdict: usage: verdict --findings N | --none [--note TEXT]"
+	[[ -n $findings ]] || _die "verdict: usage: verdict --findings N | --none [--note TEXT] [--override]"
 	[[ $findings == <-> ]] || _die "verdict: --findings must be a non-negative integer"
 
 	local member manager
@@ -2133,6 +2138,30 @@ _cmd_verdict() {
 	role=$(apex_member_get "$manager" "$member" pair_role)
 	[[ $role == reviewer ]] || _die "verdict: only the reviewer half of a linked pair records verdicts (this member's pair_role is '${role:-<unlinked>}')"
 	round=$(apex_member_get "$manager" "$member" pair_round); [[ -n $round ]] || round=1
+
+	# `verdict --findings N` with N>0 used to be trusted on its word: nothing
+	# checked that the findings were ever posted somewhere the fixer (or
+	# anyone outside this pane) could actually read them. A reviewer could
+	# run --findings 3 having only thought about the findings, and the relay
+	# would send the fixer to read comments that don't exist (issue #47).
+	# So: if there are findings and no --note, require at least one
+	# published PR comment as evidence the findings are readable outside
+	# this pane. This does not try to match the count — one comment can
+	# carry three findings — it only checks that *something* was posted.
+	if (( findings > 0 )) && [[ -z $note ]] && (( ! override )); then
+		local pr wt published=""
+		pr=$(apex_member_get "$manager" "$member" pair_pr)
+		wt=$(apex_member_get "$manager" "$member" worktree)
+		if [[ -n $pr && -n $wt && -d $wt ]]; then
+			published=$(cd "$wt" && gh pr view "$pr" --json comments,reviews \
+				--jq '(.comments | length) + ([.reviews[] | select(.body != "")] | length)' 2>/dev/null)
+		fi
+		if [[ -z $published ]]; then
+			_die "verdict: could not confirm findings were published on PR #${pr:-?} (failed to query GitHub) — post the findings first, or pass --note TEXT to record them inline, or --override to record the verdict anyway"
+		elif (( published == 0 )); then
+			_die "verdict: --findings ${findings} was recorded but PR #${pr} has zero published comments — the fixer would be sent to read nothing. Post the findings as PR comments first, or pass --note TEXT to record them inline, or --override if you are certain (e.g. no network) and want to record the verdict anyway"
+		fi
+	fi
 
 	apex_member_merge "$manager" "$member" "$(jq -nc \
 		--arg r "$round" --arg f "$findings" --arg n "$note" \
