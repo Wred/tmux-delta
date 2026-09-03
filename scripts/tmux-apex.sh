@@ -1304,7 +1304,8 @@ _perm_unattended() {
 _spawn_check_mode() {
 	local mode="$1" perm="$2" agent="${3:-claude}" profile="$4"
 	local shown="${perm:-<agent default>}"
-	local src="--agent-flags ${shown}"
+	local src="--agent-flags ${perm}"
+	[[ -z $perm ]] && src="no --agent-flags"
 	[[ -n $profile ]] && src="profile '${profile}' (agent_flags=${shown})"
 
 	[[ $mode == autonomous || $mode == interactive ]] || \
