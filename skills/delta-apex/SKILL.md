@@ -630,6 +630,8 @@ the agent never ran: a failed launch, hooks that are not wired
 reported once, after `APEX_STARTING_STALE` seconds (15 minutes by default), and
 not again unless the member changes — so act on it when you see it rather than
 waiting for a second ping.
+Set that knob in whole seconds — anything else (`15m`, a negative) is refused
+on stderr and the default is used instead.
 
 If pings arrive only when the human writes to you, the poller is not running:
 check `tmux-apex.sh watch --status` and start it with `tmux-apex.sh watch`.

@@ -2507,7 +2507,8 @@ _cmd_status() {
 # told and has chosen to wait should not be re-interrupted every minute.
 _APEX_REPORTABLE_JQ='def stale_after:
 	(env.APEX_STARTING_STALE | tonumber?)
-	// (env._APEX_STARTING_STALE_DEFAULT | tonumber);
+	// (env._APEX_STARTING_STALE_DEFAULT | tonumber?)
+	// 900;
 def stalled_start:
 	.status == "starting"
 	and (.seq // 0) == 0
@@ -2534,14 +2535,34 @@ def reportable:
 # reader has to remember to pass — puts back exactly the drift the shared
 # definition exists to prevent (issue #23), and fails in the worst available
 # direction: a reader that forgets them makes jq exit non-zero, which reads as
-# "nothing to report" on every path at once. `tonumber? // 900` is the same
-# argument for a garbage value: clamp in the predicate, where no caller can
-# skip it, rather than at a door there is no single one of.
-# One binding for the number, referenced everywhere it is needed — the
-# predicate's fallback, the default itself, and any message that quotes it.
+# "nothing to report" on every path at once. `tonumber?` on both branches is
+# the same argument for a garbage value: clamp in the predicate, where no caller
+# can skip it, rather than at a door there is no single one of. That is also why
+# the last fallback is a literal and not the env lookup: an env var can be
+# absent, and `stale_after` returning null would make `>= stale_after` true for
+# every member — reporting healthy workers, the one direction this check must
+# not fail in. The literal is a backstop, not a second configuration point, and
+# `tests/apex-watch.test.sh` pins it equal to the binding below.
+#
+# One binding for the number otherwise, referenced everywhere it is needed — the
+# default itself, the predicate's fallback, and the warning that quotes it.
 # Written out three times it would drift, and the failure is quiet in the worst
 # way: a clamp that reverts to one value while the warning names another.
 _APEX_STARTING_STALE_DEFAULT=900
+
+# Two clamps, because the diagnostic and the safety net are independent and only
+# one of them can be inside the predicate. `<->` is the stricter test of the two
+# and it runs here: `tonumber?` screens non-numeric, not nonsense, so it takes
+# `15m` for 900 without a word — the operator asked for fifteen minutes and got
+# fifteen minutes of a different unit — and accepts `-5`, which makes
+# `(now - .spawned_at) >= -5` true for a member spawned a second ago and reports
+# every starting member at once. Say so and use the default instead; the
+# predicate's own clamp stays as the backstop for values that never came through
+# here.
+if [[ -n ${APEX_STARTING_STALE:-} && $APEX_STARTING_STALE != <-> ]]; then
+	print -u2 "${SELF:-tmux-apex}: APEX_STARTING_STALE='${APEX_STARTING_STALE}' is not a whole number of seconds; using ${_APEX_STARTING_STALE_DEFAULT}"
+	APEX_STARTING_STALE=$_APEX_STARTING_STALE_DEFAULT
+fi
 APEX_STARTING_STALE=${APEX_STARTING_STALE:-$_APEX_STARTING_STALE_DEFAULT}
 export APEX_STARTING_STALE _APEX_STARTING_STALE_DEFAULT
 

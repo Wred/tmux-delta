@@ -291,6 +291,45 @@ member 'w:%7' idle 3 -1
 eq "…and takes nothing else down with it" "w:%7#3" \
 	"$(APEX_STARTING_STALE=soon _apex_pending_sig "$MGR")"
 
+# The predicate's last resort is a literal rather than a third env lookup,
+# because `stale_after` returning null would make `>= stale_after` true for
+# every member — reporting healthy workers at the moment the default went
+# missing, the one direction this check must not fail in.
+member_started 'w:%7' starting 0 -1 5
+eq "a missing default does not report every starting member" "" \
+	"$(zsh -c 'source "'"$SCRIPTS"'/tmux-apex.sh" >/dev/null 2>&1
+		unset APEX_STARTING_STALE _APEX_STARTING_STALE_DEFAULT
+		_apex_pending_sig "'"$MGR"'"')"
+member_started 'w:%7' starting 0 -1 5000
+eq "…and still reports a genuinely stale one" "w:%7#0" \
+	"$(zsh -c 'source "'"$SCRIPTS"'/tmux-apex.sh" >/dev/null 2>&1
+		unset APEX_STARTING_STALE _APEX_STARTING_STALE_DEFAULT
+		_apex_pending_sig "'"$MGR"'"')"
+
+# That literal is a backstop, not a second configuration point. Pin the two
+# together so a changed default cannot leave a stale copy behind — the drift
+# this threshold was single-sourced to prevent.
+eq "the predicate's fallback matches the binding" "$_APEX_STARTING_STALE_DEFAULT" \
+	"$(print -r -- "$_APEX_REPORTABLE_JQ" | sed -n 's/.*\/\/ \([0-9][0-9]*\);/\1/p')"
+
+# `tonumber?` screens non-numeric, not nonsense: it takes `15m` for the default
+# without a word, and accepts `-5`, which makes the age comparison true for a
+# member spawned a second ago. `<->` catches both, so the diagnostic runs at
+# source time and the predicate clamp stays as the backstop.
+warn=$(APEX_STARTING_STALE=15m zsh -c 'source "'"$SCRIPTS"'/tmux-apex.sh"' 2>&1 >/dev/null) || true
+contains "a rejected threshold is reported"  "APEX_STARTING_STALE='15m'" "$warn"
+contains "…and names the value used instead" "using 900" "$warn"
+eq "…and the clamped value is what jq sees" 900 \
+	"$(APEX_STARTING_STALE=15m zsh -c 'source "'"$SCRIPTS"'/tmux-apex.sh" >/dev/null 2>&1
+		print -r -- "$APEX_STARTING_STALE"')"
+
+# A negative is perfectly numeric, so only `<->` stops it reporting every
+# starting member on the spot.
+member_started 'w:%7' starting 0 -1 5
+eq "a negative threshold does not report a fresh member" "" \
+	"$(APEX_STARTING_STALE=-5 zsh -c 'source "'"$SCRIPTS"'/tmux-apex.sh" >/dev/null 2>&1
+		_apex_pending_sig "'"$MGR"'"')"
+
 # Set in the invoking shell without `export`, the knob would be invisible to
 # jq while looking configured — a threshold that silently is not the one you
 # set. The script exports it for exactly that reason.
