@@ -1926,8 +1926,24 @@ _pair_advance() {
 			return 0
 		fi
 	else
+		# Stamp this round's comment baseline on the reviewer before waking
+		# it: verdict compares against this, so a stale comment left over
+		# from an earlier round cannot keep satisfying the "findings were
+		# published" guard forever (issue #47 follow-up). Best-effort — if
+		# GitHub cannot be queried right now, leave the prior baseline in
+		# place rather than block the relay on it; verdict's own query will
+		# fail closed on the same outage if it matters.
+		local wt baseline
+		wt=$(apex_member_get "$manager" "$member" worktree)
+		baseline=$(_pair_comment_count "$wt" "$pr" 2>/dev/null) || baseline=""
+
 		apex_member_merge "$manager" "$member" '{"pair_turn":"reviewer"}'
-		apex_member_merge "$manager" "$pair" '{"pair_turn":"reviewer"}'
+		if [[ -n $baseline ]]; then
+			apex_member_merge "$manager" "$pair" \
+				"$(jq -nc --argjson b "$baseline" '{pair_turn:"reviewer", pair_comment_baseline:$b}')"
+		else
+			apex_member_merge "$manager" "$pair" '{"pair_turn":"reviewer"}'
+		fi
 		if ! _pair_relay "$manager" "$pair" \
 			"$(_pair_reviewer_msg "$pr" "$round" rereview)"; then
 			_pair_rollback "$manager" "$member" "$pair" "$round" worker
@@ -2112,6 +2128,24 @@ _cmd_pair_resume() {
 	print "Resumed the loop on PR #${pr}; reviewer re-invoked for round ${round} of ${max}."
 }
 
+# _pair_comment_count <worktree> <pr> — total PR comments the fixer can
+# actually read: issue-level comments, non-empty review bodies, *and* inline
+# review comments (`pulls/{n}/comments`) — the channel `/my-pr-review` and
+# the non-note relay text actually point the fixer at. `gh pr view --json
+# comments,reviews` alone misses inline comments entirely: posting one
+# creates a COMMENTED review with an *empty* body, which the reviews filter
+# drops. Prints the summed count and returns 0, or prints nothing and
+# returns 1 if both queries failed (so a real GitHub outage still reads as
+# "could not confirm" rather than silently as zero).
+_pair_comment_count() {
+	local wt="$1" pr="$2" c1 c2 rc1=0 rc2=0
+	c1=$(cd "$wt" && gh pr view "$pr" --json comments,reviews \
+		--jq '(.comments | length) + ([.reviews[] | select(.body != "")] | length)' 2>/dev/null) || rc1=$?
+	c2=$(cd "$wt" && gh api "repos/{owner}/{repo}/pulls/${pr}/comments" --jq 'length' 2>/dev/null) || rc2=$?
+	(( rc1 == 0 || rc2 == 0 )) || return 1
+	print -r -- $(( ${c1:-0} + ${c2:-0} ))
+}
+
 # verdict — run by the *reviewer* in its own pane. This is the loop's only
 # termination signal, and deliberately a structured one.
 _cmd_verdict() {
@@ -2144,22 +2178,26 @@ _cmd_verdict() {
 	# anyone outside this pane) could actually read them. A reviewer could
 	# run --findings 3 having only thought about the findings, and the relay
 	# would send the fixer to read comments that don't exist (issue #47).
-	# So: if there are findings and no --note, require at least one
-	# published PR comment as evidence the findings are readable outside
-	# this pane. This does not try to match the count — one comment can
-	# carry three findings — it only checks that *something* was posted.
+	# So: if there are findings and no --note, require at least one PR
+	# comment *since this round started* as evidence the findings are
+	# readable outside this pane. This does not try to match the count —
+	# one comment can carry three findings — it only checks that
+	# *something new* was posted. Comparing against a per-round baseline
+	# (not just "any comment ever") matters from round 2 onward: without
+	# it, a stale round-1 comment would keep satisfying every later round's
+	# guard even though nothing new was ever published.
 	if (( findings > 0 )) && [[ -z $note ]] && (( ! override )); then
-		local pr wt published=""
+		local pr wt baseline published
 		pr=$(apex_member_get "$manager" "$member" pair_pr)
 		wt=$(apex_member_get "$manager" "$member" worktree)
-		if [[ -n $pr && -n $wt && -d $wt ]]; then
-			published=$(cd "$wt" && gh pr view "$pr" --json comments,reviews \
-				--jq '(.comments | length) + ([.reviews[] | select(.body != "")] | length)' 2>/dev/null)
+		if [[ -z $pr || -z $wt || ! -d $wt ]]; then
+			_die "verdict: refusing --findings ${findings} — could not determine the PR or worktree to check for published comments (pair_pr='${pr}', worktree='${wt}'); nothing recorded. Pass --note TEXT to record the findings inline, or --override to record the verdict anyway"
 		fi
-		if [[ -z $published ]]; then
-			_die "verdict: could not confirm findings were published on PR #${pr:-?} (failed to query GitHub) — post the findings first, or pass --note TEXT to record them inline, or --override to record the verdict anyway"
-		elif (( published == 0 )); then
-			_die "verdict: --findings ${findings} was recorded but PR #${pr} has zero published comments — the fixer would be sent to read nothing. Post the findings as PR comments first, or pass --note TEXT to record them inline, or --override if you are certain (e.g. no network) and want to record the verdict anyway"
+		published=$(_pair_comment_count "$wt" "$pr") || \
+			_die "verdict: refusing --findings ${findings} — could not confirm findings were published on PR #${pr} (failed to query GitHub); nothing recorded. Post the findings first, or pass --note TEXT to record them inline, or --override to record the verdict anyway"
+		baseline=$(apex_member_get "$manager" "$member" pair_comment_baseline); [[ $baseline == <-> ]] || baseline=0
+		if (( published <= baseline )); then
+			_die "verdict: refusing --findings ${findings} — PR #${pr} has no comments published since this round started (baseline ${baseline}, now ${published}); nothing recorded. The fixer would be sent to read nothing. Post the findings as PR comments first, or pass --note TEXT to record them inline, or --override if you are certain (e.g. no network) and want to record the verdict anyway"
 		fi
 	fi
 

@@ -209,7 +209,21 @@ cat > "$BIN/gh" <<'EOF'
 printf '%s\n' "$*" >> "$STUB_GH"
 [ -n "${STUB_GH_FAIL:-}" ] && exit 1
 case "$*" in
-	*"pr view"*"--jq"*) printf '%s\n' "${STUB_GH_COMMENTS:-1}" ;;
+	*"pr view"*"--jq"*)
+		if [ -n "${STUB_GH_COMMENTS:-}" ]; then
+			printf '%s\n' "$STUB_GH_COMMENTS"
+		else
+			# No fixed count was pinned: simulate a comment landing every
+			# time this is queried, so a round's baseline-stamp query and
+			# its later verdict query never collide on the same number —
+			# tests that don't care about the exact count (most of them)
+			# don't have to hand-simulate new comments every round.
+			n=$(( $(cat "$STUB_GH.count" 2>/dev/null || echo 0) + 1 ))
+			printf '%s\n' "$n" > "$STUB_GH.count"
+			printf '%s\n' "$n"
+		fi
+		;;
+	*"pulls/"*"/comments"*"--jq"*) printf '%s\n' "${STUB_GH_INLINE:-0}" ;;
 esac
 exit 0
 EOF
@@ -245,7 +259,7 @@ reset() {
 	for a in "$@"; do
 		case "$a" in --no-link) nolink=true ;; --max=*) max="${a#--max=}" ;; esac
 	done
-	rm -rf "$XDG_CACHE_HOME" "$STUB_OPTS" "$STUB_PANES" "$STUB_SENT" "$STUB_GH" "$STUB_SENT.box" "$STUB_SENT.boxseed" "$STUB_SENT.busy" "$STUB_SENT.reads"
+	rm -rf "$XDG_CACHE_HOME" "$STUB_OPTS" "$STUB_PANES" "$STUB_SENT" "$STUB_GH" "$STUB_GH.count" "$STUB_SENT.box" "$STUB_SENT.boxseed" "$STUB_SENT.busy" "$STUB_SENT.reads"
 	mkdir -p "$MEMBERS"
 	: > "$STUB_OPTS"; : > "$STUB_SENT"; : > "$STUB_GH"
 	printf '%%1\n%%2\n' > "$STUB_PANES"
@@ -802,7 +816,8 @@ reset
 export STUB_GH_COMMENTS=0
 out=$(verdict --findings 2 2>&1)
 contains "the die names the PR" "PR #42" "$out"
-contains "the die says nothing was published" "zero published comments" "$out"
+contains "the die says nothing was published" "no comments published since this round started" "$out"
+contains "the die is explicit nothing was recorded" "nothing recorded" "$out"
 contains "the die offers --note" "--note" "$out"
 contains "the die offers --override" "--override" "$out"
 eq "no verdict was recorded" "" "$(mget "$REVIEWER" verdict_findings)"
@@ -845,6 +860,44 @@ out=$(verdict --findings 1 2>&1)
 contains "the die says it could not confirm" "could not confirm" "$out"
 eq "no verdict was recorded" "" "$(mget "$REVIEWER" verdict_findings)"
 unset STUB_GH_FAIL
+
+# Inline review comments (`pulls/{n}/comments`) are the channel the relay's
+# non-note text actually points the fixer at, but posting one creates a
+# COMMENTED review with an *empty* body — `gh pr view --json comments,reviews`
+# alone never sees it. The guard has to count that endpoint too.
+print "\n...and an inline review comment alone satisfies the guard"
+reset
+export STUB_GH_COMMENTS=0
+export STUB_GH_INLINE=3
+out=$(verdict --findings 3 2>&1)
+eq "verdict is recorded from inline comments alone" 3 "$(mget "$REVIEWER" verdict_findings)"
+unset STUB_GH_COMMENTS STUB_GH_INLINE
+
+# A stale comment from round 1 must not keep satisfying every later round's
+# guard — each round needs its own evidence, or the same #47 failure mode
+# just resurfaces from round 2 onward.
+print "\n...and a round cannot coast on a prior round's comment"
+reset --max=3
+export STUB_GH_COMMENTS=1
+out=$(verdict --findings 1 2>&1)
+eq "round 1 verdict is recorded" 1 "$(mget "$REVIEWER" verdict_findings)"
+settle "$REVIEWER" >/dev/null   # relays to the worker, round -> 2
+settle "$WORKER" >/dev/null     # worker "pushes", reviewer re-invoked for round 2, baseline stamped at 1
+out=$(verdict --findings 1 2>&1)
+contains "round 2 with no new comment is refused" "no comments published since this round started" "$out"
+eq "round 2 verdict was not recorded" "" "$(mget "$REVIEWER" verdict_findings)"
+unset STUB_GH_COMMENTS
+
+print "\n...but a fresh comment in round 2 clears the new baseline"
+reset --max=3
+export STUB_GH_COMMENTS=1
+verdict --findings 1 >/dev/null
+settle "$REVIEWER" >/dev/null
+settle "$WORKER" >/dev/null
+export STUB_GH_COMMENTS=2       # a new comment landed for round 2
+out=$(verdict --findings 1 2>&1)
+eq "round 2 verdict is recorded" 1 "$(mget "$REVIEWER" verdict_findings)"
+unset STUB_GH_COMMENTS
 
 # ── two-argument option guards ───────────────────────────────────────
 # zsh's `shift 2` with one positional left fails *and leaves $# unchanged*, so
