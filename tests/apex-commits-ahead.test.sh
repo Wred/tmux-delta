@@ -115,10 +115,38 @@ print "\n_commits_ahead — never pushed at all"
 eq "a branch the remote has never heard of is not 0 either" "" \
 	"$(_commits_ahead "$WT" virgin)"
 
-# 4 commits: base, pushed-on-side, unpushed-on-side, never-pushed. None of them
-# is on the remote under refs/heads/virgin, so all of them are unpushed *there*.
-eq "…and --ask-remote counts every commit as unpushed" "4" \
+# `virgin` has 4 commits reachable from HEAD: base, pushed-on-side,
+# unpushed-on-side, never-pushed. Only the last two are work the remote does not
+# have anywhere; `base` is on origin/main and `pushed-on-side` is on the remote's
+# refs/heads/side. A count of 4 would be the whole reachable history — the
+# unactionable number in the other direction, which is what `--not --remotes`
+# exists to avoid here.
+#
+# Right now only origin/main survives locally (the #57 fixture above deleted
+# origin/side), so the honest-but-bounded answer is 3: shared history subtracted,
+# with one commit's worth of residual because the ref that would account for
+# `pushed-on-side` is not present under the narrow refspec.
+eq "…and --ask-remote subtracts shared history rather than counting all of it" "3" \
 	"$(_commits_ahead "$WT" virgin --ask-remote)"
+
+total=$(git -C "$WT" rev-list --count HEAD)
+if [[ $(_commits_ahead "$WT" virgin --ask-remote) == $total ]]; then
+	bad "…and never reports the whole reachable history" \
+		"reported all $total commits as unpushed"
+else
+	ok "…and never reports the whole reachable history"
+fi
+
+# Restore the ref the narrow-refspec fixture removed — at the sha the remote
+# really holds for refs/heads/side, which is `side~1`, not the local tip — and
+# the residual goes away: 2, the fully honest answer. This is what pins the claim in
+# `_commits_ahead`'s comment that the overcount is bounded by the branch's own
+# divergence rather than unbounded — the same input, one more remote ref, one
+# fewer phantom commit.
+git -C "$WT" update-ref refs/remotes/origin/side "$(git -C "$WT" rev-parse 'side~1')"
+eq "…and the residual is exactly the refs the narrow refspec withheld" "2" \
+	"$(_commits_ahead "$WT" virgin --ask-remote)"
+git -C "$WT" update-ref -d refs/remotes/origin/side
 
 print "\n_commits_ahead — a STALE tracking ref beats nothing, but not the remote"
 

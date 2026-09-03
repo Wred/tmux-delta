@@ -600,8 +600,29 @@ _commits_ahead() {
 		if (( rc == 0 )); then
 			remote_sha=$(printf '%s' "$out" | cut -f1)
 			if [[ -z $remote_sha ]]; then
-				# The remote has no such branch: nothing on it was ever pushed.
-				n=$(git -C "$wt" rev-list --count HEAD 2>/dev/null) || n=""
+				# The remote has no such branch, so this branch's own commits
+				# genuinely are unpushed. `--not --remotes` subtracts the shared
+				# history the branch inherited: a plain `rev-list --count HEAD`
+				# counts every commit already sitting on origin/main too, so a
+				# worker that made one commit reports the age of the repository
+				# — hundreds here. That is the same unactionable number this
+				# function exists to stop reporting, merely inverted from
+				# understating to wildly overstating.
+				#
+				# `--remotes` is safe *here* specifically, and the standing
+				# argument against it does not apply: we have just confirmed via
+				# the remote that this branch is absent there, so `--remotes` is
+				# only being used to subtract shared history, never to decide
+				# whether anything is pushed. (That decision is what it gets
+				# wrong under a narrow refspec — issue #31.)
+				#
+				# It can still overcount slightly under that same narrow
+				# refspec: a commit pushed to some *other* worker branch has no
+				# local remote ref to be subtracted by. That residual is bounded
+				# by the branch's own divergence and errs toward "look at this",
+				# which is the safe direction; the whole-history figure was
+				# neither bounded nor informative.
+				n=$(git -C "$wt" rev-list --count HEAD --not --remotes 2>/dev/null) || n=""
 			elif git -C "$wt" cat-file -e "${remote_sha}^{commit}" 2>/dev/null; then
 				n=$(git -C "$wt" rev-list --count HEAD --not "$remote_sha" 2>/dev/null) || n=""
 			else
