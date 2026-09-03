@@ -208,6 +208,23 @@ cat > "$BIN/gh" <<'EOF'
 #!/usr/bin/env bash
 printf '%s\n' "$*" >> "$STUB_GH"
 [ -n "${STUB_GH_FAIL:-}" ] && exit 1
+case "$*" in
+	*"pr view"*"--jq"*)
+		if [ -n "${STUB_GH_COMMENTS:-}" ]; then
+			printf '%s\n' "$STUB_GH_COMMENTS"
+		else
+			# No fixed count was pinned: simulate a comment landing every
+			# time this is queried, so a round's baseline-stamp query and
+			# its later verdict query never collide on the same number —
+			# tests that don't care about the exact count (most of them)
+			# don't have to hand-simulate new comments every round.
+			n=$(( $(cat "$STUB_GH.count" 2>/dev/null || echo 0) + 1 ))
+			printf '%s\n' "$n" > "$STUB_GH.count"
+			printf '%s\n' "$n"
+		fi
+		;;
+	*"pulls/"*"/comments"*"--jq"*) printf '%s\n' "${STUB_GH_INLINE:-0}" ;;
+esac
 exit 0
 EOF
 chmod +x "$BIN/tmux" "$BIN/gh"
@@ -242,7 +259,7 @@ reset() {
 	for a in "$@"; do
 		case "$a" in --no-link) nolink=true ;; --max=*) max="${a#--max=}" ;; esac
 	done
-	rm -rf "$XDG_CACHE_HOME" "$STUB_OPTS" "$STUB_PANES" "$STUB_SENT" "$STUB_GH" "$STUB_SENT.box" "$STUB_SENT.boxseed" "$STUB_SENT.busy" "$STUB_SENT.reads"
+	rm -rf "$XDG_CACHE_HOME" "$STUB_OPTS" "$STUB_PANES" "$STUB_SENT" "$STUB_GH" "$STUB_GH.count" "$STUB_SENT.box" "$STUB_SENT.boxseed" "$STUB_SENT.busy" "$STUB_SENT.reads"
 	mkdir -p "$MEMBERS"
 	: > "$STUB_OPTS"; : > "$STUB_SENT"; : > "$STUB_GH"
 	printf '%%1\n%%2\n' > "$STUB_PANES"
@@ -319,7 +336,7 @@ eq "verdict count is stored"           3 "$(mget "$REVIEWER" verdict_findings)"
 settle "$REVIEWER" >/dev/null
 relayed=$(sent_to %1)
 contains "worker is told the finding count" "3 finding(s)"      "$relayed"
-contains "worker is told how to read them"  "gh pr view 42"     "$relayed"
+contains "worker is told how the finding was recorded" "noted inline" "$relayed"
 contains "the reviewer's note is passed on" "unquoted vars"     "$relayed"
 contains "worker is told not to wait"       "Do NOT message the manager" "$relayed"
 eq "round advances on both halves (worker)"   2 "$(mget "$WORKER" pair_round)"
@@ -380,7 +397,7 @@ out=$(apex pending)
 contains "stuck ping explains why"   "without recording a verdict" "$out"
 contains "stuck ping offers a resume" "pair-resume"                "$out"
 eq "loop is marked stuck"  stuck "$(mget "$WORKER" pair_state)"
-eq "the PR is left as a draft" "" "$(cat "$STUB_GH")"
+lacks "the PR is left as a draft" "pr ready" "$(cat "$STUB_GH")"
 lacks "the worker is not asked to fix anything" "finding(s)" "$(sent_to %1)"
 
 # ── loop cap ─────────────────────────────────────────────────────────
@@ -398,7 +415,7 @@ contains "cap ping names the cap"        "round 2 of 2" "$out"
 contains "cap ping says they diverged"   "not converging" "$out"
 eq "loop is marked stuck" stuck "$(mget "$WORKER" pair_state)"
 eq "no third round is relayed" "" "$(sent_to %1)"
-eq "the PR is left as a draft" "" "$(cat "$STUB_GH")"
+lacks "the PR is left as a draft" "pr ready" "$(cat "$STUB_GH")"
 
 # Resuming at the cap without raising it would re-invoke the reviewer for a
 # full turn, collect duplicate PR comments, and land back in `stuck` on its
@@ -789,6 +806,112 @@ contains "verdict rejects a non-integer" "non-negative integer" "$out"
 # The worker must not be able to close out its own review.
 out=$(worker_verdict --none)
 contains "only the reviewer may record a verdict" "only the reviewer" "$out"
+
+# ── verdict refuses to trust findings nobody can read (issue #47) ────
+# A reviewer could run `verdict --findings N` having only thought about the
+# findings, without ever posting them anywhere outside its own pane — the
+# relay would then send the fixer to read comments that don't exist.
+print "\nverdict refuses findings with nothing published to back them"
+reset
+export STUB_GH_COMMENTS=0
+out=$(verdict --findings 2 2>&1)
+contains "the die names the PR" "PR #42" "$out"
+contains "the die says nothing was published" "no comments published since this round started" "$out"
+contains "the die is explicit nothing was recorded" "nothing recorded" "$out"
+contains "the die offers --note" "--note" "$out"
+contains "the die offers --override" "--override" "$out"
+eq "no verdict was recorded" "" "$(mget "$REVIEWER" verdict_findings)"
+unset STUB_GH_COMMENTS
+
+print "\n...but a --note is accepted as the evidence instead"
+reset
+export STUB_GH_COMMENTS=0
+out=$(verdict --findings 2 --note 'no network, recording inline' 2>&1)
+eq "verdict is recorded" 2 "$(mget "$REVIEWER" verdict_findings)"
+contains "the reviewer sees it went through" "recorded for round" "$out"
+unset STUB_GH_COMMENTS
+
+print "\n...and --override records it anyway without a note"
+reset
+export STUB_GH_COMMENTS=0
+out=$(verdict --findings 2 --override 2>&1)
+eq "verdict is recorded despite no published comments" 2 "$(mget "$REVIEWER" verdict_findings)"
+contains "the reviewer sees it went through" "recorded for round" "$out"
+eq "the bypass is recorded in member state" 1 "$(mget "$REVIEWER" verdict_override)"
+contains "the bypass is emitted as its own event" '"event":"pair-verdict-override"' "$(ev pair-verdict-override)"
+contains "the ordinary verdict event also flags it" '"override":true' "$(ev pair-verdict)"
+settle "$REVIEWER" >/dev/null
+relayed=$(sent_to %1)
+contains "the worker is told the findings were asserted, not published" "asserted via --override" "$relayed"
+lacks "and is not sent hunting for PR comments" "gh pr view 42" "$relayed"
+unset STUB_GH_COMMENTS
+
+print "\n...and a real published comment satisfies the guard"
+export STUB_GH_COMMENTS=0
+reset
+export STUB_GH_COMMENTS=1
+out=$(verdict --findings 3 2>&1)
+eq "verdict is recorded" 3 "$(mget "$REVIEWER" verdict_findings)"
+unset STUB_GH_COMMENTS
+
+print "\n...and --none never needs published comments"
+reset
+export STUB_GH_COMMENTS=0
+out=$(verdict --none 2>&1)
+eq "an empty verdict is recorded" 0 "$(mget "$REVIEWER" verdict_findings)"
+unset STUB_GH_COMMENTS
+
+print "\n...and a GitHub query failure refuses rather than assumes"
+reset
+export STUB_GH_FAIL=1
+out=$(verdict --findings 1 2>&1)
+contains "the die says it could not confirm" "could not confirm" "$out"
+eq "no verdict was recorded" "" "$(mget "$REVIEWER" verdict_findings)"
+unset STUB_GH_FAIL
+
+# Inline review comments (`pulls/{n}/comments`) are the channel the relay's
+# non-note text actually points the fixer at, but posting one creates a
+# COMMENTED review with an *empty* body — `gh pr view --json comments,reviews`
+# alone never sees it. The guard has to count that endpoint too.
+print "\n...and an inline review comment alone satisfies the guard"
+reset
+export STUB_GH_COMMENTS=0
+export STUB_GH_INLINE=3
+out=$(verdict --findings 3 2>&1)
+eq "verdict is recorded from inline comments alone" 3 "$(mget "$REVIEWER" verdict_findings)"
+unset STUB_GH_COMMENTS STUB_GH_INLINE
+
+# A stale comment from round 1 must not keep satisfying every later round's
+# guard — each round needs its own evidence, or the same #47 failure mode
+# just resurfaces from round 2 onward.
+print "\n...and a round cannot coast on a prior round's comment"
+export STUB_GH_COMMENTS=0
+reset --max=3
+export STUB_GH_COMMENTS=1
+out=$(verdict --findings 1 2>&1)
+eq "round 1 verdict is recorded" 1 "$(mget "$REVIEWER" verdict_findings)"
+settle "$REVIEWER" >/dev/null   # relays to the worker, round -> 2
+settle "$WORKER" >/dev/null     # worker "pushes", reviewer re-invoked for round 2, baseline stamped at 1
+: > "$STUB_SENT"
+out=$(verdict --findings 1 2>&1)
+contains "round 2 with no new comment is refused" "no comments published since this round started" "$out"
+eq "round 2 verdict was not recorded" 1 "$(mget "$REVIEWER" verdict_round)"
+settle "$REVIEWER" >/dev/null
+eq "no findings are relayed on a refused verdict" "" "$(sent_to %1)"
+eq "the reviewer is escalated, not believed" stuck "$(mget "$REVIEWER" pair_state)"
+unset STUB_GH_COMMENTS
+
+print "\n...but a fresh comment in round 2 clears the new baseline"
+export STUB_GH_COMMENTS=0
+reset --max=3
+export STUB_GH_COMMENTS=1
+verdict --findings 1 >/dev/null
+settle "$REVIEWER" >/dev/null
+settle "$WORKER" >/dev/null
+export STUB_GH_COMMENTS=2       # a new comment landed for round 2
+out=$(verdict --findings 1 2>&1)
+eq "round 2 verdict is recorded" 1 "$(mget "$REVIEWER" verdict_findings)"
+unset STUB_GH_COMMENTS
 
 # ── two-argument option guards ───────────────────────────────────────
 # zsh's `shift 2` with one positional left fails *and leaves $# unchanged*, so

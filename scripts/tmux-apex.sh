@@ -1661,12 +1661,19 @@ _cmd_send() {
 #   pair_state      active | complete | stuck
 #   pair_message    escalation text for `pending` to surface, once terminal
 #   verdict_round / verdict_findings / verdict_note   last recorded verdict
+#   verdict_override  "1" iff that verdict bypassed the published-comment guard
 
 APEX_PAIR_MAX_ROUNDS=${APEX_PAIR_MAX_ROUNDS:-5}
 
 _pair_worker_msg() {
-	local pr="$1" round="$2" findings="$3" note="$4"
-	print -r -- "PAIRED REVIEW round ${round}: the reviewer on PR #${pr} recorded ${findings} finding(s) worth addressing${note:+ — \"${note}\"}. Read them with 'gh pr view ${pr} --comments' and 'gh api repos/{owner}/{repo}/pulls/${pr}/comments'. Fix every BUG/CONCERN finding and push to the PR branch; for anything you disagree with, reply on that review thread saying why rather than silently skipping it. Do NOT message the manager or wait for a human — when your commits are pushed, just stop. The reviewer is re-invoked automatically."
+	local pr="$1" round="$2" findings="$3" note="$4" override="$5"
+	if [[ -n $note ]]; then
+		print -r -- "PAIRED REVIEW round ${round}: the reviewer on PR #${pr} recorded ${findings} finding(s) worth addressing, noted inline (no PR comments were required for this verdict): \"${note}\". Fix every BUG/CONCERN finding and push to the PR branch; for anything you disagree with, reply on that review thread saying why rather than silently skipping it. Do NOT message the manager or wait for a human — when your commits are pushed, just stop. The reviewer is re-invoked automatically."
+	elif [[ $override == 1 ]]; then
+		print -r -- "PAIRED REVIEW round ${round}: the reviewer on PR #${pr} recorded ${findings} finding(s) worth addressing, asserted via --override — the findings were NOT published anywhere and no note was left, so there is nothing to read on the PR. Do not go hunting for comments. Reply on the review thread asking the reviewer to state the findings, or otherwise get them from the reviewer directly, before treating this as actionable. Do NOT message the manager or wait for a human beyond that. The reviewer is re-invoked automatically."
+	else
+		print -r -- "PAIRED REVIEW round ${round}: the reviewer on PR #${pr} recorded ${findings} finding(s) worth addressing. Check 'gh pr view ${pr} --comments' and 'gh api repos/{owner}/{repo}/pulls/${pr}/comments' for them; if nothing readable turns up there, report that back rather than assuming you're looking in the wrong place. Fix every BUG/CONCERN finding and push to the PR branch; for anything you disagree with, reply on that review thread saying why rather than silently skipping it. Do NOT message the manager or wait for a human — when your commits are pushed, just stop. The reviewer is re-invoked automatically."
+	fi
 }
 
 _pair_reviewer_msg() {
@@ -1876,10 +1883,11 @@ _pair_advance() {
 	fi
 
 	if [[ $role == reviewer ]]; then
-		local vround findings note
+		local vround findings note voverride
 		vround=$(apex_member_get "$manager" "$member" verdict_round)
 		findings=$(apex_member_get "$manager" "$member" verdict_findings)
 		note=$(apex_member_get "$manager" "$member" verdict_note)
+		voverride=$(apex_member_get "$manager" "$member" verdict_override)
 
 		if [[ $vround != "$round" || -z $findings ]]; then
 			_pair_escalate "$manager" "$member" stuck \
@@ -1910,7 +1918,7 @@ _pair_advance() {
 		apex_member_merge "$manager" "$pair" \
 			"$(jq -nc --argjson r "$next" '{pair_round:$r, pair_turn:"worker"}')"
 		if ! _pair_relay "$manager" "$pair" \
-			"$(_pair_worker_msg "$pr" "$next" "$findings" "$note")"; then
+			"$(_pair_worker_msg "$pr" "$next" "$findings" "$note" "$voverride")"; then
 			# Roll the pre-written state back: nobody performed round
 			# $next, and leaving it bumped spends one of the cap's
 			# attempts on a round that never happened — which now costs
@@ -1922,8 +1930,28 @@ _pair_advance() {
 			return 0
 		fi
 	else
+		# Stamp this round's comment baseline on the reviewer before waking
+		# it: verdict compares against this, so a stale comment left over
+		# from an earlier round cannot keep satisfying the "findings were
+		# published" guard forever (issue #47 follow-up). Best-effort — if
+		# GitHub cannot be queried right now, leave the prior baseline in
+		# place rather than block the relay on it; verdict's own query will
+		# fail closed on the same outage if it matters.
+		local wt baseline
+		wt=$(apex_member_get "$manager" "$member" worktree)
+		if [[ -n $wt && -d $wt ]]; then
+			baseline=$(_pair_comment_count "$wt" "$pr" 2>/dev/null) || baseline=""
+		else
+			baseline=""
+		fi
+
 		apex_member_merge "$manager" "$member" '{"pair_turn":"reviewer"}'
-		apex_member_merge "$manager" "$pair" '{"pair_turn":"reviewer"}'
+		if [[ -n $baseline ]]; then
+			apex_member_merge "$manager" "$pair" \
+				"$(jq -nc --argjson b "$baseline" '{pair_turn:"reviewer", pair_comment_baseline:$b}')"
+		else
+			apex_member_merge "$manager" "$pair" '{"pair_turn":"reviewer"}'
+		fi
 		if ! _pair_relay "$manager" "$pair" \
 			"$(_pair_reviewer_msg "$pr" "$round" rereview)"; then
 			_pair_rollback "$manager" "$member" "$pair" "$round" worker
@@ -1972,16 +2000,32 @@ _cmd_link() {
 	fi
 	[[ -n $pr ]] || _die "link: could not determine the PR number — pass --pr N"
 
+	# Stamp round 1's baseline too — otherwise a PR that already has
+	# comments on it (e.g. from a human, or a prior unrelated pairing)
+	# satisfies the verdict guard on round 1 without the reviewer having
+	# published anything, which is issue #47's failure mode relocated
+	# rather than fixed. Best-effort like the round-2+ stamp in
+	# _pair_advance: if GitHub cannot be queried right now, fall back to
+	# an empty baseline (0) rather than block the link.
+	local rwt rbaseline
+	rwt=$(apex_member_get "$manager" "$reviewer" worktree)
+	if [[ -n $rwt && -d $rwt ]]; then
+		rbaseline=$(_pair_comment_count "$rwt" "$pr" 2>/dev/null) || rbaseline=0
+	else
+		rbaseline=0
+	fi
+
 	apex_member_merge "$manager" "$worker" "$(jq -nc \
 		--arg pair "$reviewer" --arg pr "$pr" --argjson max "$max" \
 		'{pair:$pair, pair_role:"worker", pair_pr:$pr, pair_round:1,
 		  pair_max_rounds:$max, pair_turn:"reviewer", pair_state:"active",
 		  pair_message:""}')"
 	apex_member_merge "$manager" "$reviewer" "$(jq -nc \
-		--arg pair "$worker" --arg pr "$pr" --argjson max "$max" \
+		--arg pair "$worker" --arg pr "$pr" --argjson max "$max" --argjson b "$rbaseline" \
 		'{pair:$pair, pair_role:"reviewer", pair_pr:$pr, pair_round:1,
 		  pair_max_rounds:$max, pair_turn:"reviewer", pair_state:"active",
-		  pair_message:"", verdict_round:"", verdict_findings:"", verdict_note:""}')"
+		  pair_message:"", verdict_round:"", verdict_findings:"", verdict_note:"",
+		  verdict_override:"", pair_comment_baseline:$b}')"
 
 	apex_event "$manager" "$(jq -nc --arg w "$worker" --arg r "$reviewer" \
 		--arg pr "$pr" --argjson max "$max" \
@@ -2098,7 +2142,7 @@ _cmd_pair_resume() {
 	# verdict; the old one must not satisfy it.
 	if [[ -f $(apex_member_file "$manager" "$reviewer") ]]; then
 		apex_member_merge "$manager" "$reviewer" \
-			'{"verdict_round":"","verdict_findings":"","verdict_note":""}'
+			'{"verdict_round":"","verdict_findings":"","verdict_note":"","verdict_override":""}'
 	fi
 
 	_pair_relay "$manager" "$reviewer" "$(_pair_reviewer_msg "$pr" "$round" rereview)" \
@@ -2108,19 +2152,41 @@ _cmd_pair_resume() {
 	print "Resumed the loop on PR #${pr}; reviewer re-invoked for round ${round} of ${max}."
 }
 
+# _pair_comment_count <worktree> <pr> — total PR comments the fixer can
+# actually read: issue-level comments, non-empty review bodies, *and* inline
+# review comments (`pulls/{n}/comments`) — the channel `/my-pr-review` and
+# the non-note relay text actually point the fixer at. `gh pr view --json
+# comments,reviews` alone misses inline comments entirely: posting one
+# creates a COMMENTED review with an *empty* body, which the reviews filter
+# drops. Prints the summed count and returns 0, or prints nothing and
+# returns 1 if either query failed. Both must succeed: a sum from one
+# endpoint is not comparable to a sum from both, so a partial failure
+# comparing against — or later being compared to — a baseline taken with
+# the other endpoint up would silently mean two different things by the
+# same number, false-blocking or (worse) false-passing a stale round.
+_pair_comment_count() {
+	local wt="$1" pr="$2" c1 c2 rc1=0 rc2=0
+	c1=$(cd "$wt" && gh pr view "$pr" --json comments,reviews \
+		--jq '(.comments | length) + ([.reviews[] | select(.body != "")] | length)' 2>/dev/null) || rc1=$?
+	c2=$(cd "$wt" && gh api "repos/{owner}/{repo}/pulls/${pr}/comments" --jq 'length' 2>/dev/null) || rc2=$?
+	(( rc1 == 0 && rc2 == 0 )) || return 1
+	print -r -- $(( ${c1:-0} + ${c2:-0} ))
+}
+
 # verdict — run by the *reviewer* in its own pane. This is the loop's only
 # termination signal, and deliberately a structured one.
 _cmd_verdict() {
-	local findings="" note=""
+	local findings="" note="" override=0
 	while (( $# )); do
 		case "$1" in
 			--findings) _need_val verdict "$1" $#; findings="$2"; shift 2 ;;
 			--none)     findings=0; shift ;;
 			--note)     _need_val verdict "$1" $#; note="$2"; shift 2 ;;
+			--override) override=1; shift ;;
 			*) _die "verdict: unknown argument '$1'" ;;
 		esac
 	done
-	[[ -n $findings ]] || _die "verdict: usage: verdict --findings N | --none [--note TEXT]"
+	[[ -n $findings ]] || _die "verdict: usage: verdict --findings N | --none [--note TEXT] [--override]"
 	[[ $findings == <-> ]] || _die "verdict: --findings must be a non-negative integer"
 
 	local member manager
@@ -2134,12 +2200,57 @@ _cmd_verdict() {
 	[[ $role == reviewer ]] || _die "verdict: only the reviewer half of a linked pair records verdicts (this member's pair_role is '${role:-<unlinked>}')"
 	round=$(apex_member_get "$manager" "$member" pair_round); [[ -n $round ]] || round=1
 
+	# `verdict --findings N` with N>0 used to be trusted on its word: nothing
+	# checked that the findings were ever posted somewhere the fixer (or
+	# anyone outside this pane) could actually read them. A reviewer could
+	# run --findings 3 having only thought about the findings, and the relay
+	# would send the fixer to read comments that don't exist (issue #47).
+	# So: if there are findings and no --note, require at least one PR
+	# comment *since this round started* as evidence the findings are
+	# readable outside this pane. This does not try to match the count —
+	# one comment can carry three findings — it only checks that
+	# *something new* was posted. Comparing against a per-round baseline
+	# (not just "any comment ever") matters from round 2 onward: without
+	# it, a stale round-1 comment would keep satisfying every later round's
+	# guard even though nothing new was ever published.
+	# --override exists for the reviewer's own genuine can't-publish case
+	# (no network, PR closed) — not as a routine substitute for --note.
+	# Reaching for it is common under pressure (an unpublished-finding
+	# verdict is exactly the failure this guard exists to catch), so a
+	# bypass must never be silent: `bypassed` below is recorded in member
+	# state and emitted as its own event, and the worker relay is told
+	# the findings were asserted rather than published, so it stops
+	# there instead of hunting for comments that were never posted.
+	local bypassed=0
+	if (( findings > 0 )) && [[ -z $note ]]; then
+		if (( override )); then
+			bypassed=1
+		else
+			local pr wt baseline published
+			pr=$(apex_member_get "$manager" "$member" pair_pr)
+			wt=$(apex_member_get "$manager" "$member" worktree)
+			if [[ -z $pr || -z $wt || ! -d $wt ]]; then
+				_die "verdict: refusing --findings ${findings} — could not determine the PR or worktree to check for published comments (pair_pr='${pr}', worktree='${wt}'); nothing recorded. Pass --note TEXT to record the findings inline instead"
+			fi
+			published=$(_pair_comment_count "$wt" "$pr") || \
+				_die "verdict: refusing --findings ${findings} — could not confirm findings were published on PR #${pr} (failed to query GitHub); nothing recorded. Post the findings first, or pass --note TEXT to record them inline. (--override exists only for a genuine can't-publish case — e.g. no network — and is recorded as a bypass, visible to the human, not a quiet way past this)"
+			baseline=$(apex_member_get "$manager" "$member" pair_comment_baseline); [[ $baseline == <-> ]] || baseline=0
+			if (( published <= baseline )); then
+				_die "verdict: refusing --findings ${findings} — PR #${pr} has no comments published since this round started (baseline ${baseline}, now ${published}); nothing recorded. The fixer would be sent to read nothing. Post the findings as PR comments first, or pass --note TEXT to record them inline. (--override exists only for a genuine can't-publish case — e.g. no network — and is recorded as a bypass, visible to the human, not a quiet way past this)"
+			fi
+		fi
+	fi
+
 	apex_member_merge "$manager" "$member" "$(jq -nc \
-		--arg r "$round" --arg f "$findings" --arg n "$note" \
-		'{verdict_round:$r, verdict_findings:$f, verdict_note:$n}')"
+		--arg r "$round" --arg f "$findings" --arg n "$note" --argjson o "$bypassed" \
+		'{verdict_round:$r, verdict_findings:$f, verdict_note:$n, verdict_override:(if $o == 1 then "1" else "" end)}')"
 	apex_event "$manager" "$(jq -nc --arg s "$member" --arg r "$round" \
-		--argjson f "$findings" --arg n "$note" \
-		'{event:"pair-verdict", session:$s, round:$r, findings:$f, note:$n}')"
+		--argjson f "$findings" --arg n "$note" --argjson o "$bypassed" \
+		'{event:"pair-verdict", session:$s, round:$r, findings:$f, note:$n, override:($o == 1)}')"
+	if (( bypassed )); then
+		apex_event "$manager" "$(jq -nc --arg s "$member" --arg r "$round" --argjson f "$findings" \
+			'{event:"pair-verdict-override", session:$s, round:$r, findings:$f}')"
+	fi
 
 	if (( findings == 0 )); then
 		print "Verdict recorded for round ${round}: no findings worth addressing."
