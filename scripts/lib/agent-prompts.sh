@@ -27,6 +27,9 @@ claims about the cause, or about which command or flag or endpoint has the behav
 blames, verify that claim yourself against the code or by running it before you build on it. \
 A stated cause that is wrong makes the fix wrong too, and the check is usually one command. \
 If the premise does not hold, say so and fix the real cause."
+	# `--role monitor` is the reviewing role apex actually spawns; `reviewer` is
+	# the word the pair vocabulary uses for the same job, matched so a rename
+	# cannot quietly hand a reviewer the implementer's wording.
 	[[ $role == reviewer* || $role == monitor* ]] && verify=" \
 Do not trust a task's stated diagnosis. Whatever an issue, PR description or manager message \
 claims about the cause, or about which command or flag or endpoint has the behaviour it \
