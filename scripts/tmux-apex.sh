@@ -1808,6 +1808,9 @@ _cmd_send() {
 #                   leaves the loop active and the turn where it was
 #   verdict_round / verdict_findings / verdict_note   last recorded verdict
 #   verdict_override  "1" iff that verdict bypassed the published-comment guard
+#   verdict_channel   "inline" | "issue" | "both" — which comment channel the guard
+#                   found that verdict's findings in, so the relay can point
+#                   the fixer at that one rather than at both (issue #60)
 
 APEX_PAIR_MAX_ROUNDS=${APEX_PAIR_MAX_ROUNDS:-5}
 # Wall-clock bound, in seconds, on the one `ls-remote` the loop makes per
@@ -1836,14 +1839,26 @@ if [[ ${APEX_PAIR_HEAD_TIMEOUT-} != <-> ]] || (( APEX_PAIR_HEAD_TIMEOUT < 1 || A
 	APEX_PAIR_HEAD_TIMEOUT=5
 fi
 
+# The non-note, non-override branch names *one* channel — the one the guard
+# actually found the findings in (issue #60). Naming both let the fixer be
+# sent to `pulls/N/comments` on a review that only posted an issue-level
+# summary, where that endpoint returns 0: from the fixer's side, identical to
+# findings that were never published at all.
 _pair_worker_msg() {
-	local pr="$1" round="$2" findings="$3" note="$4" override="$5"
+	local pr="$1" round="$2" findings="$3" note="$4" override="$5" channel="$6"
 	if [[ -n $note ]]; then
 		print -r -- "PAIRED REVIEW round ${round}: the reviewer on PR #${pr} recorded ${findings} finding(s) worth addressing, noted inline (no PR comments were required for this verdict): \"${note}\". Fix every BUG/CONCERN finding and push to the PR branch; for anything you disagree with, reply on that review thread saying why rather than silently skipping it. Do NOT message the manager or wait for a human — when your commits are pushed, just stop. The reviewer is re-invoked automatically."
 	elif [[ $override == 1 ]]; then
 		print -r -- "PAIRED REVIEW round ${round}: the reviewer on PR #${pr} recorded ${findings} finding(s) worth addressing, asserted via --override — the findings were NOT published anywhere and no note was left, so there is nothing to read on the PR. Do not go hunting for comments. Reply on the review thread asking the reviewer to state the findings, or otherwise get them from the reviewer directly, before treating this as actionable. Do NOT message the manager or wait for a human beyond that. The reviewer is re-invoked automatically."
 	else
-		print -r -- "PAIRED REVIEW round ${round}: the reviewer on PR #${pr} recorded ${findings} finding(s) worth addressing. Check 'gh pr view ${pr} --comments' and 'gh api repos/{owner}/{repo}/pulls/${pr}/comments' for them; if nothing readable turns up there, report that back rather than assuming you're looking in the wrong place. Fix every BUG/CONCERN finding and push to the PR branch; for anything you disagree with, reply on that review thread saying why rather than silently skipping it. Do NOT message the manager or wait for a human — when your commits are pushed, just stop. The reviewer is re-invoked automatically."
+		local where
+		case "$channel" in
+			inline) where="They are inline review comments, anchored to a file and line: read them with 'gh api repos/{owner}/{repo}/pulls/${pr}/comments'." ;;
+			both)   where="Some are inline review comments anchored to a file and line and some are issue-level comments on the PR: read both with 'gh api repos/{owner}/{repo}/pulls/${pr}/comments' and 'gh pr view ${pr} --comments'." ;;
+			issue)  where="They are issue-level comments on the PR, not inline ones: read them with 'gh pr view ${pr} --comments' ('gh api repos/{owner}/{repo}/pulls/${pr}/comments' returns nothing for this round, which is expected)." ;;
+			*)      where="Read them with 'gh pr view ${pr} --comments', which covers both issue-level and inline comments." ;;
+		esac
+		print -r -- "PAIRED REVIEW round ${round}: the reviewer on PR #${pr} recorded ${findings} finding(s) worth addressing. ${where} If nothing readable turns up, report that back rather than assuming you're looking in the wrong place. Fix every BUG/CONCERN finding and push to the PR branch; for anything you disagree with, reply on that review thread saying why rather than silently skipping it. Do NOT message the manager or wait for a human — when your commits are pushed, just stop. The reviewer is re-invoked automatically."
 	fi
 }
 
@@ -1855,7 +1870,7 @@ _pair_reviewer_msg() {
 	else
 		lead="PAIRED REVIEW round ${round}: the worker pushed fixes for PR #${pr}. Re-review it (/my-pr-review ${pr}), covering the findings you raised last round and anything new in the diff. Post findings as PR comments as usual."
 	fi
-	print -r -- "${lead} Before you stop you MUST record a machine-readable verdict — the loop halts and escalates to a human without one: run 'tmux-apex.sh verdict --findings <count worth addressing>', or 'tmux-apex.sh verdict --none' if nothing is left worth fixing. Count BUG/CONCERN findings, plus any SUGGESTION you genuinely think should be acted on; do not count nits you would not block on. Recording --none flips the PR out of draft and hands it to a human, so only do that when you would approve it. Do NOT message the manager."
+	print -r -- "${lead} Before you stop you MUST record a machine-readable verdict — the loop halts and escalates to a human without one: run 'tmux-apex.sh verdict --findings <count worth addressing>', or 'tmux-apex.sh verdict --none' if nothing is left worth fixing. Count BUG/CONCERN findings, plus any SUGGESTION you genuinely think should be acted on; do not count nits you would not block on. Prefer inline review comments anchored to a file and line over a prose summary — they tell the fixer *where* — but an issue-level comment on the PR is accepted evidence too. Recording --none flips the PR out of draft and hands it to a human, so only do that when you would approve it. Do NOT message the manager."
 }
 
 # _pair_relay <manager> <target> <text> — deliver, or halt the loop if the
@@ -2635,11 +2650,12 @@ _pair_advance() {
 	fi
 
 	if [[ $role == reviewer ]]; then
-		local vround findings note voverride
+		local vround findings note voverride vchannel
 		vround=$(apex_member_get "$manager" "$member" verdict_round)
 		findings=$(apex_member_get "$manager" "$member" verdict_findings)
 		note=$(apex_member_get "$manager" "$member" verdict_note)
 		voverride=$(apex_member_get "$manager" "$member" verdict_override)
+		vchannel=$(apex_member_get "$manager" "$member" verdict_channel)
 
 		if [[ $vround != "$round" || -z $findings ]]; then
 			_pair_escalate "$manager" "$member" stuck \
@@ -2679,7 +2695,7 @@ _pair_advance() {
 		apex_member_merge "$manager" "$member" "$turn_worker"
 		apex_member_merge "$manager" "$pair" "$turn_worker"
 		local msg rrc=0
-		msg=$(_pair_worker_msg "$pr" "$next" "$findings" "$note" "$voverride")
+		msg=$(_pair_worker_msg "$pr" "$next" "$findings" "$note" "$voverride" "$vchannel")
 		_pair_relay "$manager" "$pair" "$msg" || rrc=$?
 		if (( rrc == 2 )); then
 			# Deferred, not failed: the worker's pane is busy holding our text,
@@ -2746,18 +2762,24 @@ _pair_advance() {
 		# GitHub cannot be queried right now, leave the prior baseline in
 		# place rather than block the relay on it; verdict's own query will
 		# fail closed on the same outage if it matters.
-		local wt baseline
+		# Both channel baselines come from the same query and are stamped
+		# together or not at all (issue #60): a fresh count for one channel
+		# next to a stale one for the other is the same "two different things
+		# by the same number" hazard _pair_comment_counts refuses to create.
+		local wt counts baseline inline
 		wt=$(apex_member_get "$manager" "$member" worktree)
 		if [[ -n $wt && -d $wt ]]; then
-			baseline=$(_pair_comment_count "$wt" "$pr" 2>/dev/null) || baseline=""
+			counts=$(_pair_comment_counts "$wt" "$pr" 2>/dev/null) || counts=""
 		else
-			baseline=""
+			counts=""
 		fi
 
 		apex_member_merge "$manager" "$member" '{"pair_turn":"reviewer"}'
-		if [[ -n $baseline ]]; then
+		if [[ -n $counts ]]; then
+			baseline=${counts%% *}; inline=${counts##* }
 			apex_member_merge "$manager" "$pair" \
-				"$(jq -nc --argjson b "$baseline" '{pair_turn:"reviewer", pair_comment_baseline:$b}')"
+				"$(jq -nc --argjson b "$baseline" --argjson bi "$inline" \
+					'{pair_turn:"reviewer", pair_comment_baseline:$b, pair_inline_baseline:$bi}')"
 		else
 			apex_member_merge "$manager" "$pair" '{"pair_turn":"reviewer"}'
 		fi
@@ -2821,13 +2843,14 @@ _cmd_link() {
 	# rather than fixed. Best-effort like the round-2+ stamp in
 	# _pair_advance: if GitHub cannot be queried right now, fall back to
 	# an empty baseline (0) rather than block the link.
-	local rwt rbaseline
+	local rwt rcounts rbaseline rinline
 	rwt=$(apex_member_get "$manager" "$reviewer" worktree)
 	if [[ -n $rwt && -d $rwt ]]; then
-		rbaseline=$(_pair_comment_count "$rwt" "$pr" 2>/dev/null) || rbaseline=0
+		rcounts=$(_pair_comment_counts "$rwt" "$pr" 2>/dev/null) || rcounts="0 0"
 	else
-		rbaseline=0
+		rcounts="0 0"
 	fi
+	rbaseline=${rcounts%% *}; rinline=${rcounts##* }
 
 	apex_member_merge "$manager" "$worker" "$(jq -nc \
 		--arg pair "$reviewer" --arg pr "$pr" --argjson max "$max" \
@@ -2835,12 +2858,14 @@ _cmd_link() {
 		  pair_max_rounds:$max, pair_turn:"reviewer", pair_state:"active",
 		  pair_message:"", pair_worker_head:""}')"
 	apex_member_merge "$manager" "$reviewer" "$(jq -nc \
-		--arg pair "$worker" --arg pr "$pr" --argjson max "$max" --argjson b "$rbaseline" \
+		--arg pair "$worker" --arg pr "$pr" --argjson max "$max" \
+		--argjson b "$rbaseline" --argjson bi "$rinline" \
 		'{pair:$pair, pair_role:"reviewer", pair_pr:$pr, pair_round:1,
 		  pair_max_rounds:$max, pair_turn:"reviewer", pair_state:"active",
 		  pair_message:"", pair_worker_head:"", verdict_round:"",
 		  verdict_findings:"", verdict_note:"", verdict_override:"",
-		  pair_comment_baseline:$b}')"
+		  verdict_channel:"",
+		  pair_comment_baseline:$b, pair_inline_baseline:$bi}')"
 
 	apex_event "$manager" "$(jq -nc --arg w "$worker" --arg r "$reviewer" \
 		--arg pr "$pr" --argjson max "$max" \
@@ -2970,7 +2995,7 @@ _cmd_pair_resume() {
 	# verdict; the old one must not satisfy it.
 	if [[ -f $(apex_member_file "$manager" "$reviewer") ]]; then
 		apex_member_merge "$manager" "$reviewer" \
-			'{"verdict_round":"","verdict_findings":"","verdict_note":"","verdict_override":""}'
+			'{"verdict_round":"","verdict_findings":"","verdict_note":"","verdict_override":"","verdict_channel":""}'
 	fi
 
 	# A human has now adjudicated whatever the loop was stuck on, so any relay
@@ -2998,25 +3023,37 @@ _cmd_pair_resume() {
 	print "Resumed the loop on PR #${pr}; reviewer re-invoked for round ${round} of ${max}."
 }
 
-# _pair_comment_count <worktree> <pr> — total PR comments the fixer can
-# actually read: issue-level comments, non-empty review bodies, *and* inline
-# review comments (`pulls/{n}/comments`) — the channel `/my-pr-review` and
-# the non-note relay text actually point the fixer at. `gh pr view --json
-# comments,reviews` alone misses inline comments entirely: posting one
-# creates a COMMENTED review with an *empty* body, which the reviews filter
-# drops. Prints the summed count and returns 0, or prints nothing and
-# returns 1 if either query failed. Both must succeed: a sum from one
-# endpoint is not comparable to a sum from both, so a partial failure
-# comparing against — or later being compared to — a baseline taken with
-# the other endpoint up would silently mean two different things by the
-# same number, false-blocking or (worse) false-passing a stale round.
-_pair_comment_count() {
+# _pair_comment_counts <worktree> <pr> — the two *separate* channels a fixer
+# can read findings from, printed as "<issue> <inline>":
+#
+#   issue   issue-level PR comments plus non-empty review bodies — what
+#           `gh pr view N --comments` surfaces
+#   inline  inline review comments anchored to a file and line —
+#           `gh api repos/{owner}/{repo}/pulls/N/comments`
+#
+# They are kept apart rather than summed because the verdict guard and the
+# relay have to agree about *where* the findings are (issue #60). A summed
+# count let a reviewer satisfy the guard with a single issue-level summary
+# and still have the fixer pointed at the inline endpoint, which returns 0 —
+# indistinguishable, from the fixer's side, from the unpublished-findings
+# failure the guard was built to eliminate (issue #47).
+#
+# `gh pr view --json comments,reviews` cannot see inline comments at all:
+# posting one creates a COMMENTED review with an *empty* body, which the
+# reviews filter drops. Hence the second query.
+#
+# Prints both counts and returns 0, or prints nothing and returns 1 if
+# either query failed. Both must succeed: a baseline taken while one
+# endpoint was down is not comparable to a later count taken with it up, so
+# a partial failure would silently mean two different things by the same
+# number, false-blocking or (worse) false-passing a stale round.
+_pair_comment_counts() {
 	local wt="$1" pr="$2" c1 c2 rc1=0 rc2=0
 	c1=$(cd "$wt" && gh pr view "$pr" --json comments,reviews \
 		--jq '(.comments | length) + ([.reviews[] | select(.body != "")] | length)' 2>/dev/null) || rc1=$?
 	c2=$(cd "$wt" && gh api "repos/{owner}/{repo}/pulls/${pr}/comments" --jq 'length' 2>/dev/null) || rc2=$?
 	(( rc1 == 0 && rc2 == 0 )) || return 1
-	print -r -- $(( ${c1:-0} + ${c2:-0} ))
+	print -r -- "${c1:-0} ${c2:-0}"
 }
 
 # verdict — run by the *reviewer* in its own pane. This is the loop's only
@@ -3067,32 +3104,52 @@ _cmd_verdict() {
 	# state and emitted as its own event, and the worker relay is told
 	# the findings were asserted rather than published, so it stops
 	# there instead of hunting for comments that were never posted.
-	local bypassed=0
+	#
+	# The two channels are counted *separately* and either one is accepted as
+	# evidence (issue #60). Summing them meant a reviewer who posted a single
+	# issue-level summary and no inline comments passed the guard, while the
+	# relay still sent the fixer to `pulls/N/comments` — an endpoint that
+	# returns 0 for exactly that reviewer. From the fixer's side that is
+	# indistinguishable from the #47 failure this guard exists to catch. So
+	# the channel that actually grew is recorded in `verdict_channel` and the
+	# relay points the fixer at that one.
+	local bypassed=0 channel=""
 	if (( findings > 0 )) && [[ -z $note ]]; then
 		if (( override )); then
 			bypassed=1
 		else
-			local pr wt baseline published
+			local pr wt counts base_issue base_inline pub_issue pub_inline
 			pr=$(apex_member_get "$manager" "$member" pair_pr)
 			wt=$(apex_member_get "$manager" "$member" worktree)
 			if [[ -z $pr || -z $wt || ! -d $wt ]]; then
 				_die "verdict: refusing --findings ${findings} — could not determine the PR or worktree to check for published comments (pair_pr='${pr}', worktree='${wt}'); nothing recorded. Pass --note TEXT to record the findings inline instead"
 			fi
-			published=$(_pair_comment_count "$wt" "$pr") || \
+			counts=$(_pair_comment_counts "$wt" "$pr") || \
 				_die "verdict: refusing --findings ${findings} — could not confirm findings were published on PR #${pr} (failed to query GitHub); nothing recorded. Post the findings first, or pass --note TEXT to record them inline. (--override exists only for a genuine can't-publish case — e.g. no network — and is recorded as a bypass, visible to the human, not a quiet way past this)"
-			baseline=$(apex_member_get "$manager" "$member" pair_comment_baseline); [[ $baseline == <-> ]] || baseline=0
-			if (( published <= baseline )); then
-				_die "verdict: refusing --findings ${findings} — PR #${pr} has no comments published since this round started (baseline ${baseline}, now ${published}); nothing recorded. The fixer would be sent to read nothing. Post the findings as PR comments first, or pass --note TEXT to record them inline. (--override exists only for a genuine can't-publish case — e.g. no network — and is recorded as a bypass, visible to the human, not a quiet way past this)"
+			pub_issue=${counts%% *}; pub_inline=${counts##* }
+			base_issue=$(apex_member_get "$manager" "$member" pair_comment_baseline); [[ $base_issue == <-> ]] || base_issue=0
+			base_inline=$(apex_member_get "$manager" "$member" pair_inline_baseline); [[ $base_inline == <-> ]] || base_inline=0
+			# When both grew, say so: naming only one would leave the fixer
+			# unaware of half the findings, which is the same
+			# guard-and-relay disagreement in the other direction.
+			if (( pub_inline > base_inline && pub_issue > base_issue )); then
+				channel=both
+			elif (( pub_inline > base_inline )); then
+				channel=inline
+			elif (( pub_issue > base_issue )); then
+				channel=issue
+			else
+				_die "verdict: refusing --findings ${findings} — PR #${pr} has no comments published since this round started (inline ${base_inline}→${pub_inline}, issue-level ${base_issue}→${pub_issue}); nothing recorded. The fixer would be sent to read nothing. Post the findings as PR comments first — inline comments anchored to a file and line are preferred — or pass --note TEXT to record them inline. (--override exists only for a genuine can't-publish case — e.g. no network — and is recorded as a bypass, visible to the human, not a quiet way past this)"
 			fi
 		fi
 	fi
 
 	apex_member_merge "$manager" "$member" "$(jq -nc \
-		--arg r "$round" --arg f "$findings" --arg n "$note" --argjson o "$bypassed" \
-		'{verdict_round:$r, verdict_findings:$f, verdict_note:$n, verdict_override:(if $o == 1 then "1" else "" end)}')"
+		--arg r "$round" --arg f "$findings" --arg n "$note" --argjson o "$bypassed" --arg c "$channel" \
+		'{verdict_round:$r, verdict_findings:$f, verdict_note:$n, verdict_override:(if $o == 1 then "1" else "" end), verdict_channel:$c}')"
 	apex_event "$manager" "$(jq -nc --arg s "$member" --arg r "$round" \
-		--argjson f "$findings" --arg n "$note" --argjson o "$bypassed" \
-		'{event:"pair-verdict", session:$s, round:$r, findings:$f, note:$n, override:($o == 1)}')"
+		--argjson f "$findings" --arg n "$note" --argjson o "$bypassed" --arg c "$channel" \
+		'{event:"pair-verdict", session:$s, round:$r, findings:$f, note:$n, override:($o == 1), channel:$c}')"
 	if (( bypassed )); then
 		apex_event "$manager" "$(jq -nc --arg s "$member" --arg r "$round" --argjson f "$findings" \
 			'{event:"pair-verdict-override", session:$s, round:$r, findings:$f}')"
