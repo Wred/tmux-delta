@@ -843,8 +843,43 @@ contains "past the bound the wedged lock is named as itself" \
 	'"event":"pair-defer-lock-wedged"' "$(ev pair-defer-lock-wedged)"
 eq "and the transition is spent rather than handed back again" "$SEQ" \
 	"$(mget "$WORKER" settled_seq)"
-eq "the deferral is left for a human to read, not silently dropped" "$WORKER" \
+# And it escalates, the way every other exhaustion on this path does. An
+# events.jsonl line is not something `pending` says to a human in words, and on
+# the timer side nothing else stays armed, so logging alone leaves a loop that
+# reads as one that simply went quiet.
+eq "the loop is handed over, not left quiet" stuck "$(mget "$REVIEWER" pair_state)"
+contains "and the ping names the lock, not the pane" "stuck lock" "$(apex pending)"
+contains "saying why the pane was never read" "look at the pane" "$(apex pending)"
+eq "the round is left alone, since nothing observed the target" 2 \
+	"$(mget "$WORKER" pair_round)"
+eq "and the record is cleared, since no trigger will look again" "" \
 	"$(mget "$REVIEWER" pair_defer_target)"
+
+# The bound itself is a knob, and it is read into arithmetic where a
+# non-numeric, empty or negative value all evaluate as 0 — which would make the
+# first ordinary contention report a wedged lock.
+print "\n…and its bound is clamped like the rest of the family"
+reset --max=3
+verdict --findings 2 >/dev/null
+export STUB_PANE_TEXT='[apex from:apex-pair] PAIRED REVIEW'
+export STUB_PANE_NO_DRAIN=1
+export STUB_PANE_BUSY=1
+export APEX_SEND_SETTLE_TICKS=6
+settle "$REVIEWER" >/dev/null
+unset APEX_SEND_SETTLE_TICKS STUB_PANE_BUSY
+export APEX_HAVE_FLOCK=1 APEX_LOCK_WAIT=1 APEX_SETTLE_LOCK_RETRIES=nope
+mkdir -p "$DEFER_LOCK.d"
+SEQ=$(( $(mget "$WORKER" seq) + 1 ))
+jq -c --argjson s "$SEQ" '.seq = $s' "$MEMBERS/$WORKER.json" > "$TMPROOT/s" \
+	&& mv "$TMPROOT/s" "$MEMBERS/$WORKER.json"
+out=$(apex _settle "$WORKER" "$MGR" "$SEQ")
+rmdir "$DEFER_LOCK.d"
+unset APEX_HAVE_FLOCK APEX_LOCK_WAIT APEX_SETTLE_LOCK_RETRIES
+unset STUB_PANE_TEXT STUB_PANE_NO_DRAIN
+contains "a non-numeric bound is refused out loud" "APEX_SETTLE_LOCK_RETRIES" "$out"
+eq "and the first contention is still handed back" "" \
+	"$(mget "$WORKER" settled_seq)"
+eq "rather than reported as a wedged lock" active "$(mget "$REVIEWER" pair_state)"
 
 # The other reading, and the only one that means undelivered: our text in the
 # box and the pane not repainting a single cell. Nobody took it. This is the

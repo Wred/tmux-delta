@@ -1989,10 +1989,10 @@ APEX_PAIR_DEFER_IDLE_TICKS=${APEX_PAIR_DEFER_IDLE_TICKS:-10}
 # rides it should too, and running out should say so rather than go quiet.
 APEX_SETTLE_LOCK_RETRIES=${APEX_SETTLE_LOCK_RETRIES:-5}
 
-# _pair_defer_knobs — clamp the three knobs that bound the deferral, into
-# _PAIR_DEFER_SECS, _PAIR_DEFER_MAX and _PAIR_DEFER_TICKS.
+# _pair_defer_knobs — clamp the four knobs that bound the deferral, into
+# _PAIR_DEFER_SECS, _PAIR_DEFER_MAX, _PAIR_DEFER_TICKS and _PAIR_DEFER_RETRIES.
 #
-# Neither is trusted, for the reason _send_to_pane spells out for its own ticks:
+# None of them is trusted, for the reason _send_to_pane spells out for its own ticks:
 # a knob that silently switches off the bound it exists to tune is worse than a
 # knob that is ignored. `SECS=0` fires `run-shell -d 0` immediately and burns
 # the whole re-check budget in seconds; a non-numeric value makes `run-shell`
@@ -2037,6 +2037,16 @@ _pair_defer_knobs() {
 	if (( _PAIR_DEFER_TICKS > wait_ceiling )); then
 		print -u2 "tmux-apex: APEX_PAIR_DEFER_IDLE_TICKS='${APEX_PAIR_DEFER_IDLE_TICKS}' would outlast APEX_LOCK_WAIT='${APEX_LOCK_WAIT:-5}'; using ${wait_ceiling}"
 		_PAIR_DEFER_TICKS=$wait_ceiling
+	fi
+	# And the hand-back bound, which is read into arithmetic where a
+	# non-numeric, empty or negative value all evaluate as 0 — making the
+	# *first* contention, the ordinary sub-five-second kind, spend the
+	# transition and report a wedged lock. That is this comment's own argument
+	# turned on the newest member of the family.
+	_PAIR_DEFER_RETRIES=${APEX_SETTLE_LOCK_RETRIES}
+	if [[ $_PAIR_DEFER_RETRIES != <-> ]] || (( _PAIR_DEFER_RETRIES < 1 )); then
+		print -u2 "tmux-apex: APEX_SETTLE_LOCK_RETRIES='${APEX_SETTLE_LOCK_RETRIES}' is not a positive integer; using 5"
+		_PAIR_DEFER_RETRIES=5
 	fi
 }
 
@@ -2094,7 +2104,7 @@ _pair_defer_arm() {
 # outlive a hook process or hold a sleeping watcher open.
 _pair_defer_schedule() {
 	local manager="$1" member="$2" attempt="${3:-0}"
-	local _PAIR_DEFER_SECS _PAIR_DEFER_MAX _PAIR_DEFER_TICKS
+	local _PAIR_DEFER_SECS _PAIR_DEFER_MAX _PAIR_DEFER_TICKS _PAIR_DEFER_RETRIES
 	_pair_defer_knobs
 	tmux run-shell -b -d "$_PAIR_DEFER_SECS" \
 		"${SELF} _pair-defer-check ${(q)member} ${(q)manager} ${attempt}" 2>/dev/null || true
@@ -2129,6 +2139,30 @@ _pair_defer_clear() {
 			  "pair_defer_from":"","pair_defer_pair":"","pair_defer_prev_turn":"",
 			  "pair_defer_prev_round":0,"pair_defer_checks":0}'
 	done
+}
+
+# _pair_defer_wedged <manager> <member> <attempts> — the hand-back bound ran out.
+#
+# Every other way a deferral runs out ends in _pair_escalate, and this one has
+# to as well: an events.jsonl line is not something `pending` hands a human in
+# words, and on the timer side nothing else was left armed at all, so the loop
+# read as one that simply went quiet. The message names the lock rather than the
+# pane, because that is the whole distinction — nobody ever got to look at the
+# pane. The round is left where it is for the same reason the MAX_CHECKS
+# hand-over leaves it: nothing here observed the target, so there is no evidence
+# a round is not running. The record is cleared because no trigger will look at
+# it again once the chain has stopped.
+_pair_defer_wedged() {
+	setopt localoptions no_err_return
+	local manager="$1" member="$2" attempts="$3" from pr
+	from=$(apex_member_get "$manager" "$member" pair_defer_from 2>/dev/null)
+	[[ -n $from ]] || from="$member"
+	pr=$(apex_member_get "$manager" "$from" pair_pr 2>/dev/null)
+	apex_event "$manager" "$(jq -nc --arg s "$member" --argjson n "$attempts" \
+		'{event:"pair-defer-lock-wedged", session:$s, attempts:$n}')" 2>/dev/null
+	_pair_defer_clear "$manager" "$member"
+	_pair_escalate "$manager" "$from" stuck \
+		"PAIRED REVIEW STUCK: a deferred relay on PR #${pr} could not be adjudicated after ${attempts} attempts, because another check held its lock every time. This is a stuck lock, not a stuck pane — nothing ever got to look at the pane, so the round was left as it is. Read the panes to see where the loop actually got to, then 'pair-resume' this member."
 }
 
 # _pair_defer_settle <manager> <member>
@@ -2195,7 +2229,7 @@ _pair_defer_adjudicate() {
 	setopt localoptions no_err_return
 	local manager="$1" member="$2"
 	local target text residue from pair prev_round prev_turn
-	local _PAIR_DEFER_SECS _PAIR_DEFER_MAX _PAIR_DEFER_TICKS
+	local _PAIR_DEFER_SECS _PAIR_DEFER_MAX _PAIR_DEFER_TICKS _PAIR_DEFER_RETRIES
 	_pair_defer_knobs
 
 	target=$(apex_member_get "$manager" "$member" pair_defer_target 2>/dev/null)
@@ -2327,9 +2361,10 @@ _cmd_pair_defer_check() {
 	# APEX_PAIR_DEFER_MAX_CHECKS instead.
 	if (( rc == 3 )); then
 		(( attempt += 1 ))
-		if (( attempt > APEX_SETTLE_LOCK_RETRIES )); then
-			apex_event "$manager" "$(jq -nc --arg s "$member" --argjson n "$attempt" \
-				'{event:"pair-defer-lock-wedged", session:$s, attempts:$n}')" 2>/dev/null
+		local _PAIR_DEFER_SECS _PAIR_DEFER_MAX _PAIR_DEFER_TICKS _PAIR_DEFER_RETRIES
+		_pair_defer_knobs
+		if (( attempt > _PAIR_DEFER_RETRIES )); then
+			_pair_defer_wedged "$manager" "$member" "$attempt"
 		else
 			_pair_defer_schedule "$manager" "$member" "$attempt"
 		fi
@@ -2979,12 +3014,10 @@ _cmd_settle() {
 		# partner it never relayed to. The cost is one extra idle status event
 		# per retry, which is the honest record of what happened.
 		(( attempt += 1 ))
-		if (( attempt > APEX_SETTLE_LOCK_RETRIES )); then
-			# Out of hand-backs. Say so as its own event: a lock nobody ever
-			# releases is a different fault from a busy pair, and it should be
-			# legible as itself rather than as a loop that went quiet.
-			apex_event "$manager" "$(jq -nc --arg s "$session" --argjson n "$attempt" \
-				'{event:"pair-defer-lock-wedged", session:$s, attempts:$n}')" 2>/dev/null
+		local _PAIR_DEFER_SECS _PAIR_DEFER_MAX _PAIR_DEFER_TICKS _PAIR_DEFER_RETRIES
+		_pair_defer_knobs
+		if (( attempt > _PAIR_DEFER_RETRIES )); then
+			_pair_defer_wedged "$manager" "$session" "$attempt"
 			return 0
 		fi
 		apex_member_merge "$manager" "$session" '{"settled_seq":""}'
