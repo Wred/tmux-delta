@@ -320,6 +320,36 @@ done
 p=$(delta_task_prompt '' 43 review)
 eq "marker is the whole review prompt" "$p" "$(delta_task_marker '' 43)"
 
+# An issue's stated diagnosis is often wrong (#35/#45, #60, #43), and the agent
+# in the worktree is the cheapest place to catch that. The instruction belongs
+# in the *managed* prompt: the task prompt doubles as the transcript-matching
+# key above, so growing it would break recovery matching (#18).
+# The wording is role-specific, so each role is pinned to the tail only its own
+# branch produces — asserting on the shared opening would pass even if the
+# reviewing-role override were deleted. `monitor` is the reviewing role apex
+# spawns (`--role worker|monitor`); `reviewer` is the pair vocabulary's name for
+# it, covered so a rename cannot hand a reviewer the implementer's wording.
+for r in worker monitor reviewer; do
+	mp=$(delta_managed_prompt $r tmux-delta)
+	contains "the $r managed prompt tells it not to trust the diagnosis" \
+		"Do not trust a task's stated diagnosis" "$mp"
+	contains "…and to verify the claim first" "verify that claim yourself" "$mp"
+	if [[ $r == worker ]]; then
+		contains "…and tells a $r to fix the real cause" \
+			"fix the real cause" "$mp"
+		lacks "…not to write a review it does not write" \
+			"say so in your review" "$mp"
+	else
+		contains "…and tells a $r to report it in the review" \
+			"say so in your review" "$mp"
+		lacks "…not to fix it itself" "fix the real cause" "$mp"
+	fi
+done
+lacks "the verify gate is not in the task prompt" \
+	"Do not trust a task's stated diagnosis" "$(delta_task_prompt 42 '' autonomous)"
+eq "…and an unmanaged session gets no prompt at all" "" \
+	"$(delta_managed_prompt '' tmux-delta)"
+
 # ─── 2. resume argv ──────────────────────────────────────────────────
 
 print "\nresume argv"
