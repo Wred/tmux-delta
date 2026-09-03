@@ -532,7 +532,38 @@ tmux-apex.sh recover --yes     # recreate those panes, resuming their conversati
 
 `recover` recreates the session and pane for each dead member and restarts its
 agent **on the original conversation**, not with a blank context — so a worker
-picks up mid-task instead of re-doing it. Pass member keys to limit it to those.
+does not re-do work it has already done. Pass member keys to limit it to those.
+
+**A resumed agent comes back waiting, not working.** Restoring a conversation
+restores context and then leaves the agent at an empty prompt: it is never
+re-handed its task prompt, because that would re-run "assign the issue, comment
+that you have started, work it end-to-end" on a conversation that already did
+all of it. So `recover --yes` waits for each resumed pane's agent to come up and
+delivers a short continuation message itself — not the task, just "carry on,
+check what is already committed first". Read the per-member lines it prints:
+
+Every line reports what was *verified*, never what was merely typed — after
+delivering the nudge it watches the member's own state for the start of a turn,
+because keystrokes sent into an agent that has execed but is still restoring a
+long conversation are silently dropped:
+
+- `Nudged it to continue (…) — it has started a turn.` — that member is working
+  again. This is the only line that means recovery finished.
+- `Nudged it (…), but it has NOT started a turn after Ns.` — the message went
+  out and nothing happened, most likely typed while the agent was still
+  restoring. The following lines give you the `send` to re-deliver it.
+- `NOT nudged: …` — no message was delivered at all. The line says why and gives
+  you the `send` to run.
+
+The last two both mean a member is sitting at an empty prompt and **will not
+start on its own**. Do not assume recovery worked because the pane exists — read
+the line. An unnudged or unconfirmed member also stays `status=starting`, so
+`pending` surfaces it once it goes stale even if you lose these lines.
+
+Set `APEX_RECOVER_NUDGE=0` to skip the nudge (it then tells you to send one),
+`APEX_RECOVER_NUDGE_WAIT` to change how long it waits for an agent to come up
+before giving up, and `APEX_RECOVER_NUDGE_CONFIRM` to change how long it then
+waits for that member to start a turn.
 
 Read the dry run before you act on it, and tell the human what it found. Two
 lines matter:
@@ -581,8 +612,8 @@ tell the human what it found.
 ## If pings stop
 
 A worker's hooks are what generates a ping in the first place, so a worker that
-crashes outright never records one — there is nothing to pull, and you won't
-hear about it until you go looking. If your workers have gone quiet longer than
+crashes outright *after* its first turn never records one — there is nothing to
+pull, and you won't hear about it until you go looking. If your workers have gone quiet longer than
 the work should have taken, check `tmux-apex.sh status` — dead sessions show
 as `dead`. `watch` cannot help here either — a crashed worker records no
 transition, so there is nothing for the poller to notice. If the whole tmux
@@ -590,6 +621,17 @@ server went down rather than one agent, see "After a tmux crash" below —
 `recover` puts the workers back on their own conversations. For long unattended
 runs you can `/loop 20m` over a status check yourself as a fallback heartbeat;
 that is now only for crashes and never-reported state, not for latency.
+
+A member that never reaches its **first** turn is reported too, and this is the
+one case where a report means "go look at the pane" rather than "read the work".
+`status=starting … it has never taken a turn` means the record was written but
+the agent never ran: a failed launch, hooks that are not wired
+(`tmux-apex.sh doctor`), or a recovered agent that was never nudged. It is
+reported once, after `APEX_STARTING_STALE` seconds (15 minutes by default), and
+not again unless the member changes — so act on it when you see it rather than
+waiting for a second ping.
+Set that knob in whole seconds — anything else (`15m`, a negative) is refused
+on stderr and the default is used instead.
 
 If pings arrive only when the human writes to you, the poller is not running:
 check `tmux-apex.sh watch --status` and start it with `tmux-apex.sh watch`.

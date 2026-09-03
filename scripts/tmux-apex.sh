@@ -2482,11 +2482,89 @@ _cmd_status() {
 # wake the member back into `working` before the manager next pulls, which
 # would otherwise defer "READY FOR HUMAN REVIEW" by a whole agent turn —
 # likeliest in exactly the cases that need it soonest.
-_APEX_REPORTABLE_JQ='def reportable:
+#
+# The second half of the predicate is the member that never reached its first
+# turn (issue #42). `starting` is written once, at registration, and is only
+# ever moved off by the member's own hooks — so an agent whose launch failed,
+# whose hooks are not wired, or that came back from `recover` and is sitting at
+# an empty prompt stays `starting` with seq 0 for as long as the pane lives,
+# and every reporting path used to agree it had nothing to say. That was a
+# silent 24h stall on two workers. Past APEX_STARTING_STALE seconds, never
+# having taken a turn is not a state, it is a failure, so report it.
+#
+# Gated on seq 0 as well as on status, not status alone: a member that has run
+# turns and is somehow back at `starting` has a live agent and a different
+# problem. And gated on `spawned_at` being present — records written before
+# that field existed read as "spawned just now" and are never called stale,
+# which is the safe direction for a check whose false positive tells the
+# manager to go poke a healthy worker.
+#
+# Note that this reports *once*, like every other reportable state: the
+# `--mark-delivered` CAS advances pinged_seq to 0, which equals the stalled
+# member's seq, so the member falls out of the predicate again. One nudge is
+# the whole point — it breaks the silence and hands the manager a member key.
+# It deliberately does not keep repeating, because a manager that has been
+# told and has chosen to wait should not be re-interrupted every minute.
+_APEX_REPORTABLE_JQ='def stale_after:
+	(env.APEX_STARTING_STALE | tonumber?)
+	// (env._APEX_STARTING_STALE_DEFAULT | tonumber?)
+	// 900;
+def stalled_start:
+	.status == "starting"
+	and (.seq // 0) == 0
+	and (.spawned_at != null)
+	and (now - .spawned_at) >= stale_after;
+def reportable:
 	((.seq // 0) != (.pinged_seq // -1))
 	and (((.pair_message // "") != "")
-	     or .status == "idle" or .status == "attention");
+	     or .status == "idle" or .status == "attention"
+	     or stalled_start);
 '
+
+# How long a member may sit at `starting`, never having taken a turn, before
+# `reportable` calls it a failure. Generous by default: a cold agent launch on a
+# loaded machine is seconds, not minutes, but a spawn that is merely slow must
+# never be reported as broken.
+#
+# Exported because the predicate reads it out of the environment rather than
+# taking it as a `--argjson` binding, and a value set in the invoking shell
+# without `export` would otherwise be invisible to jq while looking configured.
+#
+# Reading it there, and reading the clock via jq's own `now`, is what keeps the
+# predicate a *self-contained* string. The alternative — two bindings every
+# reader has to remember to pass — puts back exactly the drift the shared
+# definition exists to prevent (issue #23), and fails in the worst available
+# direction: a reader that forgets them makes jq exit non-zero, which reads as
+# "nothing to report" on every path at once. `tonumber?` on both branches is
+# the same argument for a garbage value: clamp in the predicate, where no caller
+# can skip it, rather than at a door there is no single one of. That is also why
+# the last fallback is a literal and not the env lookup: an env var can be
+# absent, and `stale_after` returning null would make `>= stale_after` true for
+# every member — reporting healthy workers, the one direction this check must
+# not fail in. The literal is a backstop, not a second configuration point, and
+# `tests/apex-watch.test.sh` pins it equal to the binding below.
+#
+# One binding for the number otherwise, referenced everywhere it is needed — the
+# default itself, the predicate's fallback, and the warning that quotes it.
+# Written out three times it would drift, and the failure is quiet in the worst
+# way: a clamp that reverts to one value while the warning names another.
+_APEX_STARTING_STALE_DEFAULT=900
+
+# Two clamps, because the diagnostic and the safety net are independent and only
+# one of them can be inside the predicate. `<->` is the stricter test of the two
+# and it runs here: `tonumber?` screens non-numeric, not nonsense, so it takes
+# `15m` for 900 without a word — the operator asked for fifteen minutes and got
+# fifteen minutes of a different unit — and accepts `-5`, which makes
+# `(now - .spawned_at) >= -5` true for a member spawned a second ago and reports
+# every starting member at once. Say so and use the default instead; the
+# predicate's own clamp stays as the backstop for values that never came through
+# here.
+if [[ -n ${APEX_STARTING_STALE:-} && $APEX_STARTING_STALE != <-> ]]; then
+	print -u2 "${SELF:-tmux-apex}: APEX_STARTING_STALE='${APEX_STARTING_STALE}' is not a whole number of seconds; using ${_APEX_STARTING_STALE_DEFAULT}"
+	APEX_STARTING_STALE=$_APEX_STARTING_STALE_DEFAULT
+fi
+APEX_STARTING_STALE=${APEX_STARTING_STALE:-$_APEX_STARTING_STALE_DEFAULT}
+export APEX_STARTING_STALE _APEX_STARTING_STALE_DEFAULT
 
 _cmd_pending() {
 	local mark=false a
@@ -2496,7 +2574,7 @@ _cmd_pending() {
 	manager=$(_require_manager)
 	APEX_SESSION="$manager"
 
-	local s st seq rawseq role task facts summary pair_msg
+	local s st seq rawseq role task facts summary pair_msg spawned age
 	for s in ${(f)"$(apex_members "$manager")"}; do
 		[[ -z $s ]] && continue
 
@@ -2530,6 +2608,17 @@ _cmd_pending() {
 
 		if [[ -n $pair_msg ]]; then
 			print "[apex] session=${s} role=${role} ${task:+task=${task} }— ${pair_msg} (${summary})"
+		elif [[ $st == starting ]]; then
+			# A stalled start needs a different line from every other report,
+			# because the manager's usual reflex — read the member's facts, decide
+			# what to tell it next — is wrong here. Nothing has happened yet, the
+			# facts line describes a worktree nobody has touched, and the actual
+			# question is whether the agent is even running. Say that, and say the
+			# two things that fix it.
+			spawned=$(apex_member_get "$manager" "$s" spawned_at)
+			age=""
+			[[ $spawned == <-> ]] && age=" for $(( $(date +%s) - spawned ))s"
+			print "[apex] session=${s} role=${role} ${task:+task=${task} }status=starting${age} — it has never taken a turn. Its agent may have failed to launch, its hooks may not be wired (${SELF} doctor), or it was recovered and is waiting at an empty prompt. Look at the pane, then either '${SELF} send ${s} <continue where you left off>' or recover/respawn it. Not reported again unless it changes."
 		else
 			print "[apex] session=${s} role=${role} ${task:+task=${task} }status=${st} — ${summary}. Full state: ${SELF} status --json"
 		fi
@@ -2863,6 +2952,152 @@ _apex_session_label() {
 	delta_session_label "$1" "$2" "${3:-}"
 }
 
+# How long `recover` waits, after a nudge is delivered, for the member to
+# actually start a turn. Any turn moves it — `event set` fires on the first tool
+# call and `event clear` on Stop, and both bump seq and write status — so this
+# covers "the agent accepted the keystrokes", not the whole turn.
+APEX_RECOVER_NUDGE_CONFIRM=${APEX_RECOVER_NUDGE_CONFIRM:-45}
+
+# _apex_nudge_confirmed <manager> <member> <seconds> — did the member actually
+# start a turn?
+#
+# `_pane_is_agent` is the strongest precondition available before typing, and it
+# is not strong enough to justify the claim `recover` prints: it compares
+# `#{pane_current_command}`, which proves the agent process execed, not that its
+# TUI is accepting input. On the `--resume` path specifically that gap is wide —
+# claude execs and then spends time restoring the conversation, and the longer
+# the transcript the wider it gets, which is exactly the case `recover` exists
+# for. Keystrokes typed into that window are dropped, and `_send_to_pane` cannot
+# tell: an empty `_pane_input_line` reads the same whether the box is ready and
+# empty or has not been drawn yet, and its post-send "our text is no longer
+# pending" check is trivially satisfied by text that was never accepted.
+#
+# So do not infer the outcome from the delivery. Read the member's own state,
+# which its hooks write and nothing here can fake, and report what it says.
+# Costs a few file reads and the wait, and turns a confident wrong line into a
+# hedged right one.
+_apex_nudge_confirmed() {
+	local manager="$1" member="$2" secs="$3"
+	[[ $secs == <-> ]] || secs=45
+	local -i i st_seq
+	local st
+	for (( i = 0; i <= secs; i++ )); do
+		st=$(apex_member_get "$manager" "$member" status 2>/dev/null)
+		st_seq=$(apex_member_get "$manager" "$member" seq 2>/dev/null) || st_seq=0
+		# An unreadable record is not confirmation: an empty status must not
+		# pass for "no longer starting". Fail towards the hedged line — the
+		# stale-start report picks the member up either way.
+		[[ ( -n $st && $st != starting ) || $st_seq -gt 0 ]] && return 0
+		(( i < secs )) && sleep 1
+	done
+	return 1
+}
+
+# How long `recover` waits for a resumed agent's pane to actually be running an
+# agent before it gives up on nudging it. A cold launch is seconds; this is the
+# ceiling for "something went wrong", and it is what a `recover --yes` of a
+# broken member costs in wall-clock, so it is not generous.
+APEX_RECOVER_NUDGE_WAIT=${APEX_RECOVER_NUDGE_WAIT:-60}
+
+# _apex_wait_for_agent <pane> <seconds> — block until <pane> is running a
+# coding agent, or give up.
+#
+# Needed because a freshly split pane is a *shell* for the first second or two:
+# tmux returns the pane id the moment the split exists, long before
+# `direnv exec … zsh -ic 'claude …'` has execed anything. Sending into it then
+# would run the message as a shell command, which _pane_is_agent exists to
+# prevent — so the choice is to wait for the agent or not to nudge at all.
+_apex_wait_for_agent() {
+	local pane="$1" secs="$2"
+	local -i ticks
+	[[ $secs == <-> ]] || secs=60
+	ticks=$(( secs * 2 ))
+	(( ticks < 1 )) && ticks=1
+	local -i i
+	for (( i = 1; i <= ticks; i++ )); do
+		_pane_is_agent "$pane" && return 0
+		(( i < ticks )) && sleep 0.5
+	done
+	return 1
+}
+
+# _apex_continue_resumed <manager> <member> <pane> — tell a just-resumed agent
+# to carry on (issue #42).
+#
+# The resume path gives DELTA_AGENT_RESUME precedence over DELTA_AGENT_PROMPT on
+# purpose, so a recovered worker cannot re-run its task and duplicate commits.
+# The cost of that correctness is that the agent comes back and sits at an empty
+# prompt forever: `status` says `starting`, seq never moves, and (before the
+# reportable change above) nothing anywhere would ever say so. Two workers sat
+# like that for ~24h.
+#
+# So `recover` delivers the nudge a human otherwise has to type. This is not the
+# task prompt — see delta_resume_continuation — so the no-duplicate-work
+# property the resume path buys is untouched.
+#
+# Synchronous, and reported line by line, on purpose. A backgrounded nudge would
+# make `recover --yes` return before anyone knows whether the member is actually
+# working, which is the same "looks like recovery worked" failure the transcript
+# resolution above was written to avoid. Waiting a few seconds per member is the
+# cheaper half of that trade, and it means the printed output — the only thing
+# the manager reads — states plainly which members were nudged and which are
+# still sitting at a prompt.
+_apex_continue_resumed() {
+	local manager="$1" member="$2" pane="$3" text rc=0
+	source "${SCRIPTS}/lib/agent-prompts.sh"
+	text=$(delta_resume_continuation)
+
+	local -a ev=(--arg s "$member")
+	if [[ ${APEX_RECOVER_NUDGE:-1} != 1 ]]; then
+		print "  NOT nudged (APEX_RECOVER_NUDGE=${APEX_RECOVER_NUDGE}): it is waiting at an empty prompt and will not start on its own."
+		print "  Send it a continuation yourself: ${SELF} send ${member} <continue where you left off>"
+		apex_event "$manager" "$(jq -nc "${ev[@]}" \
+			'{event:"recover-continue", session:$s, delivered:false, reason:"disabled"}')"
+		return 0
+	fi
+
+	if ! _apex_wait_for_agent "$pane" "$APEX_RECOVER_NUDGE_WAIT"; then
+		print "  NOT nudged: pane ${pane} was still not running an agent after ${APEX_RECOVER_NUDGE_WAIT}s, so it is waiting at an empty prompt and will not start on its own."
+		print "  Its launch may have failed. Look at the pane; if the agent is up, ${SELF} send ${member} <continue where you left off>"
+		apex_event "$manager" "$(jq -nc "${ev[@]}" \
+			'{event:"recover-continue", session:$s, delivered:false,
+			  reason:"pane never came up as an agent"}')"
+		return 0
+	fi
+
+	_deliver "$member" recover "$text" || rc=$?
+	if (( rc != 0 )); then
+		print "  NOT nudged: delivery failed (rc=${rc}); it is waiting at an empty prompt."
+		print "  Retry with: ${SELF} send ${member} <continue where you left off>"
+		apex_event "$manager" "$(jq -nc "${ev[@]}" --argjson rc "$rc" \
+			'{event:"recover-continue", session:$s, delivered:false, deliver_rc:$rc}')"
+		return 0
+	fi
+
+	local confirmed=true
+	_apex_nudge_confirmed "$manager" "$member" "$APEX_RECOVER_NUDGE_CONFIRM" || confirmed=false
+
+	if $confirmed; then
+		print "  Nudged it to continue (${_DELIVER_VIA}) — it has started a turn."
+	else
+		# Delivered but never acted on. The likeliest cause is the one
+		# _pane_is_agent cannot rule out: the agent had execed but was still
+		# restoring its conversation, and the keystrokes went nowhere.
+		print "  Nudged it (${_DELIVER_VIA}), but it has NOT started a turn after ${APEX_RECOVER_NUDGE_CONFIRM}s."
+		[[ -n ${APEX_SEND_UNCONFIRMED:-} ]] \
+			&& print "  Its input box never drained either, so the keystrokes may never have been accepted."
+		print "  It was probably still restoring its conversation when the nudge was typed. Look at the pane; if it is idle at an empty prompt, ${SELF} send ${member} <continue where you left off>"
+		print "  If it really never starts, it stays status=starting and \`pending\` reports it after ${APEX_STARTING_STALE}s."
+	fi
+
+	apex_event "$manager" "$(jq -nc "${ev[@]}" --arg text "$text" \
+		--arg via "${_DELIVER_VIA:-}" --arg unconf "${APEX_SEND_UNCONFIRMED:-}" \
+		--argjson conf "$confirmed" \
+		'{event:"recover-continue", session:$s, delivered:true, confirmed:$conf,
+		  via:$via, text:$text}
+		 + (if $unconf != "" then {unconfirmed:true} else {} end)')"
+}
+
 # recover [--yes] [member ...] — put crashed members back, with their
 # conversations intact.
 #
@@ -3034,6 +3269,10 @@ _cmd_recover() {
 
 		if [[ -n $sid ]]; then
 			print "Recovered $new_key (resumed conversation $sid)"
+			# A resumed agent restores context and waits; a fresh one was launched
+			# with the task prompt and is already working. Only the first needs
+			# telling to carry on, and only the first must never be re-prompted.
+			_apex_continue_resumed "$manager" "$new_key" "$pane"
 		else
 			print "Recovered $new_key (fresh conversation — nothing resumable found)"
 		fi
@@ -3812,6 +4051,7 @@ case "${1:-}" in
 		print "                                  uncommitted or unpushed work)"
 		print "  recover [--yes] [member ...]   re-create dead members' panes, resuming"
 		print "                                 their conversations (after a tmux crash)"
+		print "                                 and nudging each resumed agent to continue"
 		print "  profiles                       list available spawn profiles"
 		print "  doctor                         check that ping-delivery hooks are wired"
 		[[ -n ${1:-} ]] && exit 1

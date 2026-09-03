@@ -61,3 +61,21 @@ delta_task_marker() {
 		print -r -- "/my-pr-review ${pr}"
 	fi
 }
+
+# delta_resume_continuation — what to say to an agent that has just been
+# relaunched with --resume (issue #42).
+#
+# A resumed agent restores its context and then waits at an empty prompt. It
+# does not resume *working*, it resumes *waiting*: nothing re-states the task
+# and it has no reason to believe it should carry on. So `recover` says so.
+#
+# Deliberately NOT the task prompt. Handing a resumed agent
+# delta_task_prompt again is the thing the resume path exists to avoid — it
+# would re-run "assign the issue, comment that you have started, work it
+# end-to-end" on a conversation that already did all three, which is how you
+# get duplicate comments and duplicate commits. A continuation instruction
+# carries no task: it points the agent at its own history and at git, and
+# tells it that finishing is a valid answer.
+delta_resume_continuation() {
+	print -r -- "You were just recovered after a tmux server crash and relaunched on your original conversation, so your full history above is intact and your task has not changed. Nothing was lost on disk either: your worktree, branch and any uncommitted changes survived. Pick up where you left off — re-read your own last few messages, then check what is actually done (\`git status\`, \`git log --oneline @{u}..\` or \`git log --oneline -5\`, and \`gh pr view\` if you had opened one) before you write anything, and do not redo work that is already committed or pushed. If you had already finished, say so in one line and stop rather than starting again."
+}

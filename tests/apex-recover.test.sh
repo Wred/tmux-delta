@@ -58,6 +58,14 @@ lacks() {
 BIN="$TMPROOT/bin"; mkdir -p "$BIN"
 export PATH="$BIN:$PATH"
 export TMUX=fake-socket
+# `recover` waits for a resumed pane's agent to come up before nudging it. The
+# stub pane never execs anything, so every recover of a resumable member would
+# otherwise pay the full real-world ceiling before giving up.
+export APEX_RECOVER_NUDGE_WAIT=1
+# Likewise for the confirmation wait: no stub pane ever starts a turn, so every
+# nudge here is delivered-but-unconfirmed and would pay the full ceiling.
+export APEX_RECOVER_NUDGE_CONFIRM=1
+export STUB_PANE_CMD=""
 export XDG_CACHE_HOME="$TMPROOT/cache"
 APEX_ROOT="$XDG_CACHE_HOME/tmux-delta/apex"
 
@@ -80,6 +88,10 @@ display-message)
 		# pane target: resolve the pane's session (or echo the pane id back)
 		case "$fmt" in
 			'#S') awk -F'\t' -v p="$target" '$1==p{print $2}' "$STUB/panes" 2>/dev/null ;;
+			# What `_pane_is_agent` asks. Empty by default, so a freshly split
+			# pane reads as the shell it actually is for the first second or
+			# two — which is the case `recover` has to refuse to type into.
+			'#{pane_current_command}') print -r -- "${STUB_PANE_CMD:-}" ;;
 			*)    print -r -- "$target" ;;
 		esac
 	elif [[ -n $target ]]; then
@@ -469,6 +481,17 @@ eq "the recovered record keeps issue" 42     "$(print -r -- "$rec" | jq -r '.iss
 eq "the recovered record carries no PR"  ""  "$(print -r -- "$rec" | jq -r '.review_pr')"
 eq "the recovered pane is tagged with one task" "issue:42" "$(pane_opt "$new_pane" @apex_task)"
 
+# The pane exists but is still a shell, so the continuation cannot be
+# delivered. The one thing recover must not do here is stay quiet about it:
+# "the pane is back" and "the worker is working" are different claims, and
+# reporting the first as the second is how two members sat at an empty prompt
+# for ~24h (issue #42).
+contains "recover says when it could not nudge a resumed member" "NOT nudged" "$out"
+contains "…and says the member will not start on its own" "waiting at an empty prompt" "$out"
+contains "…and hands over the send to run by hand" "send repo-fix-issue-42:" "$out"
+cev=$(grep -F '"event":"recover-continue"' "$APEX_ROOT/$MANAGER/events.jsonl" | tail -1)
+eq "…and records the undelivered nudge" false "$(print -r -- "$cev" | jq -r '.delivered')"
+
 ev=$(grep -F '"event":"recover"' "$APEX_ROOT/$MANAGER/events.jsonl" | tail -1)
 eq "the recover event records that it resumed" true "$(print -r -- "$ev" | jq -r '.resumed')"
 eq "the recover event names the pane it replaced" "repo-fix-issue-42:%7" \
@@ -501,6 +524,127 @@ eq "the event does not claim a resume" false "$(print -r -- "$ev" | jq -r '.resu
 
 # Selecting one member must leave the others alone.
 lacks "a named member is recovered alone" "repo-gone-issue-9" "$out"
+
+# ─── 4b. a resumed member is told to continue (issue #42) ────────────
+
+print "\na resumed member is nudged to continue"
+
+# DELTA_AGENT_RESUME takes precedence over DELTA_AGENT_PROMPT (section 2), so a
+# recovered agent restores its context and then waits at an empty prompt: it
+# resumes *waiting*, not *working*. `starting` was not reportable, no hook ever
+# fired, and nothing in the system could say so — two workers sat like that for
+# ~24h. `recover` now delivers the continuation a human otherwise has to type.
+#
+# Reusing $WT keeps the worker transcript resolvable: `recover` reads the id off
+# disk and refuses to trust the record alone, so a member with no transcript
+# takes the fresh path instead and is never nudged.
+member "resumed:%21" "$(jq -nc --arg wt "$WT" \
+	'{role:"worker", worktree:$wt, issue:"42", review_pr:"", agent:"claude",
+	  mode:"autonomous", status:"idle", seq:6}')"
+
+stub_reset_log
+out=$(STUB_PANE_CMD=node apex recover --yes resumed:%21 2>&1)
+# The stub pane runs no agent, so nothing ever writes a turn to the new
+# member's record: the nudge is delivered and *not* confirmed. That is the
+# honest reading here, and the line has to say so — see section 4c.
+contains "the resumed member is nudged" "Nudged it" "$out"
+contains "…and the unconfirmed nudge is not claimed as a start" \
+	"has NOT started a turn" "$out"
+lacks "…so it never says the member started" "started a turn." \
+	"${out%%has NOT started*}"
+contains "…and it hands over the send to re-deliver it" "send resumed:" "$out"
+contains "…and points at the stale-start report as the backstop" \
+	"status=starting" "$out"
+lacks "…and does not also claim nothing was delivered" "NOT nudged" "$out"
+
+keys=$(grep -F 'send-keys' "$STUB/log")
+contains "the continuation is typed into the new pane" "[apex from:recover]" "$keys"
+contains "…and tells it to pick up where it left off" "Pick up where you left off" "$keys"
+contains "…and is submitted" "Enter" "$keys"
+
+# The whole point of the resume path is that a recovered agent cannot re-run its
+# task and duplicate the commits, the comment and the PR. A continuation is not
+# a task prompt, and this is the assertion that keeps it that way.
+lacks "the nudge is not the task prompt" \
+	"$(delta_task_prompt 42 '' autonomous)" "$keys"
+lacks "…so it cannot re-assign the issue to itself" "--add-assignee" "$keys"
+
+cev=$(grep -F '"event":"recover-continue"' "$APEX_ROOT/$MANAGER/events.jsonl" | tail -1)
+eq "the delivery is recorded" true "$(print -r -- "$cev" | jq -r '.delivered')"
+eq "…separately from whether it was acted on" false \
+	"$(print -r -- "$cev" | jq -r '.confirmed')"
+contains "…against the new member key" "resumed:%" \
+	"$(print -r -- "$cev" | jq -r '.session')"
+
+# A member recovered onto a *fresh* conversation was launched with the task
+# prompt and is already working; nudging it would be a second instruction on
+# top of the first, and the two would race.
+FRESHWT="$TMPROOT/wt/no-transcript-issue-78"; mkdir -p "$FRESHWT"
+member "no-transcript-issue-78:%23" "$(jq -nc --arg wt "$FRESHWT" \
+	'{role:"worker", worktree:$wt, issue:"78", review_pr:"", agent:"claude",
+	  mode:"autonomous"}')"
+out=$(STUB_PANE_CMD=node apex recover --yes no-transcript-issue-78:%23 2>&1)
+contains "a fresh recover says so"     "fresh conversation" "$out"
+lacks "…and is not nudged"             "Nudged it to continue" "$out"
+lacks "…nor reported as needing one"   "NOT nudged" "$out"
+
+# The knob exists for an operator who wants the old behaviour. Turning the
+# nudge off must not turn the reporting off with it — a silently unnudged
+# member is the bug, not the nudge.
+member "optout:%22" "$(jq -nc --arg wt "$WT" \
+	'{role:"worker", worktree:$wt, issue:"42", review_pr:"", agent:"claude",
+	  mode:"autonomous", status:"idle", seq:6}')"
+out=$(STUB_PANE_CMD=node APEX_RECOVER_NUDGE=0 apex recover --yes optout:%22 2>&1)
+contains "the nudge can be turned off"      "NOT nudged (APEX_RECOVER_NUDGE=0)" "$out"
+contains "…and it still says who needs one" "send optout:" "$out"
+
+# ─── 4c. the nudge is confirmed, not assumed (issue #42, review) ─────
+
+print "\na delivered nudge is confirmed against member state"
+
+# `_pane_is_agent` is the strongest precondition available before typing, and it
+# proves the agent *execed* — not that its TUI accepts input. On the --resume
+# path claude then spends time restoring the conversation, and the longer the
+# transcript the wider that window; keystrokes typed into it are dropped and
+# `_send_to_pane` cannot tell, because an undrawn input box reads exactly like a
+# ready empty one. Asserting "Nudged it to continue" off a successful delivery
+# would relocate the false claim this whole change exists to delete one step
+# later, so the outcome is read back off the member's own state instead.
+confirmed() {  # confirmed <key> — "yes" if the member is judged to have started
+	zsh -c 'source "'"$SCRIPTS"'/tmux-apex.sh" >/dev/null 2>&1
+		if _apex_nudge_confirmed "'"$MANAGER"'" "'"$1"'" 0; then
+			print yes
+		else
+			print no
+		fi'
+}
+
+member "confirm-working:%40" '{"status":"working","seq":1}'
+eq "a member that took a turn counts as started" yes \
+	"$(confirmed confirm-working:%40)"
+
+member "confirm-idle:%41" '{"status":"idle","seq":2}'
+eq "…and so does one that already finished one" yes \
+	"$(confirmed confirm-idle:%41)"
+
+member "confirm-attention:%42" '{"status":"attention","seq":3}'
+eq "…and one that stopped to ask something" yes \
+	"$(confirmed confirm-attention:%42)"
+
+member "confirm-stuck:%43" '{"status":"starting","seq":0}'
+eq "a member still at seq 0 has not started" no \
+	"$(confirmed confirm-stuck:%43)"
+
+# seq is what the hooks bump, and a bump can land before the status write is
+# read back; either half is enough, so neither can strand a working member.
+member "confirm-raced:%44" '{"status":"starting","seq":1}'
+eq "…but a bumped seq alone is enough" yes \
+	"$(confirmed confirm-raced:%44)"
+
+# Fail towards "not confirmed": an unreadable record must not license the
+# claim. The stale-start report picks the member up either way.
+eq "an absent record is never confirmation" no \
+	"$(confirmed confirm-missing:%45)"
 
 # ─── 5. recycled pane ids ────────────────────────────────────────────
 
