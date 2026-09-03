@@ -846,7 +846,9 @@ real numbers; the per-hook path does not, so a ping line is likelier to say
 `unknown` than the table is. When `status` does ask, the remote's answer wins
 outright over a local `origin/<branch>` ref, which is only ever as fresh as the
 last fetch — preferring the cheap local number because it answered first is the
-same quiet-wrong-number failure by a different route.
+same quiet-wrong-number failure by a different route. In particular, a stale
+`origin/<branch>` for the branch being measured is never allowed to cancel out
+that branch's own commits once the remote has said it has no such branch.
 
 `--force` genuinely takes a dirty worktree: `gwtrm`'s `-f` used to skip only the
 first confirmation and prompt again for uncommitted changes, which with no tty

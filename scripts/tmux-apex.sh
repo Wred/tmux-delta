@@ -578,6 +578,11 @@ _cur_member() {
 # rather than blocking `status` on a prompt nobody will ever see.
 _commits_ahead() {
 	local wt="$1" branch="$2" ask=false a n="" out="" rc=0 remote_sha=""
+	# Declared here, not at the point of use: `local` in an inner block risks
+	# re-declaring a name that already exists in scope, which zsh answers by
+	# printing the old value to stdout — the leak behind issue #53, and this
+	# function's stdout *is* its return value.
+	local -a allrefs=() others=()
 	for a in "${@[3,-1]}"; do
 		[[ $a == --ask-remote ]] && ask=true
 	done
@@ -622,7 +627,32 @@ _commits_ahead() {
 				# by the branch's own divergence and errs toward "look at this",
 				# which is the safe direction; the whole-history figure was
 				# neither bounded nor informative.
-				n=$(git -C "$wt" rev-list --count HEAD --not --remotes 2>/dev/null) || n=""
+				#
+				# One ref must be held out of the subtraction, though: a stale
+				# `refs/remotes/origin/<branch>` for the branch being measured.
+				# We have just established via the remote that this branch is
+				# absent there, so that ref is known-wrong — and a plain
+				# `--remotes` would use it to cancel out the branch's own
+				# commits and report 0, the one value this whole function exists
+				# to stop emitting. Reachable whenever a worktree holds an
+				# `origin/<branch>` ref the remote no longer does: a default
+				# refspec, or an explicit fetch before the remote branch was
+				# deleted.
+				#
+				# The list is explicit rather than `--exclude=… --remotes`,
+				# which silently has no effect after `--not` (checked on git
+				# 2.55). Ref names cannot contain `*`, `?` or `[`, so the branch
+				# name is safe as a zsh removal pattern.
+				allrefs=("${(@f)$(git -C "$wt" for-each-ref --format='%(refname)' refs/remotes 2>/dev/null)}")
+				others=(${${allrefs:#refs/remotes/origin/${branch}}:#})
+				if (( ${#others} )); then
+					n=$(git -C "$wt" rev-list --count HEAD --not "${others[@]}" 2>/dev/null) || n=""
+				else
+					# Nothing left to subtract means the only count available is
+					# the whole reachable history — the unbounded figure. That
+					# is not an answer, so say so.
+					n=""
+				fi
 			elif git -C "$wt" cat-file -e "${remote_sha}^{commit}" 2>/dev/null; then
 				n=$(git -C "$wt" rev-list --count HEAD --not "$remote_sha" 2>/dev/null) || n=""
 			else

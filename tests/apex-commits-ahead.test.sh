@@ -148,6 +148,31 @@ eq "…and the residual is exactly the refs the narrow refspec withheld" "2" \
 	"$(_commits_ahead "$WT" virgin --ask-remote)"
 git -C "$WT" update-ref -d refs/remotes/origin/side
 
+# A stale remote ref for the branch *being measured* must be held out of the
+# subtraction. The remote has just told us refs/heads/virgin does not exist, so
+# a local origin/virgin is known-wrong — and subtracting it would cancel out the
+# branch's own commits and report 0: "fully pushed", about a branch the remote
+# does not have. Exactly the value this whole function exists to stop emitting,
+# reached from the opposite side.
+git -C "$WT" update-ref refs/remotes/origin/virgin "$(git -C "$WT" rev-parse 'virgin')"
+eq "…and a stale ref for the measured branch does not cancel its own commits" "3" \
+	"$(_commits_ahead "$WT" virgin --ask-remote)"
+if [[ $(_commits_ahead "$WT" virgin --ask-remote) == 0 ]]; then
+	bad "…and above all never reports 0 for a branch the remote lacks" \
+		"reported 0 for a branch with real unpushed commits"
+else
+	ok "…and above all never reports 0 for a branch the remote lacks"
+fi
+
+# With nothing left to subtract, the only count available is the whole reachable
+# history — the unbounded figure. Unknown is the honest answer, not that number.
+saved_main=$(git -C "$WT" rev-parse refs/remotes/origin/main)
+git -C "$WT" update-ref -d refs/remotes/origin/main
+eq "…and with no other remote ref to subtract, the count is unknown" "" \
+	"$(_commits_ahead "$WT" virgin --ask-remote)"
+git -C "$WT" update-ref refs/remotes/origin/main "$saved_main"
+git -C "$WT" update-ref -d refs/remotes/origin/virgin
+
 print "\n_commits_ahead — a STALE tracking ref beats nothing, but not the remote"
 
 # The mirror of the case above: the tracking ref *does* exist, so `@{upstream}`
