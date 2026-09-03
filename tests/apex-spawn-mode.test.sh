@@ -65,7 +65,9 @@ eq "argv with no permission-mode: unknown"  2 "$(cls '--verbose --add-dir /tmp')
 eq "an unrecognised bare token: unknown"    2 "$(cls someFutureMode)"
 
 print -- "_perm_unattended (non-claude agents)"
-eq "codex --full-auto runs unattended"      0 "$(cls '--full-auto' codex)"
+eq "codex --ask-for-approval never"         0 "$(cls '--sandbox workspace-write --ask-for-approval never' codex)"
+eq "codex --ask-for-approval on-request prompts" 1 "$(cls '--ask-for-approval on-request' codex)"
+eq "opencode --auto runs unattended"        0 "$(cls '--auto' opencode)"
 eq "codex bypass flag runs unattended"      0 "$(cls '--dangerously-bypass-approvals-and-sandbox' codex)"
 eq "pi --approve is unknown, not assumed"   2 "$(cls '--approve' pi)"
 eq "opencode with no flags is unknown"      2 "$(cls '' opencode)"

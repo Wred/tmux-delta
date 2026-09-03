@@ -1275,7 +1275,7 @@ _perm_unattended() {
 	case " $perm " in
 		*" --dangerously-skip-permissions "*|\
 		*" --dangerously-bypass-approvals-and-sandbox "*|\
-		*" --full-auto "*|*" --yolo "*) return 0 ;;
+		*" --yolo "*) return 0 ;;
 	esac
 
 	if [[ ${agent:t} == claude ]]; then
@@ -1293,8 +1293,18 @@ _perm_unattended() {
 		esac
 	fi
 
-	# Non-claude adapters take agent-native argv; without an allowlist per agent
-	# there is nothing honest to say beyond "unknown".
+	# Non-claude adapters take agent-native argv. Only the flags whose meaning
+	# this repo actually documents (README's agent-flags table) are classified;
+	# anything else is "unknown" rather than a guess.
+	case "${agent:t}" in
+		codex)
+			[[ " $perm " == *" --ask-for-approval never "* ]] && return 0
+			[[ " $perm " == *" -a never "* ]] && return 0
+			# on-request/untrusted are documented as asking a human.
+			[[ " $perm " == *" --ask-for-approval "* ]] && return 1 ;;
+		opencode)
+			[[ " $perm " == *" --auto "* ]] && return 0 ;;
+	esac
 	return 2
 }
 
