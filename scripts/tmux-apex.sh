@@ -2319,8 +2319,8 @@ _cmd_status() {
 	# (issue #10). Name that ambiguity here so nobody spends an hour chasing a
 	# delivery bug that isn't one, and nobody submits a guess by accident.
 	local unsent=()
+	local u
 	for r in "${rows[@]}"; do
-		local u
 		u=$(printf '%s' "$r" | jq -r '"\(.session)\t\(.pane_input // "")"')
 		[[ ${u#*$'\t'} == "" ]] || unsent+=("$u")
 	done
