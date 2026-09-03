@@ -1247,9 +1247,105 @@ _cmd_relink() {
 
 # ─── spawn ───────────────────────────────────────────────────────────
 
+# ─── autonomous-mode / permission-mode reconciliation (issue #43) ─────
+#
+# `spawn` carries two independent knobs that used to be set from different
+# places and compared nowhere: `--mode` (autonomous|interactive, defaulting to
+# autonomous) and the permission mode / agent flags (`--agent-flags`, or a named
+# `--profile`'s `agent_flags`). `--mode autonomous` hands the agent a managed
+# prompt telling it to work to completion unattended, while `acceptEdits` — the
+# value three shipped profiles use — pauses for approval on every shell command.
+# The pair is a contradiction: the worker stalls on its first `git` call and no
+# one is watching. Reconcile (or refuse) it where it is created, so a new
+# profile or a hand-rolled --agent-flags string cannot reintroduce it.
+#
+# Note the ceiling on what any of this can promise: claude's own safety
+# classifier gates dangerous operations regardless of permission mode, so even
+# `bypassPermissions` can sit on a modal prompt. Making a blocked worker
+# *visible* is issue #63; this guard only removes the guaranteed-to-block
+# combinations.
+
+# _perm_unattended <perm> [agent] — can a run with these agent flags proceed
+# without a human at the keyboard?
+#   0 = yes, 1 = no (it will prompt), 2 = unknown (agent-native argv we can't judge)
+_perm_unattended() {
+	local perm="$1" agent="${2:-claude}"
+
+	# Flags are classified per agent, never universally: a marker one agent
+	# treats as "skip every gate" is an unknown argument to another, and the
+	# agent that rejects it falls back to prompting — the very stall this guard
+	# exists to prevent. Only flags this repo documents (README's agent-flags
+	# table) are classified at all; everything else is "unknown", not a guess.
+	if [[ ${agent:t} == claude ]]; then
+		[[ " $perm " == *" --dangerously-skip-permissions "* ]] && return 0
+		if [[ $perm == -* ]]; then
+			# argv form: only a --permission-mode token is classifiable.
+			[[ $perm != *--permission-mode[\ =]* ]] && return 2
+			perm="${${perm##*--permission-mode[ =]}%% *}"
+		fi
+		case "$perm" in
+			bypassPermissions)              return 0 ;;
+			# Empty means "claude's default", which prompts for every tool use.
+			""|default|acceptEdits|plan)    return 1 ;;
+			*)                              return 2 ;;
+		esac
+	fi
+
+	# Non-claude adapters take agent-native argv. Only the flags whose meaning
+	# this repo actually documents (README's agent-flags table) are classified;
+	# anything else is "unknown" rather than a guess.
+	case "${agent:t}" in
+		codex)
+			[[ " $perm " == *" --dangerously-bypass-approvals-and-sandbox "* ]] && return 0
+			[[ " $perm " == *" --ask-for-approval never "* ]] && return 0
+			[[ " $perm " == *" -a never "* ]] && return 0
+			# on-request/untrusted are documented as asking a human.
+			[[ " $perm " == *" --ask-for-approval "* ]] && return 1 ;;
+		opencode)
+			[[ " $perm " == *" --auto "* ]] && return 0 ;;
+	esac
+	return 2
+}
+
+# _spawn_check_mode <mode> <perm> <agent> <perm_from_profile> — refuse or flag
+# the contradiction. Prints a warning for the unknown case; dies for the
+# known-bad one. Callers pass the *resolved* values, i.e. after --profile has
+# been merged, plus the profile name only when the profile is where `perm`
+# actually came from: an explicit --agent-flags wins that merge field-by-field,
+# so attributing its value to the named profile would send the caller to edit
+# the wrong knob.
+_spawn_check_mode() {
+	local mode="$1" perm="$2" agent="${3:-claude}" profile="$4"
+	local shown="${perm:-<agent default>}"
+	local src="--agent-flags ${perm}"
+	[[ -z $perm ]] && src="no --agent-flags"
+	[[ -n $profile ]] && src="profile '${profile}' (agent_flags=${shown})"
+
+	[[ $mode == autonomous || $mode == interactive ]] || \
+		_die "spawn: --mode must be 'autonomous' or 'interactive', got '${mode}'"
+
+	[[ $mode == autonomous ]] || return 0
+
+	_perm_unattended "$perm" "$agent"
+	case $? in
+		0) return 0 ;;
+		2) print -u2 "tmux-apex: spawn: --mode autonomous with ${src} for agent '${agent:t}' — cannot verify these flags run unattended; the worker may stall on an approval prompt (see issue #63)"
+		   return 0 ;;
+	esac
+
+	_die "spawn: --mode autonomous conflicts with permission mode '${shown}' (from ${src}).
+  An autonomous worker is told to work to completion with no human watching, but
+  '${shown}' pauses for approval on shell commands — it would stall on its first
+  git call. Pick one:
+    --agent-flags bypassPermissions   run it unattended (overrides the profile)
+    --mode interactive                keep the approval prompts and watch it yourself
+  Even bypassPermissions can still block on claude's safety classifier; see issue #63."
+}
+
+
 _cmd_spawn() {
 	local issue="" review_pr="" role="worker" model="" perm="" mode="autonomous"
-	local switch="no-switch" agent="" profile=""
+	local switch="no-switch" agent="" profile="" perm_profile=""
 
 	while (( $# )); do
 		case "$1" in
@@ -1288,7 +1384,10 @@ _cmd_spawn() {
 		esac
 		[[ -z $agent ]] && agent=$(jq -r '.agent // empty' <<< "$pjson")
 		[[ -z $model ]] && model=$(jq -r '.model // empty' <<< "$pjson")
-		[[ -z $perm  ]] && perm=$(jq -r '.agent_flags // empty' <<< "$pjson")
+		# perm_profile records whether the profile is what supplied `perm`, so
+		# the mode/permission-mode refusal below can name the knob the caller
+		# would actually have to change.
+		[[ -z $perm  ]] && { perm=$(jq -r '.agent_flags // empty' <<< "$pjson"); perm_profile="$profile" }
 	fi
 
 	# Only the claude adapter accepts a bare token here (it prepends
@@ -1298,6 +1397,8 @@ _cmd_spawn() {
 	if [[ -n $perm && $perm != -* && -n $agent && ${agent:t} != claude ]]; then
 		_die "spawn: --agent-flags for '${agent}' must be agent-native argv (e.g. --approve, --full-auto), not the claude token '${perm}'"
 	fi
+
+	_spawn_check_mode "$mode" "$perm" "${agent:-claude}" "$perm_profile"
 
 	local manager
 	manager=$(_require_manager)
@@ -1346,6 +1447,7 @@ _cmd_spawn() {
 	print "  task     : ${issue:+issue #$issue}${review_pr:+PR #$review_pr}"
 	print "  profile  : ${profile:-<none>}"
 	print "  model    : ${model:-<default>}   permission-mode: ${perm:-<default>}"
+	print "  mode     : ${mode}"
 }
 
 # ─── register-member (called from wherever an agent pane is actually
@@ -4996,6 +5098,8 @@ case "${1:-}" in
 		print "            --role worker|monitor --agent claude|pi|codex|opencode"
 		print "            --model M"
 		print "            --agent-flags ARGV --mode autonomous|interactive --switch"
+		print "                                 (--mode autonomous is refused with a permission mode"
+		print "                                  that pauses for approval, e.g. acceptEdits)"
 		print "  send <session> <text>          message a session's coding agent"
 		print "  link --worker M --reviewer M   run an automatic fix/re-review loop between two"
 		print "                                 members on one PR; the manager is only pinged"

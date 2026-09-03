@@ -319,7 +319,7 @@ back to the claude adapter. Adding one is a single file defining
 | model | `--model` | `--model` (accepts `provider/id`, `:thinking`) | `--model` | `--model` (wants `provider/model`) |
 | prompt | positional | positional | positional | `--prompt` |
 | system prompt | `--append-system-prompt` | `--append-system-prompt` | *none* — prepended to the prompt | *none* — injected as `instructions` via `OPENCODE_CONFIG_CONTENT` |
-| agent flags | `--permission-mode <token>`, or verbatim if it starts with `-` | verbatim (`--approve`, `--tools …`) | verbatim (`--full-auto`, `--sandbox …`) | verbatim (`--auto`) |
+| agent flags | `--permission-mode <token>`, or verbatim if it starts with `-` | verbatim (`--approve`, `--tools …`) | verbatim (`--sandbox …`, `--ask-for-approval …`) | verbatim (`--auto`) |
 | resume | `--continue` | `--continue` | `resume --last` | `--continue` |
 
 Resume is attempted first and falls back to a fresh session when there is
@@ -799,6 +799,56 @@ freely and the shipped names/models are starting points, not fixed policy —
 in particular, model aliases and pricing drift over time and across
 providers, so re-verify them periodically rather than trusting this table
 indefinitely.
+
+### Autonomous mode and the permission mode must agree
+
+`spawn` carries two knobs that only make sense together: `--mode`
+(`autonomous`, the default, or `interactive`) and the permission mode /
+agent flags. `--mode autonomous` appends a system prompt telling the agent to
+work to completion without a human — commit, push, open a draft PR — while
+`acceptEdits` (and claude's bare default) pauses for approval on every shell
+command. That pair cannot work: the worker stalls on its first `git` call with
+nobody watching.
+
+Since it is created in `spawn`, it is refused in `spawn`. An autonomous spawn
+whose permission mode is known to prompt fails immediately, naming both values
+and where the permission mode came from:
+
+```
+$ tmux-apex.sh spawn --issue 42 --profile hard
+tmux-apex: spawn: --mode autonomous conflicts with permission mode 'acceptEdits'
+  (from profile 'hard' (agent_flags=acceptEdits)).
+  ...
+    --agent-flags bypassPermissions   run it unattended (overrides the profile)
+    --mode interactive                keep the approval prompts and watch it yourself
+```
+
+The check runs on the *resolved* values, so it covers a hand-rolled
+`--agent-flags`, a `--profile`, and any mix of the two — a new profile or a new
+flag string cannot reintroduce the combination. `--mode interactive` is never
+constrained: prompts are the point there.
+
+Flags are classified per agent, never universally — a marker one agent reads as
+"skip every gate" is an unknown argument to another, and the agent that rejects
+it falls back to prompting. Only the flags whose approval behaviour this repo
+documents are classified at all:
+
+| Agent | Runs unattended | Prompts |
+|---|---|---|
+| claude | `bypassPermissions`, `--dangerously-skip-permissions` | `default`, `acceptEdits`, `plan`, and no flags at all |
+| codex | `--ask-for-approval never`, `--dangerously-bypass-approvals-and-sandbox` | any other `--ask-for-approval` |
+| opencode | `--auto` | — |
+
+Anything else — including every `pi` flag and any future token — is classified
+neither way. Those spawns proceed with a warning on stderr rather than being
+refused or silently accepted, since refusing would be a guess.
+
+**A permission mode that can run unattended reduces blocking; it does not
+eliminate it.** Claude Code's own safety classifier gates dangerous operations
+regardless of permission mode, so even a `bypassPermissions` worker can sit on
+a modal prompt indefinitely (observed once here for nearly seven hours, on an
+`rm` against an unquoted glob — correctly blocked). Making a blocked worker
+*visible* instead of silent is a separate problem, tracked in issue #63.
 
 `--profile` only fills the `--agent`/`--model`/`--agent-flags` fields the
 `spawn` call didn't already set explicitly — pass any of those three

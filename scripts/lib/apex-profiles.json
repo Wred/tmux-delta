@@ -15,18 +15,18 @@
     "agent": "claude",
     "model": "sonnet",
     "agent_flags": "acceptEdits",
-    "description": "Default tier for most issue work. Edits apply automatically; shell commands still pause for approval."
+    "description": "Default tier for most issue work. Edits apply automatically; shell commands still pause for approval, so this tier needs --mode interactive (or an explicit --agent-flags bypassPermissions) — an autonomous spawn with it is refused."
   },
   "hard": {
     "agent": "claude",
     "model": "opus",
     "agent_flags": "acceptEdits",
-    "description": "Tricky refactors, ambiguous specs, anything touching shared/critical code."
+    "description": "Tricky refactors, ambiguous specs, anything touching shared/critical code. Shell commands pause for approval, so this tier needs --mode interactive (or an explicit --agent-flags bypassPermissions) — an autonomous spawn with it is refused."
   },
   "extreme": {
     "agent": "claude",
     "model": "fable",
     "agent_flags": "acceptEdits",
-    "description": "Hardest problems, strongest available model. For a second harness's judgment alongside claude, override with e.g. --agent codex or --agent pi — verify their exact model ids yourself, this repo doesn't validate them."
+    "description": "Hardest problems, strongest available model. Shell commands pause for approval, so this tier needs --mode interactive (or an explicit --agent-flags bypassPermissions) — an autonomous spawn with it is refused. For a second harness's judgment alongside claude, override with e.g. --agent codex or --agent pi — verify their exact model ids yourself, this repo doesn't validate them."
   }
 }

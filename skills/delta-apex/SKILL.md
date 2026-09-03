@@ -314,11 +314,27 @@ still exist or mean what they used to; check before guessing.
 ```bash
 tmux-apex.sh profiles
 
-tmux-apex.sh spawn --issue 42 --profile standard
-tmux-apex.sh spawn --issue 43 --profile hard
-tmux-apex.sh spawn --issue 44 --profile hard --agent-flags bypassPermissions
-tmux-apex.sh spawn --review-pr 17 --role monitor --profile hard
+tmux-apex.sh spawn --issue 42 --profile standard --mode interactive
+tmux-apex.sh spawn --issue 43 --profile hard --agent-flags bypassPermissions
+tmux-apex.sh spawn --issue 44 --profile easy
+tmux-apex.sh spawn --review-pr 17 --role monitor --profile hard --agent-flags bypassPermissions
 ```
+
+A spawn defaults to `--mode autonomous`, which tells the worker to work to
+completion — commit, push, open a draft PR — with nobody watching it. That is
+incompatible with a permission mode that pauses for approval on shell commands,
+so `spawn` refuses the pair outright instead of handing you a worker that stalls
+on its first `git` call: `standard`, `hard` and `extreme` ship `acceptEdits`, so
+an autonomous spawn on those tiers needs `--agent-flags bypassPermissions`
+(overriding just that field), and without it you must pass `--mode interactive`
+and supervise the pane yourself. The refusal names both values, so you do not
+have to remember which tiers are which. Say which you chose and why.
+
+Do not read that as a guarantee. Claude Code's safety classifier gates
+dangerous operations *regardless* of permission mode, so a `bypassPermissions`
+worker can still sit on a modal prompt for hours. `bypassPermissions` removes
+the blocks that are certain, not all of them — a worker that has gone quiet is
+still worth looking at (see issue #63).
 
 ### Linked pairs — do not relay reviews by hand
 
@@ -381,7 +397,10 @@ tmux-apex.sh spawn --issue 46 --agent codex --agent-flags '--sandbox workspace-w
 
 - `--model` — `sonnet` for mechanical, well-specified work; `opus` for design
   work, tricky refactors, and reviews.
-- `--agent-flags` — how much the worker may do without asking. For claude, a
+- `--agent-flags` — how much the worker may do without asking. Whatever you
+  pass has to agree with `--mode`: an autonomous spawn is refused unless the
+  flags can actually run unattended, and flags this repo cannot classify (most
+  non-claude argv) spawn with a warning instead. For claude, a
   bare token is a `--permission-mode`: `bypassPermissions` for work that must
   run unattended (the worktree is isolated and the human reviews the PR),
   `acceptEdits` when you want shell commands to stop and ask. A worker in
