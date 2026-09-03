@@ -250,6 +250,8 @@ EVENTS="$XDG_CACHE_HOME/tmux-delta/apex/$MGR/events.jsonl"
 apex() { "$APEX" "$@" 2>&1 || true }
 # Last event of a given type, as compact JSON ("" if none).
 ev() { jq -c --arg e "$1" 'select(.event == $e)' "$EVENTS" 2>/dev/null | tail -1 }
+# How many events of a given type the log holds.
+ev_count() { jq -c --arg e "$1" 'select(.event == $e)' "$EVENTS" 2>/dev/null | wc -l | tr -d ' ' }
 
 mget() { jq -r --arg k "$2" '.[$k] // "" | tostring' "$MEMBERS/$1.json" }
 
@@ -373,6 +375,35 @@ contains "the ping says the draft was lifted" "ready-for-review"       "$out"
 eq "and only about the PR, once" 1 "$(print -r -- "$out" | grep -c 'READY FOR HUMAN')"
 # Escalating twice — once per pane — is exactly the noise this replaces.
 eq "the reviewer pane is not reported separately" 1 "$(print -r -- "$out" | wc -l | tr -d ' ')"
+
+# What happens after a clean loop is this repo's answer to the merge-authority
+# question (#41/#46), not a fixed fact. The message above used to assert
+# "nothing is left for an agent to do", which was written before the grant
+# existed and contradicted the skill on any repo where merging is granted
+# (issue #49). Above, nobody has granted anything, so it is right by accident;
+# these two pin it to the grant.
+contains "an ungranted repo is told not to merge" "do not merge" "$out"
+contains "and what to do instead"  "ready-and-ineligible" "$out"
+
+print "\n…and the completion message follows the merge grant"
+reset
+# The grant is per-repo and resolved from the manager's *recorded* repo, so the
+# manager file has to name one — a manager that does not is `unknown`, which
+# fail-closed treats as no grant (and is what the block above exercises).
+APEX_JSON="$XDG_CACHE_HOME/tmux-delta/apex/$MGR/apex.json"
+jq -nc --arg r "$ROOT" '{repo:$r}' > "$APEX_JSON"
+APEX_AUTHORITY_UNATTENDED_GRANT=1 apex authority --grant --json >/dev/null
+verdict --none >/dev/null
+settle "$REVIEWER" >/dev/null
+out=$(apex pending)
+contains "a granted repo is still reported as ready" "READY FOR HUMAN REVIEW" "$out"
+contains "but told the merge is its own to finish" "yours to finish" "$out"
+contains "against the criteria, not on its own judgement" "merge criteria" "$out"
+lacks "and is not told to stand down" "do not merge" "$out"
+# The reviewer here is an independent one, so this needs the merge axis only —
+# saying otherwise would send the manager to ask for a grant it does not need.
+lacks "nor to ask for the self-review axis" "self-review axis is" "$out"
+APEX_AUTHORITY_UNATTENDED_GRANT=1 apex authority --revoke --json >/dev/null
 
 # A failed `gh pr ready` must still reach the human, and say so, rather than
 # silently reporting a PR as ready when it is still a draft.
@@ -568,45 +599,342 @@ contains "with the _deliver return code" '"rc":5' "$(ev pair-relay-failed)"
 contains "the pre-send box read is carried onto the event" "PAIRED REVIEW" \
 	"$(ev pair-relay-failed)"
 
-# ── a relay the send path could not confirm (issue #24) ──────────────
+# ── a relay the send path could not confirm (issue #49) ──────────────
 # The send path no longer retypes into a pane that is visibly working, because
 # that is how the same instruction got delivered twice for real. It reports
-# delivered-by-inference instead, with APEX_SEND_UNCONFIRMED set. For a human
-# at a terminal that is fine — `send` prints a NOTE they can act on. Here there
-# is nobody to read it, and advancing pair_turn on an inference risks a loop
-# waiting forever on a partner that was never woken, with the rollback
-# machinery built for that case unreachable. So the relay demotes it to
-# undelivered and escalates, accepting a false alarm to avoid a silent
-# deadlock.
-print "\nan unconfirmed relay escalates rather than advancing the turn"
+# delivered-by-inference instead, with APEX_SEND_UNCONFIRMED set.
+#
+# The loop used to demote that to undelivered and escalate, on the argument
+# that advancing pair_turn on inference risks waiting forever on a partner that
+# was never woken. The deadlock is real; the deadline was not. "Still busy at
+# the ceiling" is the pane working on the very findings we just relayed, so the
+# more substantial the review the more certain the false alarm — and every one
+# cost three manager actions to undo. So an unconfirmed relay is now deferred:
+# no verdict, no escalation, no round spent, and the loop stays armed until the
+# pane has something new to say.
+print "\nan unconfirmed relay is deferred, not escalated"
 reset --max=3
 verdict --findings 2 >/dev/null
 export STUB_PANE_TEXT='[apex from:apex-pair] PAIRED REVIEW'
-export STUB_PANE_NO_DRAIN=1                     # box never drains…
+export STUB_PANE_NO_DRAIN=1                     # the box never drains…
 export STUB_PANE_BUSY=1                         # …but the pane keeps repainting
 export APEX_SEND_SETTLE_TICKS=6
 settle "$REVIEWER" >/dev/null
-unset STUB_PANE_TEXT STUB_PANE_NO_DRAIN STUB_PANE_BUSY APEX_SEND_SETTLE_TICKS
+unset APEX_SEND_SETTLE_TICKS
+eq "the loop stays active" active "$(mget "$REVIEWER" pair_state)"
+eq "no escalation is written" "" "$(mget "$WORKER" pair_message)"
+lacks "and the manager is not woken" "STUCK" "$(apex pending)"
+# The pre-written round and turn stay put. On the evidence available the relay
+# most likely landed, and rolling back a round that is probably running is the
+# same mistake as escalating one — it is what made `pair-resume` re-review
+# unchanged code (issue #29). The rollback belongs on the path that concludes
+# the relay did *not* land, which is why the pre-relay values are recorded.
+eq "the round is not rolled back" 2 "$(mget "$WORKER" pair_round)"
+eq "and the turn stays advanced" worker "$(mget "$WORKER" pair_turn)"
+eq "the deferral names its target" "$WORKER" "$(mget "$REVIEWER" pair_defer_target)"
+eq "and is recorded on the other half too" "$WORKER" "$(mget "$WORKER" pair_defer_target)"
+eq "with the round to roll back to if it never lands" 1 \
+	"$(mget "$REVIEWER" pair_defer_prev_round)"
+contains "and it is logged as deferred, not failed" '"event":"pair-relay-deferred"' \
+	"$(ev pair-relay-deferred)"
+eq "no relay-failed event is written" "" "$(ev pair-relay-failed)"
+
+# The deferral's happy ending, and the reason deferring is right: the box
+# drains, so the busy pane was weak evidence *for* delivery all along. Nothing
+# was consumed to find that out.
+print "\n…and resolves as delivered once the box drains"
+unset STUB_PANE_TEXT STUB_PANE_NO_DRAIN         # box is empty on the next read
+apex _pair-defer-check "$REVIEWER" "$MGR" >/dev/null
+eq "the deferral is cleared" "" "$(mget "$REVIEWER" pair_defer_target)"
+eq "on both halves" "" "$(mget "$WORKER" pair_defer_target)"
+eq "the loop is still active" active "$(mget "$REVIEWER" pair_state)"
+eq "the round still stands" 2 "$(mget "$WORKER" pair_round)"
+eq "and the relay is logged as confirmed, late" true \
+	"$(print -r -- "$(ev pair-relay)" | jq -r '.confirmed_late // false')"
+lacks "with no escalation ever reaching the manager" "STUCK" "$(apex pending)"
+
+# A re-check that finds the pane *still* working is not an answer either. Look
+# again rather than guessing — that is the whole point of the deferral.
+print "\na re-check on a still-busy pane defers again"
+reset --max=3
+verdict --findings 2 >/dev/null
+export STUB_PANE_TEXT='[apex from:apex-pair] PAIRED REVIEW'
+export STUB_PANE_NO_DRAIN=1
+export STUB_PANE_BUSY=1
+export APEX_SEND_SETTLE_TICKS=6
+settle "$REVIEWER" >/dev/null
+unset APEX_SEND_SETTLE_TICKS
+export APEX_PAIR_DEFER_IDLE_TICKS=2
+apex _pair-defer-check "$REVIEWER" "$MGR" >/dev/null
+eq "the deferral survives" "$WORKER" "$(mget "$REVIEWER" pair_defer_target)"
+eq "and counts the re-check" 1 "$(mget "$REVIEWER" pair_defer_checks)"
+# On both halves, or the counters diverge as the two trigger paths take turns
+# and the bound below is quietly worth twice what it says.
+eq "on both halves" 1 "$(mget "$WORKER" pair_defer_checks)"
+eq "and the record is still whole on the other half" 1 \
+	"$(mget "$WORKER" pair_defer_prev_round)"
+eq "the loop is still active" active "$(mget "$REVIEWER" pair_state)"
+lacks "and still nothing for the manager" "STUCK" "$(apex pending)"
+
+# Bounded, though. #36's fail-safe argument still holds: nothing else in the
+# system watches for a partner that was never woken, so a deferral with no
+# floor is a silent deadlock. The bound is measured in re-checks, and the
+# hand-over says which of the two readings ran out — a pane that never stopped
+# working needs a different explanation than one that stalled.
+print "\n…but a deferral that never resolves escalates in the end"
+export APEX_PAIR_DEFER_MAX_CHECKS=2
+apex _pair-defer-check "$REVIEWER" "$MGR" >/dev/null
+unset APEX_PAIR_DEFER_MAX_CHECKS APEX_PAIR_DEFER_IDLE_TICKS
+unset STUB_PANE_TEXT STUB_PANE_NO_DRAIN STUB_PANE_BUSY
 eq "the loop is marked stuck" stuck "$(mget "$REVIEWER" pair_state)"
-contains "the stuck ping says the delivery was unconfirmed" \
-	"could not be confirmed" "$(apex pending)"
-eq "the round is rolled back" 1 "$(mget "$WORKER" pair_round)"
-eq "and the turn is not advanced" reviewer "$(mget "$WORKER" pair_turn)"
-# The event is the only surviving record on this path, and the whole
-# justification for reporting delivered-by-inference at all — so it is pinned,
-# jq program included: a typo there loses the entire event, not just the field.
-eq "the event marks it unconfirmed" true \
-	"$(print -r -- "$(ev pair-relay-failed)" | jq -r '.unconfirmed // false')"
-contains "and reports it as an unsubmitted-class failure" '"rc":5' \
-	"$(ev pair-relay-failed)"
-# The escalation is a fail-safe, not a diagnosis: a pane that kept repainting is
-# weak evidence *for* delivery. Saying "unconfirmed" and stopping there sent an
-# operator straight to `pair-resume`, which is the one thing that must not
-# happen while the partner is mid-turn on the relay it did receive (issue #29).
-contains "the ping says the partner may have it after all" \
-	"may well have the message" "$(apex pending)"
+eq "the deferral is cleared" "" "$(mget "$REVIEWER" pair_defer_target)"
+contains "the ping says the pane never went quiet" "never went quiet" \
+	"$(apex pending)"
+contains "and says to read the pane before acting" "read the pane" "$(apex pending)"
 contains "and gives the recovery order, not just the symptom" \
-	"finish and push first" "$(apex pending)"
+	"let it finish and push" "$(apex pending)"
+# Still busy means still probably running, so this hand-over is the one
+# escalation that must NOT roll the round back — resuming onto live work is
+# what issue #29's guard exists to refuse.
+eq "the round is left alone, because one is probably running" 2 \
+	"$(mget "$WORKER" pair_round)"
+
+# Neither bound knob is trusted, for the reason _send_to_pane clamps its own:
+# a value that switches off the bound it exists to tune is worse than a value
+# that is ignored. MAX_CHECKS=0 makes the first re-check the last, i.e. the
+# deferral off; SECS=0 fires the timer immediately and burns the budget in
+# seconds, and a non-numeric value makes `run-shell` error into the `|| true`
+# so there is no timer at all — removing the bound on exactly the case that
+# has no transitions to ride.
+print "\nthe defer bounds are clamped, not trusted"
+reset --max=3
+verdict --findings 2 >/dev/null
+export STUB_PANE_TEXT='[apex from:apex-pair] PAIRED REVIEW'
+export STUB_PANE_NO_DRAIN=1
+export STUB_PANE_BUSY=1
+export APEX_SEND_SETTLE_TICKS=6
+settle "$REVIEWER" >/dev/null
+unset APEX_SEND_SETTLE_TICKS
+export APEX_PAIR_DEFER_MAX_CHECKS=0
+export APEX_PAIR_DEFER_SECS=nope
+# The sample length is the third one, and it has to default *up*: clamped to 1
+# it makes a single quiet 0.2s frame enough to conclude "nobody took the relay".
+export APEX_PAIR_DEFER_IDLE_TICKS=x
+out=$(apex _pair-defer-check "$REVIEWER" "$MGR")
+unset APEX_PAIR_DEFER_MAX_CHECKS APEX_PAIR_DEFER_SECS APEX_PAIR_DEFER_IDLE_TICKS
+unset STUB_PANE_TEXT STUB_PANE_NO_DRAIN STUB_PANE_BUSY
+contains "a zero check bound is refused out loud" "APEX_PAIR_DEFER_MAX_CHECKS" "$out"
+contains "and so is a non-numeric delay" "APEX_PAIR_DEFER_SECS" "$out"
+contains "and so is a non-numeric sample length" "APEX_PAIR_DEFER_IDLE_TICKS" "$out"
+eq "the deferral still defers on the documented defaults" "$WORKER" \
+	"$(mget "$REVIEWER" pair_defer_target)"
+eq "rather than escalating on the first re-check" active \
+	"$(mget "$REVIEWER" pair_state)"
+
+# The deferral has two independent triggers by design, so adjudicating it is a
+# read-modify-write two callers can enter at once. Claiming the record makes
+# the decision single-shot: the second caller finds nothing outstanding and
+# returns to the normal loop rather than escalating again or rolling a round
+# back underneath the first caller's advance.
+print "\nadjudicating a deferral is single-shot"
+reset --max=3
+verdict --findings 2 >/dev/null
+export STUB_PANE_TEXT='[apex from:apex-pair] PAIRED REVIEW'
+export STUB_PANE_NO_DRAIN=1
+export STUB_PANE_BUSY=1
+export APEX_SEND_SETTLE_TICKS=6
+settle "$REVIEWER" >/dev/null
+unset APEX_SEND_SETTLE_TICKS STUB_PANE_BUSY       # pane quiet, text still there
+export APEX_PAIR_DEFER_IDLE_TICKS=2
+# Stand in for a trigger already inside the decision by holding its lock from
+# outside, on the lockdir path so no second process is needed. The sequential
+# case proves only idempotence, which every terminal path had already; what the
+# lock is for is the trigger that arrives *during* the sample, and that one must
+# not relay and flip the turn while the holder is about to roll the round back.
+# The lock is keyed on the deferral's sender, which both halves carry, so it
+# excludes this pair's two triggers and not an unrelated pair's.
+DEFER_LOCK="$XDG_CACHE_HOME/tmux-delta/apex/$MGR/.pair-defer-${REVIEWER//[^A-Za-z0-9_-]/_}.lock"
+# Hold it on the flock path, which is what production takes — the lockdir
+# fallback has different semantics (a staleness rule rather than kernel
+# liveness), so testing contention only there tests the wrong mechanism. flock
+# has to be held by a live process, hence the backgrounded holder.
+: > "$XDG_CACHE_HOME/holder-ready"; rm -f "$XDG_CACHE_HOME/holder-ready"
+(
+	zmodload zsh/system
+	: >> "$DEFER_LOCK"
+	zsystem flock -f hfd "$DEFER_LOCK"
+	: > "$XDG_CACHE_HOME/holder-ready"
+	sleep 5
+) &
+HOLDER=$!
+for _i in {1..50}; do [[ -f "$XDG_CACHE_HOME/holder-ready" ]] && break; sleep 0.1; done
+export APEX_LOCK_WAIT=1
+settle "$WORKER" >/dev/null
+eq "a contended trigger does not adjudicate" "$WORKER" \
+	"$(mget "$REVIEWER" pair_defer_target)"
+eq "and leaves the loop where it was" active "$(mget "$REVIEWER" pair_state)"
+eq "and does not advance the turn" worker "$(mget "$WORKER" pair_turn)"
+contains "the skip is in the event log, not silent" '"event":"lock_timeout"' \
+	"$(ev lock_timeout)"
+# The transition is handed back, not spent: settled_seq is cleared so the same
+# seq is eligible again. Dropped instead, nothing would re-derive it and the
+# loop would sit still.
+eq "and the transition is left retryable" "" "$(mget "$WORKER" settled_seq)"
+# `wait` on a killed job reports 143, and err_return would take the suite with
+# it, so swallow both statuses explicitly.
+kill "$HOLDER" 2>/dev/null || true
+wait "$HOLDER" 2>/dev/null || true
+unset APEX_LOCK_WAIT
+# The lockdir fallback is the other acquire path, and a contended one there has
+# to reach the same verdict.
+export APEX_HAVE_FLOCK=1 APEX_LOCK_WAIT=1
+mkdir -p "$DEFER_LOCK.d"
+settle "$WORKER" >/dev/null
+eq "the lockdir fallback contends the same way" "$WORKER" \
+	"$(mget "$REVIEWER" pair_defer_target)"
+eq "and still does not advance the turn" worker "$(mget "$WORKER" pair_turn)"
+rmdir "$DEFER_LOCK.d"
+unset APEX_HAVE_FLOCK APEX_LOCK_WAIT
+# Now let the re-armed callback actually fire, with the seq the contended one
+# handed back. Asserting settled_seq alone shows the seq was returned but not
+# that anything comes of it — and if the hand-back stopped clearing settled_seq,
+# the retry would hit the dedupe guard and do nothing, which is a loop that sits
+# still while every field still looks right.
+SEQ=$(mget "$WORKER" seq)
+apex _settle "$WORKER" "$MGR" "$SEQ" >/dev/null
+eq "the re-armed transition adjudicates the deferral" stuck \
+	"$(mget "$REVIEWER" pair_state)"
+eq "and the round rolls back" 1 "$(mget "$WORKER" pair_round)"
+# And the decision is single-shot after the fact too: the record is gone from
+# both halves, so the losing trigger finds nothing rather than escalating twice.
+apex _pair-defer-check "$WORKER" "$MGR" >/dev/null
+unset APEX_PAIR_DEFER_IDLE_TICKS STUB_PANE_TEXT STUB_PANE_NO_DRAIN
+eq "a later trigger finds nothing to adjudicate" 1 \
+	"$(mget "$WORKER" pair_round)"
+eq "and does not re-escalate" 1 \
+	"$(ev_count pair-relay-deferred-armed)"
+
+# The hand-back needs its own floor, by the argument this file makes for the
+# deferral itself. The chain does end on its own in the cases contention
+# actually creates — a clamped section, a killed holder whose flock the kernel
+# drops, a member taking another turn — but a lock held by a live wedged process
+# has none of those, and pair_defer_checks cannot serve as the bound because a
+# contended trigger observed nothing and deliberately does not count.
+print "\nhanding a transition back is bounded"
+reset --max=3
+verdict --findings 2 >/dev/null
+export STUB_PANE_TEXT='[apex from:apex-pair] PAIRED REVIEW'
+export STUB_PANE_NO_DRAIN=1
+export STUB_PANE_BUSY=1
+export APEX_SEND_SETTLE_TICKS=6
+settle "$REVIEWER" >/dev/null
+unset APEX_SEND_SETTLE_TICKS STUB_PANE_BUSY
+DEFER_LOCK="$XDG_CACHE_HOME/tmux-delta/apex/$MGR/.pair-defer-${REVIEWER//[^A-Za-z0-9_-]/_}.lock"
+export APEX_HAVE_FLOCK=1 APEX_LOCK_WAIT=1 APEX_SETTLE_LOCK_RETRIES=1
+mkdir -p "$DEFER_LOCK.d"
+SEQ=$(( $(mget "$WORKER" seq) + 1 ))
+jq -c --argjson s "$SEQ" '.seq = $s' "$MEMBERS/$WORKER.json" > "$TMPROOT/s" \
+	&& mv "$TMPROOT/s" "$MEMBERS/$WORKER.json"
+apex _settle "$WORKER" "$MGR" "$SEQ" 1 >/dev/null
+rmdir "$DEFER_LOCK.d"
+unset APEX_HAVE_FLOCK APEX_LOCK_WAIT APEX_SETTLE_LOCK_RETRIES
+unset STUB_PANE_TEXT STUB_PANE_NO_DRAIN
+contains "past the bound the wedged lock is named as itself" \
+	'"event":"pair-defer-lock-wedged"' "$(ev pair-defer-lock-wedged)"
+eq "and the transition is spent rather than handed back again" "$SEQ" \
+	"$(mget "$WORKER" settled_seq)"
+# And it escalates, the way every other exhaustion on this path does. An
+# events.jsonl line is not something `pending` says to a human in words, and on
+# the timer side nothing else stays armed, so logging alone leaves a loop that
+# reads as one that simply went quiet.
+eq "the loop is handed over, not left quiet" stuck "$(mget "$REVIEWER" pair_state)"
+contains "and the ping names the lock, not the pane" "stuck lock" "$(apex pending)"
+contains "saying why the pane was never read" "look at the pane" "$(apex pending)"
+eq "the round is left alone, since nothing observed the target" 2 \
+	"$(mget "$WORKER" pair_round)"
+eq "and the record is cleared, since no trigger will look again" "" \
+	"$(mget "$REVIEWER" pair_defer_target)"
+
+# The bound itself is a knob, and it is read into arithmetic where a
+# non-numeric, empty or negative value all evaluate as 0 — which would make the
+# first ordinary contention report a wedged lock.
+print "\n…and its bound is clamped like the rest of the family"
+reset --max=3
+verdict --findings 2 >/dev/null
+export STUB_PANE_TEXT='[apex from:apex-pair] PAIRED REVIEW'
+export STUB_PANE_NO_DRAIN=1
+export STUB_PANE_BUSY=1
+export APEX_SEND_SETTLE_TICKS=6
+settle "$REVIEWER" >/dev/null
+unset APEX_SEND_SETTLE_TICKS STUB_PANE_BUSY
+export APEX_HAVE_FLOCK=1 APEX_LOCK_WAIT=1 APEX_SETTLE_LOCK_RETRIES=nope
+mkdir -p "$DEFER_LOCK.d"
+SEQ=$(( $(mget "$WORKER" seq) + 1 ))
+jq -c --argjson s "$SEQ" '.seq = $s' "$MEMBERS/$WORKER.json" > "$TMPROOT/s" \
+	&& mv "$TMPROOT/s" "$MEMBERS/$WORKER.json"
+out=$(apex _settle "$WORKER" "$MGR" "$SEQ")
+rmdir "$DEFER_LOCK.d"
+unset APEX_HAVE_FLOCK APEX_LOCK_WAIT APEX_SETTLE_LOCK_RETRIES
+unset STUB_PANE_TEXT STUB_PANE_NO_DRAIN
+contains "a non-numeric bound is refused out loud" "APEX_SETTLE_LOCK_RETRIES" "$out"
+eq "and the first contention is still handed back" "" \
+	"$(mget "$WORKER" settled_seq)"
+eq "rather than reported as a wedged lock" active "$(mget "$REVIEWER" pair_state)"
+
+# The other reading, and the only one that means undelivered: our text in the
+# box and the pane not repainting a single cell. Nobody took it. This is the
+# escalation the old code fired on both readings, now fired on the one where it
+# is right — and here the rollback is right too, because no round is running.
+print "\na deferred relay on a pane that goes quiet escalates and rolls back"
+reset --max=3
+verdict --findings 2 >/dev/null
+export STUB_PANE_TEXT='[apex from:apex-pair] PAIRED REVIEW'
+export STUB_PANE_NO_DRAIN=1
+export STUB_PANE_BUSY=1
+export APEX_SEND_SETTLE_TICKS=6
+settle "$REVIEWER" >/dev/null
+unset APEX_SEND_SETTLE_TICKS STUB_PANE_BUSY      # the pane goes quiet…
+export APEX_PAIR_DEFER_IDLE_TICKS=2              # …with our text still in it
+apex _pair-defer-check "$REVIEWER" "$MGR" >/dev/null
+unset APEX_PAIR_DEFER_IDLE_TICKS STUB_PANE_TEXT STUB_PANE_NO_DRAIN
+eq "the loop is marked stuck" stuck "$(mget "$REVIEWER" pair_state)"
+contains "the ping says the relay was never submitted" "never submitted" \
+	"$(apex pending)"
+contains "and names the box to clear" "input box" "$(apex pending)"
+eq "the round is rolled back (worker)" 1 "$(mget "$WORKER" pair_round)"
+eq "the round is rolled back (reviewer)" 1 "$(mget "$REVIEWER" pair_round)"
+eq "and so is the turn" reviewer "$(mget "$WORKER" pair_turn)"
+
+# Riding transitions the loop already gets, rather than a poller of its own
+# (#29's `watch` suggestion, done the cheap way): a deferral is recorded on
+# both halves, so either member going idle adjudicates it. The target settling
+# is the common case — it went quiet because it finished the relayed work — and
+# once the deferral resolves as delivered the transition carries on into the
+# ordinary loop, which is what makes this free.
+print "\neither half's idle transition settles a deferred relay"
+reset --max=3
+verdict --findings 2 >/dev/null
+export STUB_PANE_TEXT='[apex from:apex-pair] PAIRED REVIEW'
+export STUB_PANE_NO_DRAIN=1
+export STUB_PANE_BUSY=1
+export APEX_SEND_SETTLE_TICKS=6
+settle "$REVIEWER" >/dev/null
+unset APEX_SEND_SETTLE_TICKS STUB_PANE_NO_DRAIN STUB_PANE_BUSY STUB_PANE_TEXT
+: > "$STUB_SENT"
+settle "$WORKER" >/dev/null
+eq "the deferral is resolved by the transition" "" \
+	"$(mget "$WORKER" pair_defer_target)"
+# Clearing has to reach the *sender*, and the record is the only thing that
+# knows which half that is: pair_defer_pair names the target in both files, so
+# deriving "the other one" from it clears the settling half twice and leaves the
+# sender armed — which then re-checks a relay already confirmed and can roll
+# back a round that landed. That is the false escalation this file exists to
+# stop, arriving by a different door.
+eq "and cleared on the sender half as well" "" \
+	"$(mget "$REVIEWER" pair_defer_target)"
+eq "the loop is still active" active "$(mget "$WORKER" pair_state)"
+eq "and the same transition advances the loop" reviewer "$(mget "$WORKER" pair_turn)"
+contains "so the reviewer is asked to re-review" "Re-review" "$(sent_to %2)"
 
 # ── the same pane, watched for longer (issue #29) ─────────────────────
 # The give-up above is a ceiling, not a fact about the pane, and the ceiling it
@@ -634,10 +962,11 @@ eq "with no unconfirmed flag" false \
 	"$(print -r -- "$(ev pair-relay)" | jq -r '.unconfirmed // false')"
 eq "and no escalation was written" "" "$(mget "$WORKER" pair_message)"
 
-# Same pane, same drain, ceiling put back to `send`'s: escalates again. This is
-# the pair that shows the behaviour turns on the ceiling and nothing else — and
-# that an explicitly-set APEX_SEND_SETTLE_TICKS still wins, so an operator who
-# tuned it does not silently get the relay's default instead.
+# The same pane and the same drain, with the ceiling put back to `send`'s: the
+# relay gives up before read 11 and defers instead of delivering. This pair
+# shows the behaviour turning on the ceiling and nothing else — an
+# explicitly-set APEX_SEND_SETTLE_TICKS still wins, so an operator who tuned it
+# does not silently get the relay's default instead.
 print "\n…and the explicit ceiling still wins over the relay default"
 reset --max=3
 verdict --findings 2 >/dev/null
@@ -648,10 +977,11 @@ export STUB_PANE_DRAIN_AFTER=10
 export APEX_SEND_SETTLE_TICKS=3                 # gives up before read 11
 settle "$REVIEWER" >/dev/null
 unset STUB_PANE_TEXT STUB_PANE_NO_DRAIN STUB_PANE_BUSY STUB_PANE_DRAIN_AFTER APEX_SEND_SETTLE_TICKS
-eq "the loop is marked stuck" stuck "$(mget "$REVIEWER" pair_state)"
-eq "the round is rolled back" 1 "$(mget "$WORKER" pair_round)"
-eq "the event marks it unconfirmed" true \
-	"$(print -r -- "$(ev pair-relay-failed)" | jq -r '.unconfirmed // false')"
+eq "the relay defers instead of confirming" "$WORKER" \
+	"$(mget "$REVIEWER" pair_defer_target)"
+eq "the loop stays active either way" active "$(mget "$REVIEWER" pair_state)"
+contains "and the deferral is logged" '"event":"pair-relay-deferred"' \
+	"$(ev pair-relay-deferred)"
 
 # The same pane, read by a human's `send`: delivered, with the NOTE and the
 # flag on the `send` event rather than an escalation.

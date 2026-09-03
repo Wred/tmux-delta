@@ -526,12 +526,53 @@ The loop escalates rather than spinning whenever it cannot make progress on its
 own — the round cap is hit (worker and reviewer are not converging), no verdict
 was recorded, the partner's pane is gone, or the relay could not be delivered.
 Only then does the manager get a ping, and the message says which of those it
-is. `pair-resume` on a loop that stuck *at the cap* requires a higher
+is.
+
+"Could not be delivered" is narrower than it sounds, and deliberately so. A
+relay is typed into the partner's input box and confirmed by watching the box
+drain, and a busy pane can hold the text on screen long after the Enter landed
+— so "our text is still in the box" is only half an answer:
+
+| Box holds our relay | Pane | Reading |
+|---------------------|------|---------|
+| yes | gone quiet | nobody took it → escalate, and roll the round back |
+| yes | still repainting | probably working on it → **defer** and look again |
+| no  | — | delivered |
+
+Deferring costs nothing: no round is spent, no escalation is written, and the
+loop stays armed. The deferral is recorded on both halves, so either member's
+next idle transition adjudicates it, and a timer covers the case that produces
+no transitions at all (a relay that really was never submitted never wakes
+anyone). It is still bounded — a deferral that never resolves escalates in the
+end, because nothing else in the system watches for a partner that was never
+woken. `APEX_PAIR_DEFER_SECS` (30) sets the re-check interval and
+`APEX_PAIR_DEFER_MAX_CHECKS` (20) the ceiling, and
+`APEX_PAIR_DEFER_IDLE_TICKS` (10) how many 0.2s frames of stillness count as
+quiet. All three are clamped to a positive integer with a warning, since a zero
+or non-numeric value would switch off the very bound it was set to tune. The
+whole adjudication runs under one lock, keyed on the deferral's sender so it
+excludes that pair's two triggers and no others. A deferral is therefore decided
+once even when the timer and an idle transition arrive together: the trigger
+that loses hands its transition back — re-armed, not spent — rather than
+relaying underneath the one that is deciding, and the record stays in state
+until a terminal decision is written, so a hook process killed mid-decision
+leaves the deferral for the next trigger. The sample is also clamped to stay
+inside `APEX_LOCK_WAIT`, since a sample longer than the wait would make that
+contention the rule rather than the exception. Hand-backs are bounded too
+(`APEX_SETTLE_LOCK_RETRIES`, 5, clamped like the rest): past that the transition
+is spent, a `pair-defer-lock-wedged` event names the fault, and the loop is
+escalated as stuck — worded around the lock rather than the pane, since nothing
+ever got to read the target, so the round is left as it stands. A lock nobody
+releases is not a busy pair and must not read as a loop that quietly went
+away. `pair-resume` on a loop that stuck *at the cap* requires a higher
 `--max-rounds`: resuming at `round == max` would burn a full review turn and
 re-escalate on the reviewer's first finding. Resuming also clears the reviewer's
 last verdict, so a stale one cannot pass for the resumed round's. The terminal
-ping is framed as the decision that is actually the human's — the merge call —
-not as a generic "a member went idle".
+ping is framed around what is left to decide rather than as a generic "a member
+went idle" — which, on a repo where merge authority is granted (the
+fail-closed `authority` switch above), means telling the manager the merge is
+its own to finish against the stated criteria, and on any other repo means
+report-and-stop with the merge call left to the human.
 
 ### How reporting works
 

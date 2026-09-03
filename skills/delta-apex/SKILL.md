@@ -477,12 +477,16 @@ Then pick one:
   code, that is a new issue and a new worker, not a takeover. If it stuck at the
   round cap, `pair-resume` requires `--max-rounds N` above the old cap, and you
   should decide whether another round is actually warranted: the two agents
-  disagreeing is a judgement call, not a retry. If it stuck on a relay whose
-  **delivery could not be confirmed**, read the partner's pane before anything
-  else: a pane that kept repainting usually *did* get the message, and the loop
-  disarmed itself around work still in progress. Let that work finish and push,
-  then resume — `pair-resume` refuses a worker that is still mid-change for
-  exactly this reason, and `--force` past it only if you have looked.
+  disagreeing is a judgement call, not a retry. An **unconfirmed relay** no longer
+  escalates on its own — the loop defers and re-checks it instead — so the two
+  ways it can reach you both mean something specific. "still sitting unsent …
+  and that pane has now been completely idle" means the relay really was never
+  submitted: submit or clear the box, then resume. "busy … the whole time and
+  never went quiet" means the deferral ran out of re-checks while the partner
+  kept working, and the round was deliberately *not* rolled back — read the
+  pane, let the work finish and push, then resume. `pair-resume` refuses a
+  worker that is still mid-change for exactly this reason, and `--force` past
+  it only if you have looked.
 - **Idle with nothing pushed and no blocker** → it probably stopped early.
   Send it a nudge naming what is still missing.
 - **A question only the human can answer** (product decisions, tradeoffs,
