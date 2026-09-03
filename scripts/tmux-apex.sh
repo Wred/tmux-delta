@@ -548,6 +548,66 @@ _cur_member() {
 
 # ─── facts about a member session ────────────────────────────────────
 
+# _commits_ahead <worktree> <branch> [--ask-remote] — how many commits HEAD is
+# ahead of the remote, or the empty string when that genuinely cannot be
+# determined. Never 0 as a stand-in for "could not tell".
+#
+# The obvious `rev-list --count @{upstream}..HEAD` is right when it works and
+# useless when it does not. In an apex worktree the upstream is *configured*
+# but frequently has no local remote-tracking ref, because `remote.origin.fetch`
+# is narrowed to `main` (the same condition behind #31):
+#
+#   fatal: upstream branch 'refs/heads/apex-…' not stored as a remote-tracking branch
+#
+# The old code swallowed that with `|| echo 0`, so the failing form of the check
+# returned the passing value — the vacuous pass. 0 then meant any of "fully
+# pushed", "unpushed but no tracking ref", or "never pushed at all", and a
+# manager reading `commits_ahead=0` off a ping line concluded the first, went
+# looking for work that had been "lost", and nearly reported it lost (issue #57).
+# Report unknown as unknown instead, and let the callers render it.
+#
+# `HEAD --not --remotes` is not the fallback: under a narrow refspec no
+# origin/<worker-branch> ref ever exists, so it calls every commit on every
+# worker branch unpushed forever — the mirror-image lie, argued out at length in
+# `_reap_risk`. So ask the remote, the way `_reap_risk` does. That is a network
+# round trip per member, which is why it is opt-in: `status` is invoked
+# deliberately and can pay for it, while the per-hook path behind
+# `_record_status` and `pending` runs constantly and takes the honest `null`.
+#
+# GIT_TERMINAL_PROMPT=0 so a repo whose remote wants credentials fails fast
+# rather than blocking `status` on a prompt nobody will ever see.
+_commits_ahead() {
+	local wt="$1" branch="$2" ask=false a n="" out="" rc=0 remote_sha=""
+	for a in "${@[3,-1]}"; do
+		[[ $a == --ask-remote ]] && ask=true
+	done
+
+	n=$(git -C "$wt" rev-list --count '@{upstream}..HEAD' 2>/dev/null) || n=""
+	if [[ -n $n ]]; then
+		printf '%s' "$n"
+		return 0
+	fi
+
+	[[ $ask == true && -n $branch ]] || return 0
+
+	out=$(GIT_TERMINAL_PROMPT=0 git -C "$wt" ls-remote origin "refs/heads/${branch}" 2>/dev/null) && rc=0 || rc=$?
+	# An unreachable remote is unknown — not zero, and not "never pushed" either.
+	(( rc == 0 )) || return 0
+	remote_sha=$(printf '%s' "$out" | cut -f1)
+
+	if [[ -z $remote_sha ]]; then
+		# The remote has no such branch: nothing on it has ever been pushed.
+		n=$(git -C "$wt" rev-list --count HEAD 2>/dev/null) || n=""
+	elif git -C "$wt" cat-file -e "${remote_sha}^{commit}" 2>/dev/null; then
+		n=$(git -C "$wt" rev-list --count HEAD --not "$remote_sha" 2>/dev/null) || n=""
+	else
+		# The remote has the branch but its tip object is not here, so the two
+		# ranges are not comparable. Unknown.
+		return 0
+	fi
+	printf '%s' "$n"
+}
+
 # _member_facts <session> [--with-pane-input] — a JSON object of live,
 # derived state.
 #
@@ -555,9 +615,10 @@ _cur_member() {
 # it is opt-in: `pending` runs on every agent hook and does not need it.
 _member_facts() {
 	local session="$1" wt branch pr_number pr_state pr_draft icons ahead dirty alive
-	local want_pane_input=false a
+	local want_pane_input=false want_remote=false a
 	for a in "${@[2,-1]}"; do
 		[[ $a == --with-pane-input ]] && want_pane_input=true
+		[[ $a == --with-remote ]] && want_remote=true
 	done
 	alive=false
 	_member_alive "$session" && alive=true
@@ -565,12 +626,17 @@ _member_facts() {
 	wt=$(apex_member_get "$APEX_SESSION" "$session" worktree 2>/dev/null)
 	[[ -z $wt || ! -d $wt ]] && wt=""
 
-	branch=""; ahead=0; dirty=false
+	# Empty, not 0: an unset `ahead` means "not knowable" and reaches jq as
+	# null. Everything that reads .commits_ahead must handle null (issue #57).
+	branch=""; ahead=""; dirty=false
 	if [[ -n $wt ]]; then
 		branch=$(git -C "$wt" symbolic-ref --short HEAD 2>/dev/null)
 		[[ -n $(git -C "$wt" status --porcelain 2>/dev/null) ]] && dirty=true
-		ahead=$(git -C "$wt" rev-list --count '@{upstream}..HEAD' 2>/dev/null || echo 0)
-		[[ -z $ahead ]] && ahead=0
+		if $want_remote; then
+			ahead=$(_commits_ahead "$wt" "$branch" --ask-remote)
+		else
+			ahead=$(_commits_ahead "$wt" "$branch")
+		fi
 	fi
 
 	pr_number=""; pr_state=""; icons=""; pr_draft=""
@@ -599,7 +665,7 @@ _member_facts() {
 	jq -nc \
 		--arg session "$session" --arg wt "$wt" --arg branch "$branch" \
 		--arg pr "$pr_number" --arg pr_state "$pr_state" --arg pr_draft "$pr_draft" \
-		--arg icons "$icons" --argjson ahead "${ahead:-0}" \
+		--arg icons "$icons" --argjson ahead "${ahead:-null}" \
 		--argjson dirty "$dirty" --argjson alive "$alive" \
 		--arg working "$working" --arg attention "$attention" \
 		--arg pane_input "$pane_input" \
@@ -619,7 +685,8 @@ _facts_line() {
 		     + (if .pr_draft == "true" then "(draft)" else "" end)
 		     + (if .pr_state != "" and .pr_state != "OPEN" then "(" + (.pr_state|ascii_downcase) + ")" else "" end)
 		   else "pr=none" end),
-		  ("commits_ahead=" + (.commits_ahead|tostring)),
+		  (if .commits_ahead == null then "commits_ahead=unknown(unpushed?)"
+		   else "commits_ahead=" + (.commits_ahead|tostring) end),
 		  (if .dirty then "uncommitted-changes" else empty end),
 		  (if .alive|not then "SESSION-DEAD" else empty end)
 		] | join(" ")'
@@ -2372,7 +2439,7 @@ _cmd_status() {
 	local s facts stored merged
 	for s in ${(f)"$(apex_members "$manager")"}; do
 		[[ -z $s ]] && continue
-		facts=$(_member_facts "$s" --with-pane-input)
+		facts=$(_member_facts "$s" --with-pane-input --with-remote)
 		stored=$(cat "$(apex_member_file "$manager" "$s")" 2>/dev/null)
 		[[ -z $stored ]] && stored='{}'
 		merged=$(printf '%s\n%s\n' "$stored" "$facts" | jq -s '.[0] * .[1]')
@@ -2416,7 +2483,9 @@ _cmd_status() {
 			        + (if .pr_draft == "true" then " draft" else "" end)
 			        + (if .pr_state != "" and .pr_state != "OPEN" then " " + (.pr_state|ascii_downcase) else "" end)
 			      else empty end),
-			     (if .commits_ahead > 0 then (.commits_ahead|tostring) + " ahead" else empty end),
+			     (if .commits_ahead == null then "unpushed?"
+			      elif .commits_ahead > 0 then (.commits_ahead|tostring) + " ahead"
+			      else empty end),
 			     (if .dirty then "dirty" else empty end) ] | join(", "))
 			] | @tsv' \
 		| while IFS=$'\t' read -r c1 c2 c3 c4 c5; do
@@ -2667,8 +2736,10 @@ _reap_risk() {
 	[[ $dirty == true ]] && why+=("uncommitted changes")
 
 	# Deliberately not .commits_ahead: that is @{upstream}-relative, and a
-	# branch that was never pushed has no upstream, so rev-list fails and the
-	# count reads 0 — precisely the member whose work reap would destroy.
+	# branch that was never pushed has no upstream, so rev-list fails. That
+	# failure now reports as null rather than 0 (issue #57), which is honest but
+	# still not an answer — and this path needs an answer, because the member
+	# whose count is unknowable is precisely the one whose work reap destroys.
 	#
 	# `HEAD --not --remotes` was the replacement, and it asks a question one
 	# step removed from the one that matters: it consults *local
