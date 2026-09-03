@@ -715,15 +715,18 @@ export STUB_PANE_BUSY=1
 export APEX_SEND_SETTLE_TICKS=6
 settle "$REVIEWER" >/dev/null
 unset APEX_SEND_SETTLE_TICKS
-export APEX_PAIR_DEFER_IDLE_TICKS=2
 export APEX_PAIR_DEFER_MAX_CHECKS=0
 export APEX_PAIR_DEFER_SECS=nope
+# The sample length is the third one, and it has to default *up*: clamped to 1
+# it makes a single quiet 0.2s frame enough to conclude "nobody took the relay".
+export APEX_PAIR_DEFER_IDLE_TICKS=x
 out=$(apex _pair-defer-check "$REVIEWER" "$MGR")
 unset APEX_PAIR_DEFER_MAX_CHECKS APEX_PAIR_DEFER_SECS APEX_PAIR_DEFER_IDLE_TICKS
 unset STUB_PANE_TEXT STUB_PANE_NO_DRAIN STUB_PANE_BUSY
 contains "a zero check bound is refused out loud" "APEX_PAIR_DEFER_MAX_CHECKS" "$out"
 contains "and so is a non-numeric delay" "APEX_PAIR_DEFER_SECS" "$out"
-eq "the deferral still defers on the documented default" "$WORKER" \
+contains "and so is a non-numeric sample length" "APEX_PAIR_DEFER_IDLE_TICKS" "$out"
+eq "the deferral still defers on the documented defaults" "$WORKER" \
 	"$(mget "$REVIEWER" pair_defer_target)"
 eq "rather than escalating on the first re-check" active \
 	"$(mget "$REVIEWER" pair_state)"
@@ -743,15 +746,35 @@ export APEX_SEND_SETTLE_TICKS=6
 settle "$REVIEWER" >/dev/null
 unset APEX_SEND_SETTLE_TICKS STUB_PANE_BUSY       # pane quiet, text still there
 export APEX_PAIR_DEFER_IDLE_TICKS=2
+# Stand in for a trigger already inside the decision by holding its lock from
+# outside, on the lockdir path so no second process is needed. The sequential
+# case proves only idempotence, which every terminal path had already; what the
+# lock is for is the trigger that arrives *during* the sample, and that one must
+# not relay and flip the turn while the holder is about to roll the round back.
+export APEX_HAVE_FLOCK=1 APEX_LOCK_WAIT=1
+mkdir -p "$XDG_CACHE_HOME/tmux-delta/apex/$MGR/.pair-defer.lock.d"
+settle "$WORKER" >/dev/null
+eq "a contended trigger does not adjudicate" "$WORKER" \
+	"$(mget "$REVIEWER" pair_defer_target)"
+eq "and leaves the loop where it was" active "$(mget "$REVIEWER" pair_state)"
+eq "and does not advance the turn" worker "$(mget "$WORKER" pair_turn)"
+contains "the skip is in the event log, not silent" '"event":"lock_timeout"' \
+	"$(ev lock_timeout)"
+rmdir "$XDG_CACHE_HOME/tmux-delta/apex/$MGR/.pair-defer.lock.d"
+unset APEX_HAVE_FLOCK APEX_LOCK_WAIT
+# Uncontended, the same trigger decides — the record survived the skip, which
+# is the durability the lock-held-throughout shape buys: the decision writes to
+# state, so a killed adjudicator leaves the deferral for the next trigger
+# instead of taking it with it.
 apex _pair-defer-check "$REVIEWER" "$MGR" >/dev/null
-eq "the first caller escalates" stuck "$(mget "$REVIEWER" pair_state)"
-eq "and rolls the round back" 1 "$(mget "$WORKER" pair_round)"
-# Re-arm the state a live loop would be in and let the losing trigger fire.
-apex_probe_round=$(mget "$WORKER" pair_round)
+eq "once the lock is free the deferral is decided" stuck \
+	"$(mget "$REVIEWER" pair_state)"
+eq "and the round rolls back" 1 "$(mget "$WORKER" pair_round)"
+# And the decision is single-shot after the fact too: the record is gone from
+# both halves, so the losing trigger finds nothing rather than escalating twice.
 apex _pair-defer-check "$WORKER" "$MGR" >/dev/null
-apex _pair-defer-check "$REVIEWER" "$MGR" >/dev/null
 unset APEX_PAIR_DEFER_IDLE_TICKS STUB_PANE_TEXT STUB_PANE_NO_DRAIN
-eq "a second trigger finds nothing to adjudicate" "$apex_probe_round" \
+eq "a later trigger finds nothing to adjudicate" 1 \
 	"$(mget "$WORKER" pair_round)"
 eq "and does not re-escalate" 1 \
 	"$(ev_count pair-relay-deferred-armed)"

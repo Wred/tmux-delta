@@ -546,11 +546,15 @@ no transitions at all (a relay that really was never submitted never wakes
 anyone). It is still bounded — a deferral that never resolves escalates in the
 end, because nothing else in the system watches for a partner that was never
 woken. `APEX_PAIR_DEFER_SECS` (30) sets the re-check interval and
-`APEX_PAIR_DEFER_MAX_CHECKS` (20) the ceiling; both are clamped to a positive
-integer with a warning, since a zero or non-numeric value would switch off the
-very bound it was set to tune. Whichever trigger gets there first claims the
-record, so a deferral is adjudicated once even when the timer and an idle
-transition arrive together. `pair-resume` on a loop that stuck *at the cap* requires a higher
+`APEX_PAIR_DEFER_MAX_CHECKS` (20) the ceiling, and
+`APEX_PAIR_DEFER_IDLE_TICKS` (10) how many 0.2s frames of stillness count as
+quiet. All three are clamped to a positive integer with a warning, since a zero
+or non-numeric value would switch off the very bound it was set to tune. The
+whole adjudication runs under one lock, so a deferral is decided once even when
+the timer and an idle transition arrive together; the trigger that loses skips
+its turn rather than relaying underneath the one that is deciding, and the
+record stays in state until a terminal decision is written, so a hook process
+killed mid-decision leaves the deferral for the next trigger. `pair-resume` on a loop that stuck *at the cap* requires a higher
 `--max-rounds`: resuming at `round == max` would burn a full review turn and
 re-escalate on the reviewer's first finding. Resuming also clears the reviewer's
 last verdict, so a stale one cannot pass for the resumed round's. The terminal
