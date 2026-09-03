@@ -558,7 +558,10 @@ relaying underneath the one that is deciding, and the record stays in state
 until a terminal decision is written, so a hook process killed mid-decision
 leaves the deferral for the next trigger. The sample is also clamped to stay
 inside `APEX_LOCK_WAIT`, since a sample longer than the wait would make that
-contention the rule rather than the exception. `pair-resume` on a loop that stuck *at the cap* requires a higher
+contention the rule rather than the exception. Hand-backs are bounded too
+(`APEX_SETTLE_LOCK_RETRIES`, 5): past that the transition is spent and a
+`pair-defer-lock-wedged` event names the fault, because a lock nobody releases
+is not a busy pair and should not read as a loop that went quiet. `pair-resume` on a loop that stuck *at the cap* requires a higher
 `--max-rounds`: resuming at `round == max` would burn a full review turn and
 re-escalate on the reviewer's first finding. Resuming also clears the reviewer's
 last verdict, so a stale one cannot pass for the resumed round's. The terminal

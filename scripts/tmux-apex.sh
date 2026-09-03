@@ -1980,6 +1980,14 @@ _pair_rollback() {
 APEX_PAIR_DEFER_SECS=${APEX_PAIR_DEFER_SECS:-30}
 APEX_PAIR_DEFER_MAX_CHECKS=${APEX_PAIR_DEFER_MAX_CHECKS:-20}
 APEX_PAIR_DEFER_IDLE_TICKS=${APEX_PAIR_DEFER_IDLE_TICKS:-10}
+# How many times a transition may be handed back because another trigger held
+# the decision. The chain does terminate on its own in the cases contention
+# actually creates — a clamped section, a killed holder whose flock the kernel
+# drops, a member that takes another turn and fails the seq guard — but a lock
+# held by a process that is alive and wedged has none of those, and this file
+# argues the case for a bound at length. The deferral got one; the retry that
+# rides it should too, and running out should say so rather than go quiet.
+APEX_SETTLE_LOCK_RETRIES=${APEX_SETTLE_LOCK_RETRIES:-5}
 
 # _pair_defer_knobs — clamp the three knobs that bound the deferral, into
 # _PAIR_DEFER_SECS, _PAIR_DEFER_MAX and _PAIR_DEFER_TICKS.
@@ -2085,11 +2093,11 @@ _pair_defer_arm() {
 # tmux server the way _record_status defers _settle, so nothing here has to
 # outlive a hook process or hold a sleeping watcher open.
 _pair_defer_schedule() {
-	local manager="$1" member="$2"
+	local manager="$1" member="$2" attempt="${3:-0}"
 	local _PAIR_DEFER_SECS _PAIR_DEFER_MAX _PAIR_DEFER_TICKS
 	_pair_defer_knobs
 	tmux run-shell -b -d "$_PAIR_DEFER_SECS" \
-		"${SELF} _pair-defer-check ${(q)member} ${(q)manager}" 2>/dev/null || true
+		"${SELF} _pair-defer-check ${(q)member} ${(q)manager} ${attempt}" 2>/dev/null || true
 }
 
 # _pair_defer_clear <manager> <member> — drop the record from every half.
@@ -2304,14 +2312,28 @@ _pair_defer_adjudicate() {
 # `_settle` on either half's idle transition.
 _cmd_pair_defer_check() {
 	local member="$1" manager="$2"
+	local -i attempt=${3:-0}
 	[[ -n $member && -n $manager ]] || return 0
 	APEX_SESSION="$manager"
 	[[ -f $(apex_member_file "$manager" "$member") ]] || return 0
 	local rc=0
 	_pair_defer_settle "$manager" "$member" || rc=$?
 	# Contended: the timer chain is one of the two triggers, so returning here
-	# would end it and leave the deferral riding transitions alone. Re-arm it.
-	if (( rc == 3 )); then _pair_defer_schedule "$manager" "$member"; fi
+	# would end it and leave the deferral riding transitions alone. Re-arm it,
+	# under the same bound as _cmd_settle's hand-back and for the same reason —
+	# these attempts observed nothing, so pair_defer_checks deliberately does
+	# not count them and cannot serve as the bound. A re-check that gets the
+	# lock re-arms with the count reset, since that chain is bounded by
+	# APEX_PAIR_DEFER_MAX_CHECKS instead.
+	if (( rc == 3 )); then
+		(( attempt += 1 ))
+		if (( attempt > APEX_SETTLE_LOCK_RETRIES )); then
+			apex_event "$manager" "$(jq -nc --arg s "$member" --argjson n "$attempt" \
+				'{event:"pair-defer-lock-wedged", session:$s, attempts:$n}')" 2>/dev/null
+		else
+			_pair_defer_schedule "$manager" "$member" "$attempt"
+		fi
+	fi
 	return 0
 }
 
@@ -2932,6 +2954,7 @@ _cmd_event() {
 # attempted to record.
 _cmd_settle() {
 	local session="$1" manager="$2" seq="$3"
+	local -i attempt=${4:-0}
 	APEX_SESSION="$manager"
 	[[ $(apex_member_get "$manager" "$session" seq) == "$seq" ]] || return 0
 	[[ $(apex_member_get "$manager" "$session" settled_seq) == "$seq" ]] && return 0
@@ -2955,9 +2978,18 @@ _cmd_settle() {
 		# nothing else re-derives it — and the loop would sit still waiting on a
 		# partner it never relayed to. The cost is one extra idle status event
 		# per retry, which is the honest record of what happened.
+		(( attempt += 1 ))
+		if (( attempt > APEX_SETTLE_LOCK_RETRIES )); then
+			# Out of hand-backs. Say so as its own event: a lock nobody ever
+			# releases is a different fault from a busy pair, and it should be
+			# legible as itself rather than as a loop that went quiet.
+			apex_event "$manager" "$(jq -nc --arg s "$session" --argjson n "$attempt" \
+				'{event:"pair-defer-lock-wedged", session:$s, attempts:$n}')" 2>/dev/null
+			return 0
+		fi
 		apex_member_merge "$manager" "$session" '{"settled_seq":""}'
 		tmux run-shell -b -d "$APEX_QUIET_SECS" \
-			"${SELF} _settle ${(q)session} ${(q)manager} ${seq}" 2>/dev/null || true
+			"${SELF} _settle ${(q)session} ${(q)manager} ${seq} ${attempt}" 2>/dev/null || true
 		return 0
 	fi
 	if (( drc )); then return 0; fi

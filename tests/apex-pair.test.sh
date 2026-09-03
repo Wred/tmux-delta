@@ -795,12 +795,14 @@ eq "the lockdir fallback contends the same way" "$WORKER" \
 eq "and still does not advance the turn" worker "$(mget "$WORKER" pair_turn)"
 rmdir "$DEFER_LOCK.d"
 unset APEX_HAVE_FLOCK APEX_LOCK_WAIT
-# Uncontended, the same trigger decides — the record survived the skip, which
-# is the durability the lock-held-throughout shape buys: the decision writes to
-# state, so a killed adjudicator leaves the deferral for the next trigger
-# instead of taking it with it.
-apex _pair-defer-check "$REVIEWER" "$MGR" >/dev/null
-eq "once the lock is free the deferral is decided" stuck \
+# Now let the re-armed callback actually fire, with the seq the contended one
+# handed back. Asserting settled_seq alone shows the seq was returned but not
+# that anything comes of it — and if the hand-back stopped clearing settled_seq,
+# the retry would hit the dedupe guard and do nothing, which is a loop that sits
+# still while every field still looks right.
+SEQ=$(mget "$WORKER" seq)
+apex _settle "$WORKER" "$MGR" "$SEQ" >/dev/null
+eq "the re-armed transition adjudicates the deferral" stuck \
 	"$(mget "$REVIEWER" pair_state)"
 eq "and the round rolls back" 1 "$(mget "$WORKER" pair_round)"
 # And the decision is single-shot after the fact too: the record is gone from
@@ -811,6 +813,38 @@ eq "a later trigger finds nothing to adjudicate" 1 \
 	"$(mget "$WORKER" pair_round)"
 eq "and does not re-escalate" 1 \
 	"$(ev_count pair-relay-deferred-armed)"
+
+# The hand-back needs its own floor, by the argument this file makes for the
+# deferral itself. The chain does end on its own in the cases contention
+# actually creates — a clamped section, a killed holder whose flock the kernel
+# drops, a member taking another turn — but a lock held by a live wedged process
+# has none of those, and pair_defer_checks cannot serve as the bound because a
+# contended trigger observed nothing and deliberately does not count.
+print "\nhanding a transition back is bounded"
+reset --max=3
+verdict --findings 2 >/dev/null
+export STUB_PANE_TEXT='[apex from:apex-pair] PAIRED REVIEW'
+export STUB_PANE_NO_DRAIN=1
+export STUB_PANE_BUSY=1
+export APEX_SEND_SETTLE_TICKS=6
+settle "$REVIEWER" >/dev/null
+unset APEX_SEND_SETTLE_TICKS STUB_PANE_BUSY
+DEFER_LOCK="$XDG_CACHE_HOME/tmux-delta/apex/$MGR/.pair-defer-${REVIEWER//[^A-Za-z0-9_-]/_}.lock"
+export APEX_HAVE_FLOCK=1 APEX_LOCK_WAIT=1 APEX_SETTLE_LOCK_RETRIES=1
+mkdir -p "$DEFER_LOCK.d"
+SEQ=$(( $(mget "$WORKER" seq) + 1 ))
+jq -c --argjson s "$SEQ" '.seq = $s' "$MEMBERS/$WORKER.json" > "$TMPROOT/s" \
+	&& mv "$TMPROOT/s" "$MEMBERS/$WORKER.json"
+apex _settle "$WORKER" "$MGR" "$SEQ" 1 >/dev/null
+rmdir "$DEFER_LOCK.d"
+unset APEX_HAVE_FLOCK APEX_LOCK_WAIT APEX_SETTLE_LOCK_RETRIES
+unset STUB_PANE_TEXT STUB_PANE_NO_DRAIN
+contains "past the bound the wedged lock is named as itself" \
+	'"event":"pair-defer-lock-wedged"' "$(ev pair-defer-lock-wedged)"
+eq "and the transition is spent rather than handed back again" "$SEQ" \
+	"$(mget "$WORKER" settled_seq)"
+eq "the deferral is left for a human to read, not silently dropped" "$WORKER" \
+	"$(mget "$REVIEWER" pair_defer_target)"
 
 # The other reading, and the only one that means undelivered: our text in the
 # box and the pane not repainting a single cell. Nobody took it. This is the
