@@ -62,10 +62,14 @@ eq "--dangerously-skip-permissions argv"    0 "$(cls '--dangerously-skip-permiss
 eq "argv --permission-mode bypass"          0 "$(cls '--permission-mode bypassPermissions')"
 eq "argv --permission-mode acceptEdits"     1 "$(cls '--permission-mode acceptEdits')"
 eq "argv with no permission-mode: unknown"  2 "$(cls '--verbose --add-dir /tmp')"
+eq "argv --permission-mode=X (equals form)" 0 "$(cls '--permission-mode=bypassPermissions')"
+eq "a claude-only bypass flag on codex"     2 "$(cls '--dangerously-skip-permissions' codex)"
 eq "an unrecognised bare token: unknown"    2 "$(cls someFutureMode)"
 
 print -- "_perm_unattended (non-claude agents)"
 eq "codex --ask-for-approval never"         0 "$(cls '--sandbox workspace-write --ask-for-approval never' codex)"
+eq "codex bypass flag is codex's, not global" 0 "$(cls '--dangerously-bypass-approvals-and-sandbox' codex)"
+eq "the same codex flag on opencode"        2 "$(cls '--dangerously-bypass-approvals-and-sandbox' opencode)"
 eq "codex --ask-for-approval on-request prompts" 1 "$(cls '--ask-for-approval on-request' codex)"
 eq "opencode --auto runs unattended"        0 "$(cls '--auto' opencode)"
 eq "codex bypass flag runs unattended"      0 "$(cls '--dangerously-bypass-approvals-and-sandbox' codex)"
@@ -97,6 +101,17 @@ out=$(run autonomous acceptEdits claude '')
 eq       "raw --agent-flags acceptEdits is refused too" 1 "${out%%$'\n'*}"
 contains "attributes it to the flag, not a profile" "--agent-flags acceptEdits" "$out"
 
+# Both knobs at once: an explicit --agent-flags wins the profile merge
+# field-by-field, so the refusal must name the flag, not the profile the value
+# did not come from. `_cmd_spawn` signals that by passing an empty 4th argument.
+out=$(run autonomous acceptEdits claude '')
+contains "profile+flag together blames the flag" "from --agent-flags acceptEdits" "$out"
+if [[ $out == *"profile '"* ]]; then
+	bad "profile+flag together does not blame the profile" "$out"
+else
+	ok "profile+flag together does not blame the profile"
+fi
+
 out=$(run autonomous '' claude '')
 eq       "the bare default (no flags) is refused too" 1 "${out%%$'\n'*}"
 contains "says whose default it is" "<agent default>" "$out"
@@ -120,6 +135,98 @@ print -- "_spawn_check_mode: mode itself is validated"
 out=$(run bogus bypassPermissions claude '')
 eq       "an unknown --mode is refused" 1 "${out%%$'\n'*}"
 contains "listing the valid values" "'autonomous' or 'interactive'" "$out"
+
+# ─── the wiring: _cmd_spawn itself ───────────────────────────────────
+#
+# The two blocks above test the decision in isolation, which leaves the thing
+# that actually matters unverified: *where* the check sits in `_cmd_spawn`. It
+# has to run after --profile has been merged into `perm` and before anything is
+# created, and it has to be handed the profile name only when the profile is
+# what supplied `perm`. Moving the call one block earlier keeps every assertion
+# above green while breaking both properties, so drive the real `_cmd_spawn`
+# here — with a stub picker standing in for worktree/session creation, since
+# what is under test is the decision, not the spawn.
+
+print -- "_cmd_spawn wiring"
+eval "$(sed -n '/^_cmd_spawn()/,/^}/p' "$SCRIPTS/tmux-apex.sh")"
+(( ${+functions[_cmd_spawn]} )) || {
+	print -u2 "apex-spawn-mode.test.sh: could not extract _cmd_spawn from tmux-apex.sh"
+	exit 1
+}
+eval "$(sed -n '/^_need_val()/,/^}/p' "$SCRIPTS/tmux-apex.sh")"
+
+TMPROOT=$(mktemp -d "${TMPDIR:-/tmp}/apex-spawn-mode-test.XXXXXX")
+trap 'rm -rf "$TMPROOT"' EXIT
+
+# Everything past the guard is stubbed: reaching the stub picker at all is the
+# assertion that the guard let the spawn through.
+mkdir -p "$TMPROOT/scripts"
+# The picker's stdout is consumed by _cmd_spawn, so the stub records its argv
+# on the side: the recording is both "the guard let this through" and "these
+# are the values the new session would have been given".
+cat > "$TMPROOT/scripts/tmux-picker.sh" <<STUB
+#!/usr/bin/env zsh
+print -r -- "\$@" > "$TMPROOT/picker-args"
+printf 'apex-session\tstub-session\t/stub/worktree\n'
+STUB
+chmod +x "$TMPROOT/scripts/tmux-picker.sh"
+SCRIPTS_REAL="$SCRIPTS"
+_require_manager() { print -r -- "stub-manager" }
+apex_event() { : }
+
+# The repo's own profiles, not this machine's: a user apex-profiles.json can
+# redefine `hard`, and these assertions are about the shipped tiers.
+source "$SCRIPTS/lib/apex-profiles.sh"
+APEX_PROFILES_USER_FILE="$TMPROOT/no-such-user-profiles.json"
+
+# Not a command substitution: `_cmd_spawn` dies by `exit`, and the exit status
+# has to survive to the assertion.
+spawn_out() {  # spawn_out <args...> -> "$SPAWN_OUT", $SPAWN_RC
+	SPAWN_RC=0
+	rm -f "$TMPROOT/picker-args"
+	( SCRIPTS="$TMPROOT/scripts"; _cmd_spawn "$@" ) > "$TMPROOT/spawn.out" 2>&1 || SPAWN_RC=$?
+	SPAWN_OUT=$(< "$TMPROOT/spawn.out")
+	PICKER_ARGS=""
+	[[ -f $TMPROOT/picker-args ]] && PICKER_ARGS=$(< "$TMPROOT/picker-args")
+}
+
+spawn_out --issue 42 --profile easy; out="$SPAWN_OUT"; rc=$SPAWN_RC
+eq       "an unattended profile spawns"          0 "$rc"
+contains "reaching the picker"      "--spawn-issue 42" "$PICKER_ARGS"
+contains "and carrying the profile's flags" "CODING_AGENT_PERMISSION_MODE=bypassPermissions" "$PICKER_ARGS"
+contains "and the autonomous mode"  "autonomous" "$PICKER_ARGS"
+contains "reporting the mode it resolved" "mode     : autonomous" "$out"
+
+spawn_out --issue 42 --profile hard; out="$SPAWN_OUT"; rc=$SPAWN_RC
+eq       "a supervision-only profile is refused" 1 "$rc"
+contains "before anything is created"       "conflicts with permission mode 'acceptEdits'" "$out"
+contains "naming the profile as the source" "profile 'hard'" "$out"
+if [[ -n $PICKER_ARGS ]]; then
+	bad "a refused spawn never reaches the picker" "$out"
+else
+	ok "a refused spawn never reaches the picker"
+fi
+
+# The merge is field-by-field, so this is a *valid* spawn: the explicit flag
+# overrides `hard`'s acceptEdits. If the check ran before the merge it would
+# see an empty perm and refuse this.
+spawn_out --issue 42 --profile hard --agent-flags bypassPermissions; out="$SPAWN_OUT"; rc=$SPAWN_RC
+eq       "an explicit flag rescues a hard spawn" 0 "$rc"
+contains "and it is the flag that is passed on" "CODING_AGENT_PERMISSION_MODE=bypassPermissions" "$PICKER_ARGS"
+
+# And the mirror image: an explicit flag can also *break* an otherwise fine
+# profile, and then the refusal must blame the flag.
+spawn_out --issue 42 --profile easy --agent-flags acceptEdits; out="$SPAWN_OUT"; rc=$SPAWN_RC
+eq       "an explicit flag can break a good profile" 1 "$rc"
+contains "blaming the flag, not the profile" "from --agent-flags acceptEdits" "$out"
+
+spawn_out --issue 42 --profile hard --mode interactive; out="$SPAWN_OUT"; rc=$SPAWN_RC
+eq       "interactive spawns a supervised profile"  0 "$rc"
+contains "still reaching the picker" "--spawn-issue 42" "$PICKER_ARGS"
+contains "with interactive mode"    "interactive" "$PICKER_ARGS"
+contains "and reporting the mode"    "mode     : interactive" "$out"
+
+SCRIPTS="$SCRIPTS_REAL"
 
 # ─── the shipped profiles must be usable as documented ───────────────
 #

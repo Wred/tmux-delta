@@ -1271,19 +1271,17 @@ _cmd_relink() {
 _perm_unattended() {
 	local perm="$1" agent="${2:-claude}"
 
-	# Any agent: an explicit "skip every gate" flag in verbatim argv.
-	case " $perm " in
-		*" --dangerously-skip-permissions "*|\
-		*" --dangerously-bypass-approvals-and-sandbox "*|\
-		*" --yolo "*) return 0 ;;
-	esac
-
+	# Flags are classified per agent, never universally: a marker one agent
+	# treats as "skip every gate" is an unknown argument to another, and the
+	# agent that rejects it falls back to prompting — the very stall this guard
+	# exists to prevent. Only flags this repo documents (README's agent-flags
+	# table) are classified at all; everything else is "unknown", not a guess.
 	if [[ ${agent:t} == claude ]]; then
+		[[ " $perm " == *" --dangerously-skip-permissions "* ]] && return 0
 		if [[ $perm == -* ]]; then
 			# argv form: only a --permission-mode token is classifiable.
-			local tok="${${perm##*--permission-mode[ =]}%% *}"
-			[[ $tok == "$perm" ]] && return 2
-			perm="$tok"
+			[[ $perm != *--permission-mode[\ =]* ]] && return 2
+			perm="${${perm##*--permission-mode[ =]}%% *}"
 		fi
 		case "$perm" in
 			bypassPermissions)              return 0 ;;
@@ -1298,6 +1296,7 @@ _perm_unattended() {
 	# anything else is "unknown" rather than a guess.
 	case "${agent:t}" in
 		codex)
+			[[ " $perm " == *" --dangerously-bypass-approvals-and-sandbox "* ]] && return 0
 			[[ " $perm " == *" --ask-for-approval never "* ]] && return 0
 			[[ " $perm " == *" -a never "* ]] && return 0
 			# on-request/untrusted are documented as asking a human.
@@ -1308,9 +1307,13 @@ _perm_unattended() {
 	return 2
 }
 
-# _spawn_check_mode <mode> <perm> <agent> <profile> — refuse or flag the
-# contradiction. Prints a warning for the unknown case; dies for the known-bad
-# one. Callers pass the *resolved* values, i.e. after --profile has been merged.
+# _spawn_check_mode <mode> <perm> <agent> <perm_from_profile> — refuse or flag
+# the contradiction. Prints a warning for the unknown case; dies for the
+# known-bad one. Callers pass the *resolved* values, i.e. after --profile has
+# been merged, plus the profile name only when the profile is where `perm`
+# actually came from: an explicit --agent-flags wins that merge field-by-field,
+# so attributing its value to the named profile would send the caller to edit
+# the wrong knob.
 _spawn_check_mode() {
 	local mode="$1" perm="$2" agent="${3:-claude}" profile="$4"
 	local shown="${perm:-<agent default>}"
@@ -1342,7 +1345,7 @@ _spawn_check_mode() {
 
 _cmd_spawn() {
 	local issue="" review_pr="" role="worker" model="" perm="" mode="autonomous"
-	local switch="no-switch" agent="" profile=""
+	local switch="no-switch" agent="" profile="" perm_profile=""
 
 	while (( $# )); do
 		case "$1" in
@@ -1381,7 +1384,10 @@ _cmd_spawn() {
 		esac
 		[[ -z $agent ]] && agent=$(jq -r '.agent // empty' <<< "$pjson")
 		[[ -z $model ]] && model=$(jq -r '.model // empty' <<< "$pjson")
-		[[ -z $perm  ]] && perm=$(jq -r '.agent_flags // empty' <<< "$pjson")
+		# perm_profile records whether the profile is what supplied `perm`, so
+		# the mode/permission-mode refusal below can name the knob the caller
+		# would actually have to change.
+		[[ -z $perm  ]] && { perm=$(jq -r '.agent_flags // empty' <<< "$pjson"); perm_profile="$profile" }
 	fi
 
 	# Only the claude adapter accepts a bare token here (it prepends
@@ -1392,7 +1398,7 @@ _cmd_spawn() {
 		_die "spawn: --agent-flags for '${agent}' must be agent-native argv (e.g. --approve, --full-auto), not the claude token '${perm}'"
 	fi
 
-	_spawn_check_mode "$mode" "$perm" "${agent:-claude}" "$profile"
+	_spawn_check_mode "$mode" "$perm" "${agent:-claude}" "$perm_profile"
 
 	local manager
 	manager=$(_require_manager)

@@ -319,7 +319,7 @@ back to the claude adapter. Adding one is a single file defining
 | model | `--model` | `--model` (accepts `provider/id`, `:thinking`) | `--model` | `--model` (wants `provider/model`) |
 | prompt | positional | positional | positional | `--prompt` |
 | system prompt | `--append-system-prompt` | `--append-system-prompt` | *none* — prepended to the prompt | *none* — injected as `instructions` via `OPENCODE_CONFIG_CONTENT` |
-| agent flags | `--permission-mode <token>`, or verbatim if it starts with `-` | verbatim (`--approve`, `--tools …`) | verbatim (`--full-auto`, `--sandbox …`) | verbatim (`--auto`) |
+| agent flags | `--permission-mode <token>`, or verbatim if it starts with `-` | verbatim (`--approve`, `--tools …`) | verbatim (`--sandbox …`, `--ask-for-approval …`) | verbatim (`--auto`) |
 | resume | `--continue` | `--continue` | `resume --last` | `--continue` |
 
 Resume is attempted first and falls back to a fresh session when there is
@@ -828,9 +828,20 @@ The check runs on the *resolved* values, so it covers a hand-rolled
 flag string cannot reintroduce the combination. `--mode interactive` is never
 constrained: prompts are the point there.
 
-Flags this repo does not document the approval behaviour of — most non-claude
-argv — cannot be classified either way. Those spawns proceed with a warning on
-stderr rather than being refused or silently accepted.
+Flags are classified per agent, never universally — a marker one agent reads as
+"skip every gate" is an unknown argument to another, and the agent that rejects
+it falls back to prompting. Only the flags whose approval behaviour this repo
+documents are classified at all:
+
+| Agent | Runs unattended | Prompts |
+|---|---|---|
+| claude | `bypassPermissions`, `--dangerously-skip-permissions` | `default`, `acceptEdits`, `plan`, and no flags at all |
+| codex | `--ask-for-approval never`, `--dangerously-bypass-approvals-and-sandbox` | any other `--ask-for-approval` |
+| opencode | `--auto` | — |
+
+Anything else — including every `pi` flag and any future token — is classified
+neither way. Those spawns proceed with a warning on stderr rather than being
+refused or silently accepted, since refusing would be a guess.
 
 **A permission mode that can run unattended reduces blocking; it does not
 eliminate it.** Claude Code's own safety classifier gates dangerous operations
