@@ -2577,6 +2577,42 @@ _reap_risk() {
 	return 0
 }
 
+# _reap_live_pr_state <facts> — re-reads $facts with pr_state replaced by a
+# live `gh pr view`, or with .pr_state_unknown:true if that call fails.
+#
+# `_member_facts` reads pr_state from the on-disk PR cache, which nothing
+# invalidates when a PR merges (issue #50): the same reap run that should be
+# catching a just-merged PR sees whatever state was cached before the merge,
+# and reports "Nothing to reap" for the member whose job this run exists to
+# do. `reap` already pays for a `ls-remote` and a `gh pr view` per candidate
+# in `_reap_risk`, so one more `gh pr view` for a member with a known PR
+# number is the same budget, not a new one — reap is explicit,
+# low-frequency, and destructive.
+#
+# A failed call must not fall back to the stale cached state: that state is
+# exactly what caused the bug, so silently trusting it again would just move
+# the failure mode from "network hiccup" to "network hiccup, indefinitely".
+# Marking it unknown lets the caller hold the member and say so, rather than
+# quietly treating a member that might already be mergeable as not-yet-ready.
+_reap_live_pr_state() {
+	local facts="$1" wt pr_number live
+	wt=$(printf '%s' "$facts" | jq -r '.worktree')
+	pr_number=$(printf '%s' "$facts" | jq -r '.pr_number // ""')
+	if [[ -z $pr_number ]]; then
+		print -r -- "$facts"
+		return 0
+	fi
+	live=""
+	if [[ -n $wt && -d $wt ]]; then
+		live=$(cd "$wt" && gh pr view "$pr_number" --json state -q .state 2>/dev/null) || live=""
+	fi
+	if [[ -n $live ]]; then
+		printf '%s' "$facts" | jq --arg s "$live" '.pr_state = $s'
+	else
+		printf '%s' "$facts" | jq '.pr_state_unknown = true'
+	fi
+}
+
 # _reap_cleanup <session> <worktree> — tear down a reaped member's worktree and
 # session. Prints why and returns non-zero if the worktree is still there
 # afterwards, so the caller can keep the member record rather than orphan it.
@@ -2618,13 +2654,15 @@ _cmd_reap() {
 	manager=$(_require_manager)
 	APEX_SESSION="$manager"
 
-	local -a done_members=() held=()
-	local s facts alive pr_state risk
+	local -a done_members=() held=() unknown=()
+	local s facts alive pr_state pr_unknown risk
 	for s in ${(f)"$(apex_members "$manager")"}; do
 		[[ -z $s ]] && continue
 		facts=$(_member_facts "$s")
+		facts=$(_reap_live_pr_state "$facts")
 		alive=$(printf '%s' "$facts" | jq -r '.alive')
 		pr_state=$(printf '%s' "$facts" | jq -r '.pr_state')
+		pr_unknown=$(printf '%s' "$facts" | jq -r '.pr_state_unknown // false')
 		if [[ $alive == false || $pr_state == MERGED || $pr_state == CLOSED ]]; then
 			risk=$(_reap_risk "$facts")
 			if [[ -n $risk ]] && ! $force; then
@@ -2634,6 +2672,8 @@ _cmd_reap() {
 				done_members+=("$s")
 				print "  $s  — $(_facts_line "$facts")"
 			fi
+		elif [[ $alive == true && $pr_unknown == true ]]; then
+			unknown+=("$s")
 		fi
 	done
 
@@ -2646,9 +2686,17 @@ _cmd_reap() {
 		print "reap them anyway."
 	fi
 
+	if (( ${#unknown} )); then
+		print "\n${#unknown} member(s) skipped: could not reach \`gh\` to confirm PR"
+		print "state for ${(j:, :)unknown} — not the same as confirmed still open,"
+		print "so re-run reap once \`gh\` is reachable rather than trusting this pass."
+	fi
+
 	if (( ${#done_members} == 0 )); then
 		if (( ${#held} )); then
 			print "\nNothing reaped."
+		elif (( ${#unknown} )); then
+			print "\nCould not determine PR state for ${#unknown} member(s); nothing else to reap."
 		else
 			print "Nothing to reap."
 		fi
