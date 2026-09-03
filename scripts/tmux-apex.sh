@@ -1935,7 +1935,11 @@ _pair_advance() {
 		# fail closed on the same outage if it matters.
 		local wt baseline
 		wt=$(apex_member_get "$manager" "$member" worktree)
-		baseline=$(_pair_comment_count "$wt" "$pr" 2>/dev/null) || baseline=""
+		if [[ -n $wt && -d $wt ]]; then
+			baseline=$(_pair_comment_count "$wt" "$pr" 2>/dev/null) || baseline=""
+		else
+			baseline=""
+		fi
 
 		apex_member_merge "$manager" "$member" '{"pair_turn":"reviewer"}'
 		if [[ -n $baseline ]]; then
@@ -1992,16 +1996,32 @@ _cmd_link() {
 	fi
 	[[ -n $pr ]] || _die "link: could not determine the PR number — pass --pr N"
 
+	# Stamp round 1's baseline too — otherwise a PR that already has
+	# comments on it (e.g. from a human, or a prior unrelated pairing)
+	# satisfies the verdict guard on round 1 without the reviewer having
+	# published anything, which is issue #47's failure mode relocated
+	# rather than fixed. Best-effort like the round-2+ stamp in
+	# _pair_advance: if GitHub cannot be queried right now, fall back to
+	# an empty baseline (0) rather than block the link.
+	local rwt rbaseline
+	rwt=$(apex_member_get "$manager" "$reviewer" worktree)
+	if [[ -n $rwt && -d $rwt ]]; then
+		rbaseline=$(_pair_comment_count "$rwt" "$pr" 2>/dev/null) || rbaseline=0
+	else
+		rbaseline=0
+	fi
+
 	apex_member_merge "$manager" "$worker" "$(jq -nc \
 		--arg pair "$reviewer" --arg pr "$pr" --argjson max "$max" \
 		'{pair:$pair, pair_role:"worker", pair_pr:$pr, pair_round:1,
 		  pair_max_rounds:$max, pair_turn:"reviewer", pair_state:"active",
 		  pair_message:""}')"
 	apex_member_merge "$manager" "$reviewer" "$(jq -nc \
-		--arg pair "$worker" --arg pr "$pr" --argjson max "$max" \
+		--arg pair "$worker" --arg pr "$pr" --argjson max "$max" --argjson b "$rbaseline" \
 		'{pair:$pair, pair_role:"reviewer", pair_pr:$pr, pair_round:1,
 		  pair_max_rounds:$max, pair_turn:"reviewer", pair_state:"active",
-		  pair_message:"", verdict_round:"", verdict_findings:"", verdict_note:""}')"
+		  pair_message:"", verdict_round:"", verdict_findings:"", verdict_note:"",
+		  pair_comment_baseline:$b}')"
 
 	apex_event "$manager" "$(jq -nc --arg w "$worker" --arg r "$reviewer" \
 		--arg pr "$pr" --argjson max "$max" \
@@ -2135,14 +2155,17 @@ _cmd_pair_resume() {
 # comments,reviews` alone misses inline comments entirely: posting one
 # creates a COMMENTED review with an *empty* body, which the reviews filter
 # drops. Prints the summed count and returns 0, or prints nothing and
-# returns 1 if both queries failed (so a real GitHub outage still reads as
-# "could not confirm" rather than silently as zero).
+# returns 1 if either query failed. Both must succeed: a sum from one
+# endpoint is not comparable to a sum from both, so a partial failure
+# comparing against — or later being compared to — a baseline taken with
+# the other endpoint up would silently mean two different things by the
+# same number, false-blocking or (worse) false-passing a stale round.
 _pair_comment_count() {
 	local wt="$1" pr="$2" c1 c2 rc1=0 rc2=0
 	c1=$(cd "$wt" && gh pr view "$pr" --json comments,reviews \
 		--jq '(.comments | length) + ([.reviews[] | select(.body != "")] | length)' 2>/dev/null) || rc1=$?
 	c2=$(cd "$wt" && gh api "repos/{owner}/{repo}/pulls/${pr}/comments" --jq 'length' 2>/dev/null) || rc2=$?
-	(( rc1 == 0 || rc2 == 0 )) || return 1
+	(( rc1 == 0 && rc2 == 0 )) || return 1
 	print -r -- $(( ${c1:-0} + ${c2:-0} ))
 }
 

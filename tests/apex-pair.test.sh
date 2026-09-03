@@ -397,7 +397,7 @@ out=$(apex pending)
 contains "stuck ping explains why"   "without recording a verdict" "$out"
 contains "stuck ping offers a resume" "pair-resume"                "$out"
 eq "loop is marked stuck"  stuck "$(mget "$WORKER" pair_state)"
-eq "the PR is left as a draft" "" "$(cat "$STUB_GH")"
+lacks "the PR is left as a draft" "pr ready" "$(cat "$STUB_GH")"
 lacks "the worker is not asked to fix anything" "finding(s)" "$(sent_to %1)"
 
 # ── loop cap ─────────────────────────────────────────────────────────
@@ -840,6 +840,7 @@ contains "the reviewer sees it went through" "recorded for round" "$out"
 unset STUB_GH_COMMENTS
 
 print "\n...and a real published comment satisfies the guard"
+export STUB_GH_COMMENTS=0
 reset
 export STUB_GH_COMMENTS=1
 out=$(verdict --findings 3 2>&1)
@@ -877,18 +878,24 @@ unset STUB_GH_COMMENTS STUB_GH_INLINE
 # guard — each round needs its own evidence, or the same #47 failure mode
 # just resurfaces from round 2 onward.
 print "\n...and a round cannot coast on a prior round's comment"
+export STUB_GH_COMMENTS=0
 reset --max=3
 export STUB_GH_COMMENTS=1
 out=$(verdict --findings 1 2>&1)
 eq "round 1 verdict is recorded" 1 "$(mget "$REVIEWER" verdict_findings)"
 settle "$REVIEWER" >/dev/null   # relays to the worker, round -> 2
 settle "$WORKER" >/dev/null     # worker "pushes", reviewer re-invoked for round 2, baseline stamped at 1
+: > "$STUB_SENT"
 out=$(verdict --findings 1 2>&1)
 contains "round 2 with no new comment is refused" "no comments published since this round started" "$out"
-eq "round 2 verdict was not recorded" "" "$(mget "$REVIEWER" verdict_findings)"
+eq "round 2 verdict was not recorded" 1 "$(mget "$REVIEWER" verdict_round)"
+settle "$REVIEWER" >/dev/null
+eq "no findings are relayed on a refused verdict" "" "$(sent_to %1)"
+eq "the reviewer is escalated, not believed" stuck "$(mget "$REVIEWER" pair_state)"
 unset STUB_GH_COMMENTS
 
 print "\n...but a fresh comment in round 2 clears the new baseline"
+export STUB_GH_COMMENTS=0
 reset --max=3
 export STUB_GH_COMMENTS=1
 verdict --findings 1 >/dev/null
