@@ -800,6 +800,45 @@ in particular, model aliases and pricing drift over time and across
 providers, so re-verify them periodically rather than trusting this table
 indefinitely.
 
+### Autonomous mode and the permission mode must agree
+
+`spawn` carries two knobs that only make sense together: `--mode`
+(`autonomous`, the default, or `interactive`) and the permission mode /
+agent flags. `--mode autonomous` appends a system prompt telling the agent to
+work to completion without a human — commit, push, open a draft PR — while
+`acceptEdits` (and claude's bare default) pauses for approval on every shell
+command. That pair cannot work: the worker stalls on its first `git` call with
+nobody watching.
+
+Since it is created in `spawn`, it is refused in `spawn`. An autonomous spawn
+whose permission mode is known to prompt fails immediately, naming both values
+and where the permission mode came from:
+
+```
+$ tmux-apex.sh spawn --issue 42 --profile hard
+tmux-apex: spawn: --mode autonomous conflicts with permission mode 'acceptEdits'
+  (from profile 'hard' (agent_flags=acceptEdits)).
+  ...
+    --agent-flags bypassPermissions   run it unattended (overrides the profile)
+    --mode interactive                keep the approval prompts and watch it yourself
+```
+
+The check runs on the *resolved* values, so it covers a hand-rolled
+`--agent-flags`, a `--profile`, and any mix of the two — a new profile or a new
+flag string cannot reintroduce the combination. `--mode interactive` is never
+constrained: prompts are the point there.
+
+Flags this repo does not document the approval behaviour of — most non-claude
+argv — cannot be classified either way. Those spawns proceed with a warning on
+stderr rather than being refused or silently accepted.
+
+**A permission mode that can run unattended reduces blocking; it does not
+eliminate it.** Claude Code's own safety classifier gates dangerous operations
+regardless of permission mode, so even a `bypassPermissions` worker can sit on
+a modal prompt indefinitely (observed once here for nearly seven hours, on an
+`rm` against an unquoted glob — correctly blocked). Making a blocked worker
+*visible* instead of silent is a separate problem, tracked in issue #63.
+
 `--profile` only fills the `--agent`/`--model`/`--agent-flags` fields the
 `spawn` call didn't already set explicitly — pass any of those three
 alongside `--profile` to override just that field for one spawn, e.g.
