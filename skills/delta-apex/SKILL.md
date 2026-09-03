@@ -422,6 +422,14 @@ didn't type it and neither did the human — looking like:
 `status=idle` means the worker finished a turn and stayed quiet — usually done,
 sometimes stuck. `status=attention` means it is blocked right now.
 
+`commits_ahead` on that line may read `unknown(unpushed?)`, and in `status`
+the same field renders as `unpushed?`. That is not a bug and not a zero: a
+worker branch usually has no local remote-tracking ref, so the count is
+genuinely unknowable from the hook path, and reporting `0` there would say
+"fully pushed" about a branch that may never have been pushed at all (issue
+#57). Treat `unknown` as "go look" — `status` pays an `ls-remote` per member
+and will often turn it into a real number.
+
 You can check the same thing by hand at any time, e.g. if you want to look
 before the human sends you another message:
 

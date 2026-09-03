@@ -827,10 +827,28 @@ the worktree and deletes the branch, so a crashed member's uncommitted or
 unpushed work is gone for good — and `recover` cannot help afterwards, because it
 skips members whose worktree is missing. `reap` therefore holds back any member
 with uncommitted changes or commits no remote has, printing `HOLD:` and the
-reason instead of taking it; `--force` overrides that. The check asks
-`git rev-list --count HEAD --not --remotes` rather than reading `commits_ahead`,
-because a branch that was never pushed has no upstream and so reports zero
-commits ahead — exactly the member whose work is at stake.
+reason instead of taking it; `--force` overrides that. The check asks the remote
+directly (`git ls-remote origin refs/heads/<branch>`, falling back to the local
+remote-tracking view when the remote cannot be reached) rather than reading
+`commits_ahead`, because a worker branch often has no local remote-tracking ref
+under a narrow `remote.origin.fetch` — exactly the member whose work is at stake.
+
+For the same reason, `commits_ahead` in `status`, `status --json` and the manager
+ping lines is **nullable**. Where the count cannot be determined it is `null`,
+rendered as `unpushed?` in the table and `commits_ahead=unknown(unpushed?)` in a
+ping line. It is never 0 as a stand-in for "could not tell": 0 means fully
+pushed, and nothing else. Members with no branch at all — no worktree, or a
+worktree that is gone — omit the field entirely rather than claiming anything
+about pushing.
+
+`status` pays one `ls-remote` per member to turn as many unknowns as it can into
+real numbers; the per-hook path does not, so a ping line is likelier to say
+`unknown` than the table is. When `status` does ask, the remote's answer wins
+outright over a local `origin/<branch>` ref, which is only ever as fresh as the
+last fetch — preferring the cheap local number because it answered first is the
+same quiet-wrong-number failure by a different route. In particular, a stale
+`origin/<branch>` for the branch being measured is never allowed to cancel out
+that branch's own commits once the remote has said it has no such branch.
 
 `--force` genuinely takes a dirty worktree: `gwtrm`'s `-f` used to skip only the
 first confirmation and prompt again for uncommitted changes, which with no tty
