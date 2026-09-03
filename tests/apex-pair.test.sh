@@ -268,6 +268,11 @@ EOF
 chmod +x "$BIN/git"
 export PATH="$BIN:$PATH"
 
+# Own the temp dir, so the leak check at the end of the issue #48 section can
+# assert on an empty glob without racing a real apex process on the box.
+export TMPDIR="$TMPROOT/tmp"
+mkdir -p "$TMPDIR"
+
 export XDG_CACHE_HOME="$TMPROOT/cache"
 export STUB_OPTS="$TMPROOT/opts.tsv"
 export STUB_PANES="$TMPROOT/panes"
@@ -502,6 +507,20 @@ contains "and a silent remote falls open too" "Re-review" "$(sent_to %2)"
 eq "with the turn passed" reviewer "$(mget "$WORKER" pair_turn)"
 unset STUB_GIT_HANG APEX_PAIR_HEAD_TIMEOUT
 
+# A set-but-nonsense bound must not quietly disable the check it bounds. `0`
+# is the case that matters: it is the conventional spelling of "no timeout",
+# and unvalidated it made every probe report 124 and every turn fail open.
+print "\na nonsense bound falls back instead of disabling the check"
+reset
+export STUB_GIT_HEAD=deadbeefdeadbeefdeadbeefdeadbeefdeadbeef APEX_PAIR_HEAD_TIMEOUT=0
+verdict --findings 1 >/dev/null
+settle "$REVIEWER" >/dev/null
+: > "$STUB_SENT"
+settle "$WORKER" >/dev/null
+lacks "the no-push hold still holds" "Re-review" "$(sent_to %2)"
+contains "and the manager is still told" "PAIRED REVIEW WAITING" "$(apex pending)"
+unset STUB_GIT_HEAD APEX_PAIR_HEAD_TIMEOUT
+
 print "\nand so does a baseline that was never stamped"
 reset
 verdict --findings 1 >/dev/null
@@ -530,6 +549,11 @@ settle "$WORKER" >/dev/null
 lacks "and still-absent does not relay" "Re-review" "$(sent_to %2)"
 contains "the manager is told" "PAIRED REVIEW WAITING" "$(apex pending)"
 unset STUB_GIT_ABSENT
+
+# Every probe above created a temp file for git's stdout (see `_git_bounded`).
+# None of them may still be here.
+leaked=( $TMPDIR/tmux-apex-git.*(N) )
+eq "no probe leaked its stdout temp file" 0 "${#leaked}"
 
 # ── termination: no findings left ────────────────────────────────────
 print "\nempty verdict terminates the loop"

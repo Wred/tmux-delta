@@ -1813,7 +1813,28 @@ APEX_PAIR_MAX_ROUNDS=${APEX_PAIR_MAX_ROUNDS:-5}
 # Wall-clock bound, in seconds, on the one `ls-remote` the loop makes per
 # turn (see `_pair_pushed_head`). Overridable so the tests can exercise the
 # timeout path without waiting on it.
-APEX_PAIR_HEAD_TIMEOUT=${APEX_PAIR_HEAD_TIMEOUT:-5}
+#
+# Validated, because a set-but-nonsense value is the vacuous pass that
+# `_commits_ahead` argues against — the failing form of the check returning
+# the passing value. `0` is the conventional spelling of "no timeout" and
+# would do the exact opposite: `sleep 0` returns at once, so the watchdog
+# TERMs git immediately, every probe reports 124, and the whole issue #48
+# branch-moved check fails open on every turn while looking like it is
+# running. A non-numeric value fails the same way, via `sleep`'s own error.
+#
+# The upper bound is the same failure in the other direction: a "bound" past
+# the transport's own timeout never fires, so it silently is not a bound.
+# 300s is far beyond any honest `ls-remote`.
+#
+# And validated by falling back rather than by `_die`, because this is read
+# on the unattended settle path, where dying is a loop that has silently
+# stopped. A nonsense knob should cost the operator their setting, not the
+# feature. The warning is unconditional so it is at least visible from any
+# foreground command, but it is not fatal to any of them.
+if [[ ${APEX_PAIR_HEAD_TIMEOUT-} != <-> ]] || (( APEX_PAIR_HEAD_TIMEOUT < 1 || APEX_PAIR_HEAD_TIMEOUT > 300 )); then
+	[[ -n ${APEX_PAIR_HEAD_TIMEOUT-} ]] && print -u2 "tmux-apex: WARNING — ignoring APEX_PAIR_HEAD_TIMEOUT=${APEX_PAIR_HEAD_TIMEOUT} (want an integer 1-300 seconds); using 5"
+	APEX_PAIR_HEAD_TIMEOUT=5
+fi
 
 _pair_worker_msg() {
 	local pr="$1" round="$2" findings="$3" note="$4" override="$5"
@@ -2483,12 +2504,36 @@ _pair_finish() {
 # transport that accepts and then says nothing, the pipe form runs past a 2s
 # bound indefinitely while this form returns 124 at 2s.
 #
-# The watchdog's `sleep` may outlive its TERM as an orphan. Harmless: the
-# `kill` it would have gone on to run died with its parent.
+# Two processes are deliberately left running past the TERM, and both are
+# harmless rather than merely unnoticed:
+#
+#   - the transport helper. It is the whole reason stdout is a file, so of
+#     course it survives killing git; it goes on writing into a file that has
+#     already been unlinked and exits when its own timeout expires. It is not
+#     killed as a process group because there is no job control here, so the
+#     group is tmux-apex's own — a group TERM would take the caller with it.
+#   - the watchdog's `sleep`. It is orphaned by the TERM aimed at its parent,
+#     and the `kill` it would have gone on to run died with that parent.
+#
+# The trap owns the temp file on every path, including the one the body cannot
+# reach: an interrupt arriving mid-probe. Three things about its form, each
+# verified rather than assumed:
+#
+#   - EXIT, not INT/TERM/HUP, so signal disposition is left completely alone.
+#     Trapping the signals here would swallow them for the duration of a probe
+#     — and `watch` arms INT/TERM to clear its pidfile and exit, which must
+#     still happen. An EXIT trap runs during that unwinding anyway.
+#   - the path is expanded now, at trap-set time, not `'rm -f "$tmp"'`. The
+#     function's locals are already gone by the time an EXIT trap fires, so
+#     the deferred form quietly runs `rm -f ""` and leaks the file.
+#   - function-local (`localtraps`), so the caller's own EXIT trap survives,
+#     and the function's return value survives the trap.
 _git_bounded() {
 	local secs="$1"; shift
 	local tmp rc=0
 	tmp=$(mktemp "${TMPDIR:-/tmp}/tmux-apex-git.XXXXXX") || return 1
+	setopt localoptions localtraps
+	trap "rm -f ${(q)tmp}" EXIT
 	(
 		export GIT_TERMINAL_PROMPT=0
 		git "$@" >"$tmp" 2>/dev/null &
@@ -2504,7 +2549,6 @@ _git_bounded() {
 	# a caller can tell "the bound was hit" from "git answered, negatively".
 	(( rc == 143 )) && rc=124
 	(( rc == 0 )) && cat "$tmp"
-	rm -f "$tmp"
 	return $rc
 }
 
