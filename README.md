@@ -837,9 +837,16 @@ For the same reason, `commits_ahead` in `status`, `status --json` and the manage
 ping lines is **nullable**. Where the count cannot be determined it is `null`,
 rendered as `unpushed?` in the table and `commits_ahead=unknown(unpushed?)` in a
 ping line. It is never 0 as a stand-in for "could not tell": 0 means fully
-pushed, and nothing else. `status` pays one `ls-remote` per member to turn as
-many unknowns as it can into real numbers; the per-hook path does not, so a ping
-line is likelier to say `unknown` than the table is.
+pushed, and nothing else. Members with no branch at all — no worktree, or a
+worktree that is gone — omit the field entirely rather than claiming anything
+about pushing.
+
+`status` pays one `ls-remote` per member to turn as many unknowns as it can into
+real numbers; the per-hook path does not, so a ping line is likelier to say
+`unknown` than the table is. When `status` does ask, the remote's answer wins
+outright over a local `origin/<branch>` ref, which is only ever as fresh as the
+last fetch — preferring the cheap local number because it answered first is the
+same quiet-wrong-number failure by a different route.
 
 `--force` genuinely takes a dirty worktree: `gwtrm`'s `-f` used to skip only the
 first confirmation and prompt again for uncommitted changes, which with no tty

@@ -17,7 +17,31 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # The suite list is derived from the tree, not hand-maintained. It used to be
+  # a literal list, and two suites (apex-commits-ahead, apex-reap-pr-state) sat
+  # in `tests/` never running on any PR — a test that does not run is worse than
+  # no test, because it reads as coverage. Adding a `tests/*.test.sh` is now the
+  # whole of wiring it up.
+  discover:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      suites: ${{ steps.list.outputs.suites }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: list
+        run: |
+          suites=$(ls tests/*.test.sh \
+            | sed 's|^tests/||; s|\.test\.sh$||' \
+            | jq -R . | jq -sc .)
+          # An empty matrix silently passes the whole workflow, which is the
+          # same lie in a new place. Fail loudly instead.
+          [ "$suites" != "[]" ] || { echo "no tests/*.test.sh found" >&2; exit 1; }
+          echo "suites=$suites" >> "$GITHUB_OUTPUT"
+          echo "$suites"
+
   test:
+    needs: discover
     name: ${{ matrix.suite }}
     runs-on: ubuntu-latest
     timeout-minutes: 20
@@ -26,17 +50,7 @@ jobs:
       matrix:
         # One job per suite: apex-pair alone runs for minutes, and a matrix
         # names the failing suite directly in the checks UI.
-        suite:
-          - agent-icons
-          - apex-authority
-          - apex-delivery
-          - apex-lock
-          - apex-pair
-          - apex-recover
-          - apex-send
-          - apex-status
-          - apex-watch
-          - status-format
+        suite: ${{ fromJSON(needs.discover.outputs.suites) }}
     steps:
       - uses: actions/checkout@v4
 

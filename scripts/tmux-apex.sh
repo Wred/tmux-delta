@@ -582,29 +582,45 @@ _commits_ahead() {
 		[[ $a == --ask-remote ]] && ask=true
 	done
 
+	# Order matters, and it is the reverse of the obvious one. `@{upstream}`
+	# either fails (no tracking ref — the #57 case) or succeeds against a
+	# *local* ref that a narrowed `remote.origin.fetch` never updates. A
+	# lingering `refs/remotes/origin/<branch>` therefore makes the cheap query
+	# succeed with a number derived from an arbitrarily old ref: too high if the
+	# branch has been pushed since, too low if it was force-pushed from
+	# elsewhere. Preferring it because it answered first would spend the network
+	# round trip and then throw the good answer away — the same quiet-wrong-
+	# number failure as #57, reached by a different route.
+	#
+	# So under --ask-remote the remote wins outright, and `@{upstream}` is only
+	# the fallback for when the remote could not be reached at all. Without
+	# --ask-remote there is nothing else to consult, so the local ref stands.
+	if [[ $ask == true && -n $branch ]]; then
+		out=$(GIT_TERMINAL_PROMPT=0 git -C "$wt" ls-remote origin "refs/heads/${branch}" 2>/dev/null) && rc=0 || rc=$?
+		if (( rc == 0 )); then
+			remote_sha=$(printf '%s' "$out" | cut -f1)
+			if [[ -z $remote_sha ]]; then
+				# The remote has no such branch: nothing on it was ever pushed.
+				n=$(git -C "$wt" rev-list --count HEAD 2>/dev/null) || n=""
+			elif git -C "$wt" cat-file -e "${remote_sha}^{commit}" 2>/dev/null; then
+				n=$(git -C "$wt" rev-list --count HEAD --not "$remote_sha" 2>/dev/null) || n=""
+			else
+				# The remote answered and its tip is not an object we have, so
+				# the ranges are not comparable. That is unknown, and it
+				# deliberately does *not* fall through to `@{upstream}`: any
+				# tracking ref that could answer here is by construction behind
+				# the remote, so the fallback's number would be precisely the
+				# misleading one. Unreachable remote falls back;
+				# answered-but-incomparable does not.
+				return 0
+			fi
+			printf '%s' "$n"
+			return 0
+		fi
+		# rc != 0: offline, no such remote, auth refused. Fall through.
+	fi
+
 	n=$(git -C "$wt" rev-list --count '@{upstream}..HEAD' 2>/dev/null) || n=""
-	if [[ -n $n ]]; then
-		printf '%s' "$n"
-		return 0
-	fi
-
-	[[ $ask == true && -n $branch ]] || return 0
-
-	out=$(GIT_TERMINAL_PROMPT=0 git -C "$wt" ls-remote origin "refs/heads/${branch}" 2>/dev/null) && rc=0 || rc=$?
-	# An unreachable remote is unknown — not zero, and not "never pushed" either.
-	(( rc == 0 )) || return 0
-	remote_sha=$(printf '%s' "$out" | cut -f1)
-
-	if [[ -z $remote_sha ]]; then
-		# The remote has no such branch: nothing on it has ever been pushed.
-		n=$(git -C "$wt" rev-list --count HEAD 2>/dev/null) || n=""
-	elif git -C "$wt" cat-file -e "${remote_sha}^{commit}" 2>/dev/null; then
-		n=$(git -C "$wt" rev-list --count HEAD --not "$remote_sha" 2>/dev/null) || n=""
-	else
-		# The remote has the branch but its tip object is not here, so the two
-		# ranges are not comparable. Unknown.
-		return 0
-	fi
 	printf '%s' "$n"
 }
 
@@ -685,7 +701,8 @@ _facts_line() {
 		     + (if .pr_draft == "true" then "(draft)" else "" end)
 		     + (if .pr_state != "" and .pr_state != "OPEN" then "(" + (.pr_state|ascii_downcase) + ")" else "" end)
 		   else "pr=none" end),
-		  (if .commits_ahead == null then "commits_ahead=unknown(unpushed?)"
+		  (if .branch == "" then empty
+		   elif .commits_ahead == null then "commits_ahead=unknown(unpushed?)"
 		   else "commits_ahead=" + (.commits_ahead|tostring) end),
 		  (if .dirty then "uncommitted-changes" else empty end),
 		  (if .alive|not then "SESSION-DEAD" else empty end)
@@ -2483,7 +2500,8 @@ _cmd_status() {
 			        + (if .pr_draft == "true" then " draft" else "" end)
 			        + (if .pr_state != "" and .pr_state != "OPEN" then " " + (.pr_state|ascii_downcase) else "" end)
 			      else empty end),
-			     (if .commits_ahead == null then "unpushed?"
+			     (if .branch == "" then empty
+			      elif .commits_ahead == null then "unpushed?"
 			      elif .commits_ahead > 0 then (.commits_ahead|tostring) + " ahead"
 			      else empty end),
 			     (if .dirty then "dirty" else empty end) ] | join(", "))
@@ -2763,7 +2781,11 @@ _reap_risk() {
 	local unpushed="" branch="" remote_sha=""
 	branch=$(git -C "$wt" symbolic-ref --short HEAD 2>/dev/null) || branch=""
 	if [[ -n $branch ]]; then
-		remote_sha=$(git -C "$wt" ls-remote origin "refs/heads/${branch}" 2>/dev/null | cut -f1) || remote_sha=""
+		# GIT_TERMINAL_PROMPT=0 for the same reason `_commits_ahead` sets it,
+		# and more urgently: a remote that wants credentials would otherwise
+		# block on a prompt nobody can see, and this is the destructive path —
+		# a hang here means the HOLD decision never gets made at all.
+		remote_sha=$(GIT_TERMINAL_PROMPT=0 git -C "$wt" ls-remote origin "refs/heads/${branch}" 2>/dev/null | cut -f1) || remote_sha=""
 	fi
 	if [[ -n $remote_sha ]] && git -C "$wt" cat-file -e "${remote_sha}^{commit}" 2>/dev/null; then
 		unpushed=$(git -C "$wt" rev-list --count HEAD --not "$remote_sha" 2>/dev/null) || unpushed=""
