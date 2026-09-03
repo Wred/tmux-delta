@@ -5,11 +5,40 @@ delta_agent_argv() {
 	agent_argv=()
 	[[ -n $DELTA_AGENT_MODEL ]] && agent_argv+=(--model "$DELTA_AGENT_MODEL")
 
-	# Managed sessions are read back with `capture-pane`, and a grayed-out
-	# prompt suggestion captures identically to real typed-but-unsubmitted
-	# input. Suggestions are a human-typing convenience, so nothing is lost
-	# by turning them off where no human is typing.
-	[[ -n $DELTA_AGENT_MANAGED ]] && agent_argv+=(--prompt-suggestions false)
+	# A managed pane is read back with capture-pane, where the grayed-out
+	# prompt suggestion is byte-identical to real unsubmitted input, and the
+	# suggestions observed on live workers were valid *instructions* whose
+	# submission would have taken decisions reserved for the human (#45).
+	#
+	# Two knobs, because they cover different halves of the problem and only
+	# the env var covers the one that matters:
+	#
+	#   - CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=false is what turns the
+	#     *interactive* suggestion off. It is the first thing the TUI's
+	#     enable-check consults, ahead of the feature flag and the
+	#     promptSuggestionEnabled setting, so it wins unconditionally and
+	#     needs nothing written to the user's global config.
+	#   - --prompt-suggestions false only governs the print/SDK
+	#     `prompt_suggestion` message ("requires --print and
+	#     --output-format=stream-json", per its own error text). It is a no-op
+	#     for the TUI — #35 shipped it alone and workers kept painting ghost
+	#     text.
+	#
+	# The flag is kept deliberately, as #45 asked, for whatever later drives a
+	# managed agent non-interactively — but it is an accepted risk, not a free
+	# one. Nothing in this repo runs an agent in stream-json mode today, so its
+	# present benefit is zero, and it is passed on every managed launch. If a
+	# future CLI renames or drops it, the unknown-flag rejection kills the pane
+	# outright: a managed launch always carries a prompt or a resume id, so
+	# `agent_argv_fresh_set` is never armed and agent-adapter.sh's retry cannot
+	# rescue it. Arming that fallback here would be worse — it fires on ANY
+	# non-zero exit, which is how a crashed autonomous worker redoes its task.
+	# So: if managed panes ever start dying at launch, this line is the first
+	# suspect, and deleting it is the fix.
+	if [[ -n $DELTA_AGENT_MANAGED ]]; then
+		export CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=false
+		agent_argv+=(--prompt-suggestions false)
+	fi
 
 	# Historically this slot held a bare --permission-mode value, and the README
 	# documents it that way. Keep accepting that; anything starting with a dash

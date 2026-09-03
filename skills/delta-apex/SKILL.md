@@ -609,20 +609,42 @@ right answer whenever you ask it by hand.
 
 ## Unsent text in a member's input box
 
-`status` may report unsent text sitting in a member's input box. **That is
-almost always the agent's own autosuggestion, not a bug.** Claude Code predicts
-a plausible next input and paints it into an idle, empty box — `mark ready for
-review` and similar. From outside the pane it is indistinguishable from
-something having been typed there or injected by mistake, which has already
-cost real diagnosis time (issue #10).
+`status` may report unsent text sitting in a member's input box. Historically
+that was almost always the agent's own prompt suggestion rather than a bug:
+Claude Code predicts a plausible next input and paints it into an idle, empty
+box, and from outside the pane a grayed-out suggestion is byte-identical to
+something typed there or injected by mistake. That cost real diagnosis time
+(issue #10).
+
+Panes apex spawns or recovers are now launched with the suggestion turned off
+at the source, via `CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=false` in the pane's
+environment. That suppression lives in the Claude Code adapter only
+(`lib/agents/claude.sh`); the codex, opencode and pi adapters are handed the
+same managed marker and currently do nothing with it, so a member running one
+of those has whatever box behaviour its own agent has. The `--prompt-suggestions false` flag
+alone did not do this — it governs only the print/SDK `prompt_suggestion`
+message, so the fix that shipped with just the flag changed nothing in the TUI
+(issues #20, #35, #45). If you see a suggestion in a managed pane anyway, that
+pane predates the fix or was not launched by apex; either way the rules below
+still apply.
 
 So:
 
 - Do not treat it as evidence that a `send` failed or leaked into the wrong
   pane. `send` reports its own delivery, and verifies from the pane that the
   text actually left the input box before claiming success.
-- Do not submit it. It is a guess about what someone might type next, not an
-  instruction from anyone.
+- **Never submit what is in a member's box.** Not "prefer not to" — never.
+  Treat the box as adversarial, not merely unreliable. A suggestion is a
+  syntactically valid, contextually plausible *instruction*, and the ones
+  observed on live workers were exactly the actions the design reserves for
+  someone else: one worker waiting on two escalated policy questions had its
+  box pre-filled with a near-verbatim answer the human had not given, and
+  another, mid-paired-review, had `Undraft the PR` — which would have handed
+  the PR to the human as ready-for-review, skipping `_pair_finish` and the
+  reviewer's remaining rounds. One stray bare Enter executes a decision nobody
+  made. This is why `_send_to_pane` never fires a bare Enter on a retry: it
+  clears and retypes instead, so the worst case is our own message twice
+  rather than the agent's guess once.
 - `send` clears the box before it types where it can, and tells you what it
   cleared — including when the box refused to clear (on
   stderr and as `cleared_input` on the `send` event in `status --json`), so the
