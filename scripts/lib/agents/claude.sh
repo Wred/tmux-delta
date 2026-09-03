@@ -22,8 +22,19 @@ delta_agent_argv() {
 	#     `prompt_suggestion` message ("requires --print and
 	#     --output-format=stream-json", per its own error text). It is a no-op
 	#     for the TUI — #35 shipped it alone and workers kept painting ghost
-	#     text. Kept anyway, for whatever later drives a managed agent
-	#     non-interactively.
+	#     text.
+	#
+	# The flag is kept deliberately, as #45 asked, for whatever later drives a
+	# managed agent non-interactively — but it is an accepted risk, not a free
+	# one. Nothing in this repo runs an agent in stream-json mode today, so its
+	# present benefit is zero, and it is passed on every managed launch. If a
+	# future CLI renames or drops it, the unknown-flag rejection kills the pane
+	# outright: a managed launch always carries a prompt or a resume id, so
+	# `agent_argv_fresh_set` is never armed and agent-adapter.sh's retry cannot
+	# rescue it. Arming that fallback here would be worse — it fires on ANY
+	# non-zero exit, which is how a crashed autonomous worker redoes its task.
+	# So: if managed panes ever start dying at launch, this line is the first
+	# suspect, and deleting it is the fix.
 	if [[ -n $DELTA_AGENT_MANAGED ]]; then
 		export CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=false
 		agent_argv+=(--prompt-suggestions false)

@@ -618,7 +618,10 @@ something typed there or injected by mistake. That cost real diagnosis time
 
 Panes apex spawns or recovers are now launched with the suggestion turned off
 at the source, via `CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=false` in the pane's
-environment (`lib/agents/claude.sh`). The `--prompt-suggestions false` flag
+environment. That suppression lives in the Claude Code adapter only
+(`lib/agents/claude.sh`); the codex, opencode and pi adapters are handed the
+same managed marker and currently do nothing with it, so a member running one
+of those has whatever box behaviour its own agent has. The `--prompt-suggestions false` flag
 alone did not do this — it governs only the print/SDK `prompt_suggestion`
 message, so the fix that shipped with just the flag changed nothing in the TUI
 (issues #20, #35, #45). If you see a suggestion in a managed pane anyway, that

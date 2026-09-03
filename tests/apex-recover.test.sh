@@ -361,12 +361,16 @@ eq "…on the resume path too" \
 
 # The picker and dev-layout launch panes a human types into, and they pass no
 # managed flag. Suggestions are a typing convenience: leave them alone there.
-unset CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION
 argv_for "the task" "" ""
 eq "an unmanaged launch leaves prompt suggestions alone" \
 	"the task" "${(j: :)agent_argv}"
+# In a subshell with the var explicitly cleared first, because delta_agent_argv
+# exports into its caller: asserting on the ambient shell would silently become
+# a tautology the moment a managed argv_for is inserted above this line.
 eq "…and plants no suppression env var" 0 \
-	"${+CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION}"
+	"$( unset CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION
+	    argv_for "the task" "" ""
+	    print -r -- "${+CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION}" )"
 
 source "$SCRIPTS/lib/agent-launch.sh"
 contains "launch command exports the managed flag" "DELTA_AGENT_MANAGED=1" \
