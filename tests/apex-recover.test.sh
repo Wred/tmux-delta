@@ -320,6 +320,21 @@ done
 p=$(delta_task_prompt '' 43 review)
 eq "marker is the whole review prompt" "$p" "$(delta_task_marker '' 43)"
 
+# An issue's stated diagnosis is often wrong (#35/#45, #60, #43), and the agent
+# in the worktree is the cheapest place to catch that. The instruction belongs
+# in the *managed* prompt: the task prompt doubles as the transcript-matching
+# key above, so growing it would break recovery matching (#18).
+for r in worker reviewer monitor; do
+	mp=$(delta_managed_prompt $r tmux-delta)
+	contains "the $r managed prompt tells it not to trust the diagnosis" \
+		"Do not trust a task's stated diagnosis" "$mp"
+	contains "…and to verify the claim first" "verify that claim yourself" "$mp"
+done
+lacks "the verify gate is not in the task prompt" \
+	"Do not trust a task's stated diagnosis" "$(delta_task_prompt 42 '' autonomous)"
+eq "…and an unmanaged session gets no prompt at all" "" \
+	"$(delta_managed_prompt '' tmux-delta)"
+
 # ─── 2. resume argv ──────────────────────────────────────────────────
 
 print "\nresume argv"

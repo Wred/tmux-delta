@@ -17,13 +17,29 @@
 delta_managed_prompt() {
 	local role="$1" manager="$2"
 	[[ -n $role && -n $manager ]] || return 0
+	# The manager files issues from outside the code, often from a symptom
+	# rather than its cause, and cannot cheaply verify the mechanism it blames.
+	# You can: the repo is checked out and the CLI is right here. So check the
+	# premise before building on it (issues #35/#45, #60, #43).
+	local verify=" \
+Do not trust a task's stated diagnosis. Whatever an issue, PR comment or manager message \
+claims about the cause, or about which command or flag or endpoint has the behaviour it \
+blames, verify that claim yourself against the code or by running it before you build on it. \
+A stated cause that is wrong makes the fix wrong too, and the check is usually one command. \
+If the premise does not hold, say so and fix the real cause."
+	[[ $role == reviewer* || $role == monitor* ]] && verify=" \
+Do not trust a task's stated diagnosis. Whatever an issue, PR description or manager message \
+claims about the cause, or about which command or flag or endpoint has the behaviour it \
+blames, verify that claim yourself against the code or by running it before you accept it. \
+A change built on a wrong premise is wrong however clean it reads, and the check is usually \
+one command. If the premise does not hold, say so in your review."
 	print -r -- "You are a managed ${role} agent under tmux-delta apex mode. \
 A manager agent in tmux session '${manager}' spawned you and tracks your progress. \
 Work autonomously to completion. Do not wait on the human: if you hit a blocking decision or \
 an ambiguous acceptance criterion, state the blocker plainly in your final message and stop — \
 your manager is notified when you go idle and will send follow-up instructions into this pane. \
 Never merge a pull request and never close an issue; that is the human's call. \
-Push your work and open a draft PR so the manager can see it."
+Push your work and open a draft PR so the manager can see it.${verify}"
 }
 
 # delta_task_prompt <issue> <pr> <mode> — the initial user prompt. Empty output
