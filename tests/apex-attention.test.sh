@@ -148,14 +148,34 @@ eq "a missing pane id is unknown, not idle" unknown \
 	"$(r=$(_pane_attention_reason ""); print -r -- "${r%%$'\t'*}")"
 
 print "not false-positived by ordinary output"
-# Agent output is full of lines that begin with a number, so one numbered
-# line is never enough on its own.
+# Every dialog signal is gated on the line being box-framed, because the
+# dialog is drawn inside the box and agent output is not. Ungated, an
+# ordinary end-of-turn recap counts as a choice list and a finished worker
+# reports as blocked at a safety prompt — the mirror image of issue #63, and
+# it lands somewhere worse than a wrong label: `status` suppresses the
+# unsent-input warning for a permission-prompt member, so a misclassification
+# hides a real stuck-send too.
 eq "a single numbered line in output is not a dialog" idle \
 	"$(reason_of "$(print -l -- 'Plan:' '1. read the file' '│ > │')")"
+eq "an unframed recap with several numbered lines is not a dialog" idle \
+	"$(reason_of "$(print -l -- 'Here is what I did:' '1. Fixed the parser' '2. Added a test' '3. Updated the README' '│ > │')")"
+eq "…and neither is one with a question above it" idle \
+	"$(reason_of "$(print -l -- 'I can take this two ways. Which do you want?' '1. Patch the caller' '2. Patch the callee' '│ > │')")"
 # The notice has to have been *printed*, not typed: a member whose own input
 # box quotes the phrase has not been interrupted by anything.
 eq "the interrupt phrase inside the input box is not an interrupt" idle \
 	"$(reason_of "$(print -l -- '│ > next up: better api error handling │')")"
+# …and printed as its own line, not mentioned mid-sentence. Workers on this
+# repo narrate error-handling work constantly, and a false positive here tells
+# the manager to go send a worker that finished cleanly.
+eq "a narrated api error is not an interrupt" idle \
+	"$(reason_of "$(print -l -- 'I added a retry wrapper so an API error no longer aborts the poller.' '│ > │')")"
+eq "…nor is prose about incompleteness" idle \
+	"$(reason_of "$(print -l -- 'Caveat: the pattern list may be incomplete, so I left a TODO.' '│ > │')")"
+# Leading decoration is stripped before the prefix match, so a gutter-marked
+# notice still counts.
+eq "a decorated notice still classifies as interrupted" interrupted \
+	"$(reason_of "$(print -l -- '· API Error: 500 upstream connect error' '│ > │')")"
 # A live dialog outranks an error notice above it — the dialog is what is
 # blocking now, and answering it unblocks the pane either way.
 eq "a dialog outranks an earlier API error" permission-prompt \
@@ -173,6 +193,9 @@ lacks    "…and not the choice list"         "1. Yes"           "$d"
 contains "an interrupt detail carries the notice" "went to sleep mid-response" \
 	"$(detail_of "$SLEPT")"
 eq "a clean idle pane has no detail" "" "$(detail_of "$IDLE")"
+# The caret line is the frame, not the question — it must never leak into the
+# detail the manager reads to make the decision.
+lacks "the detail never carries the prompt caret" ">" "$(detail_of "$DIALOG")"
 
 # A ping line has to stay a line.
 LONG=$(print -l -- '╭──╮' "│ $(printf 'x%.0s' {1..400}) │" '│ Do you want to proceed? │' '│ ❯ 1. Yes │' '│ 2. No │' '╰──╯')

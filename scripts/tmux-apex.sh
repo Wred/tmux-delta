@@ -308,14 +308,22 @@ _box_line_of() {
 # text alone would be worse, since it is prose and prose gets reworded.
 #
 # The interrupted-turn notice has no shape to match on, only text, so that
-# half is an explicit pattern list (_APEX_INTERRUPT_PATTERNS). Prose does get
-# reworded, which is why an unrecognised notice has to land in `idle` rather
-# than being pretended away — the list is a way to catch the known cases
-# early, not a claim to catch all of them.
-# Lowercased substrings that mark a turn killed mid-response. Deliberately
-# short and few: each one is a phrase Claude Code has actually printed on a
-# stalled worker, matched case-insensitively so a reworded capitalisation does
-# not silently drop a case.
+# half is an explicit prefix list (_APEX_INTERRUPT_PATTERNS) against unframed
+# lines. Prose does get reworded, which is why an unrecognised notice has to
+# land in `idle` rather than being pretended away — the list is a way to catch
+# the known cases early, not a claim to catch all of them. It errs in the same
+# direction the dialog half does: a missed case reports a member as ordinarily
+# idle, which is what it already looked like, whereas a false positive tells
+# the manager to go send a worker that was fine.
+# Lowercased line *prefixes* that mark a turn killed mid-response. Each one is
+# how Claude Code has actually opened such a line on a stalled worker, matched
+# case-insensitively so a reworded capitalisation does not silently drop a
+# case, and anchored at the start of the line because unanchored they are
+# short enough to occur in ordinary narration (see the match site below).
+#
+# "may be incomplete" was on this list and is not any more: it is the tail of
+# the sleep notice, so the full notice still matches on its own opening, but
+# on its own the phrase is something a worker writes about its own work.
 #
 # Not on the list, on purpose: "Interrupted by user" (a human stopped that
 # turn deliberately — reporting it back to the manager as a fault would be
@@ -324,8 +332,7 @@ _box_line_of() {
 # advice rather than being folded in here).
 typeset -ga _APEX_INTERRUPT_PATTERNS=(
 	'api error'
-	'went to sleep mid-response'
-	'may be incomplete'
+	'your computer went to sleep mid-response'
 	'request was aborted'
 )
 
@@ -348,7 +355,7 @@ _attention_reason_of() {
 	(( ${#lines} > 30 )) && lines=(${lines[-30,-1]})
 
 	local -i choices=0
-	local question="" boxed_seen="" caret_seen="" interrupt=""
+	local question="" caret_seen="" interrupt="" bare=""
 	local -a detail=()
 	for line in $lines; do
 		local framed=""
@@ -356,40 +363,74 @@ _attention_reason_of() {
 		text=${line##[[:space:]]#[│┃|]}
 		text=${text%[│┃|]}
 		text=${${text##[[:space:]]##}%%[[:space:]]##}
-		[[ -n $framed ]] && boxed_seen=1
-		# Unframed output only: the interrupted-turn notice is printed into
-		# the transcript, and a member that pasted the phrase into its own
-		# input box has not been interrupted by anything.
-		if [[ -z $framed && -n $text ]]; then
-			for pat in $_APEX_INTERRUPT_PATTERNS; do
-				if [[ ${text:l} == *${pat}* ]]; then interrupt=$text; break; fi
-			done
+		[[ -z $text ]] && continue
+
+		# Every dialog signal below is gated on `framed`, because the dialog
+		# is drawn inside the box and agent *output* is not. Ungated, an
+		# ordinary end-of-turn recap — "Here is what I did: 1. Fixed the
+		# parser 2. Added a test" — counts as a choice list and reports a
+		# finished worker as blocked at a safety prompt. That is the mirror
+		# image of the defect this function exists to fix, and it lands
+		# somewhere worse than a wrong label: `_cmd_status` suppresses the
+		# unsent-input warning for a permission-prompt member, so a
+		# misclassification also hides a real stuck-send.
+		if [[ -n $framed ]]; then
+			# A numbered choice, with or without the selection caret:
+			# "1. Yes", "❯ 2. No, and tell Claude ...". Tested before the
+			# caret check, which the "❯ " would otherwise swallow.
+			if [[ $text == ([❯\>][[:space:]]#|)<->.[[:space:]]* ]]; then
+				# Pre-increment: `choices++` evaluates to the *old* value, so
+				# the first one exits non-zero, and this function is sourced
+				# into the test suite's shell, which runs under `err_return`
+				# — the count would return out of the function at the first
+				# choice line and every dialog would classify as idle. Found
+				# that way.
+				(( ++choices ))
+				continue
+			fi
 		fi
 		# A caret line means the input box is drawn and accepting input, which
-		# is what tells "idle" apart from "unknown".
-		[[ $text == [\>❯][[:space:]]* || $text == [\>❯] ]] && caret_seen=1
-		[[ -z $text ]] && continue
-		# A numbered choice, with or without the selection caret: "1. Yes",
-		# "❯ 2. No, and tell Claude ...".
-		if [[ $text == ([❯\>][[:space:]]#|)<->.[[:space:]]* ]]; then
-			# Pre-increment: `choices++` evaluates to the *old* value, so the
-			# first one exits non-zero, and this function is sourced into the
-			# test suite's shell, which runs under `err_return` — the count
-			# would return out of the function at the first choice line and
-			# every dialog would classify as idle. Found that way.
-			(( ++choices ))
+		# is what tells "idle" apart from "unknown". It is never detail: it is
+		# the frame, not the question.
+		if [[ $text == [\>❯][[:space:]]* || $text == [\>❯] ]]; then
+			caret_seen=1
 			continue
 		fi
-		# The question line is pulled out and re-appended last, so the detail
-		# reads operation-then-question however the dialog ordered them.
-		if [[ $text == *\? ]]; then
-			question=$text
+		if [[ -n $framed ]]; then
+			# The question line is pulled out and re-appended last, so the
+			# detail reads operation-then-question however the dialog
+			# ordered it.
+			if [[ $text == *\? ]]; then
+				question=$text
+				continue
+			fi
+			# Everything else inside the box is what the dialog is *about* —
+			# the tool name and the command it wants to run. That is the text
+			# the decision actually turns on, so it is what the detail
+			# reports.
+			detail+=("$text")
 			continue
 		fi
-		# Everything else inside the box is what the dialog is *about* — the
-		# tool name and the command it wants to run. That is the text the
-		# decision actually turns on, so it is what the detail reports.
-		[[ -n $framed ]] && detail+=("$text")
+
+		# Unframed, i.e. transcript output. Interrupted-turn notices are
+		# printed here; a member that merely typed the phrase into its own
+		# input box has not been interrupted by anything.
+		#
+		# Matched as a line *prefix*, not a substring. Claude Code prints
+		# these on a line of their own, and the phrases are short enough to
+		# occur in ordinary prose — "a retry wrapper so an API error no
+		# longer aborts the poller" is the kind of sentence a worker on this
+		# repo writes at the end of a perfectly healthy turn, and reading it
+		# as a dead turn produces a spurious `send`. Anchoring costs a real
+		# notice only if Claude Code starts prefixing them with text, which
+		# leaves the member in `idle` — the direction this errs in already.
+		#
+		# Leading decoration is stripped first, so a bulleted or gutter-marked
+		# notice ("· API Error: 500") still matches.
+		bare=${text##[^[:alnum:]]##}
+		for pat in $_APEX_INTERRUPT_PATTERNS; do
+			if [[ ${bare:l} == ${pat}* ]]; then interrupt=$bare; break; fi
+		done
 	done
 
 	if (( choices >= 2 )) || { (( choices >= 1 )) && [[ -n $question ]] }; then
