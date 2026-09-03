@@ -1373,6 +1373,7 @@ export STUB_GH_COMMENTS=0
 out=$(verdict --findings 2 2>&1)
 contains "the die names the PR" "PR #42" "$out"
 contains "the die says nothing was published" "no comments published since this round started" "$out"
+contains "the die names both channels it looked in" "inline 0" "$out"
 contains "the die is explicit nothing was recorded" "nothing recorded" "$out"
 contains "the die offers --note" "--note" "$out"
 contains "the die offers --override" "--override" "$out"
@@ -1430,11 +1431,71 @@ unset STUB_GH_FAIL
 # COMMENTED review with an *empty* body — `gh pr view --json comments,reviews`
 # alone never sees it. The guard has to count that endpoint too.
 print "\n...and an inline review comment alone satisfies the guard"
-reset
 export STUB_GH_COMMENTS=0
+export STUB_GH_INLINE=0
+reset
 export STUB_GH_INLINE=3
 out=$(verdict --findings 3 2>&1)
 eq "verdict is recorded from inline comments alone" 3 "$(mget "$REVIEWER" verdict_findings)"
+eq "the inline channel is recorded" inline "$(mget "$REVIEWER" verdict_channel)"
+contains "and named on the verdict event" '"channel":"inline"' "$(ev pair-verdict)"
+settle "$REVIEWER" >/dev/null
+relayed=$(sent_to %1)
+contains "the fixer is pointed at the inline endpoint" "pulls/42/comments" "$relayed"
+lacks "and not at the channel that has nothing this round" "gh pr view 42 --comments" "$relayed"
+contains "the fixer is told they are inline comments" "inline review comments, anchored to a file and line" "$relayed"
+unset STUB_GH_COMMENTS STUB_GH_INLINE
+
+# The defect of issue #60: the guard counted both channels as one total, so a
+# lone issue-level summary passed it — while the relay still named
+# `pulls/N/comments`, which returns 0 for exactly that review. The fixer was
+# sent to an empty endpoint, indistinguishable from #47's unpublished findings.
+print "\n...and an issue-level comment alone points the fixer at the channel that has it"
+export STUB_GH_COMMENTS=0
+export STUB_GH_INLINE=0
+reset
+export STUB_GH_COMMENTS=1
+out=$(verdict --findings 2 2>&1)
+eq "verdict is recorded from an issue comment alone" 2 "$(mget "$REVIEWER" verdict_findings)"
+eq "the issue channel is recorded" issue "$(mget "$REVIEWER" verdict_channel)"
+settle "$REVIEWER" >/dev/null
+relayed=$(sent_to %1)
+contains "the fixer is pointed at gh pr view --comments" "gh pr view 42 --comments" "$relayed"
+contains "and told the inline endpoint is empty by design" "returns nothing for this round" "$relayed"
+unset STUB_GH_COMMENTS STUB_GH_INLINE
+
+# Per-channel baselines: a stale inline comment from an earlier round must not
+# satisfy a later round either, and the two counts must not cross-satisfy.
+print "\n...and a round that used both channels names both"
+export STUB_GH_COMMENTS=0
+export STUB_GH_INLINE=0
+reset
+export STUB_GH_COMMENTS=1
+export STUB_GH_INLINE=1
+out=$(verdict --findings 4 2>&1)
+eq "both channels are recorded" both "$(mget "$REVIEWER" verdict_channel)"
+settle "$REVIEWER" >/dev/null
+relayed=$(sent_to %1)
+contains "the fixer is pointed at the inline endpoint" "pulls/42/comments" "$relayed"
+contains "and at the issue-level one" "gh pr view 42 --comments" "$relayed"
+unset STUB_GH_COMMENTS STUB_GH_INLINE
+
+print "\n...and each channel keeps its own per-round baseline"
+export STUB_GH_COMMENTS=0
+export STUB_GH_INLINE=0
+reset --max=3
+export STUB_GH_INLINE=2
+verdict --findings 1 >/dev/null
+eq "round 1 passes on inline evidence" inline "$(mget "$REVIEWER" verdict_channel)"
+settle "$REVIEWER" >/dev/null
+settle "$WORKER" >/dev/null    # round 2; baselines stamped at issue=0, inline=2
+: > "$STUB_SENT"
+out=$(verdict --findings 1 2>&1)
+contains "round 2 with no new comment in either channel is refused" "no comments published since this round started" "$out"
+export STUB_GH_INLINE=3        # one new inline comment for round 2
+out=$(verdict --findings 1 2>&1)
+eq "round 2 passes once the inline count rises" 1 "$(mget "$REVIEWER" verdict_findings)"
+eq "and is still attributed to inline" inline "$(mget "$REVIEWER" verdict_channel)"
 unset STUB_GH_COMMENTS STUB_GH_INLINE
 
 # A stale comment from round 1 must not keep satisfying every later round's
@@ -1468,6 +1529,45 @@ export STUB_GH_COMMENTS=2       # a new comment landed for round 2
 out=$(verdict --findings 1 2>&1)
 eq "round 2 verdict is recorded" 1 "$(mget "$REVIEWER" verdict_findings)"
 unset STUB_GH_COMMENTS
+
+# ── the live-upgrade window ──────────────────────────────────────────
+# A pair linked *before* per-channel evidence existed has neither a
+# verdict_channel nor a pair_inline_baseline in its member file, and this
+# repo is reloaded in place (`tmux source`) while loops are mid-flight. Both
+# states have to behave, and both are where a relocated #60/#47 would hide.
+mdrop() { jq -c --arg k "$2" 'del(.[$k])' "$MEMBERS/$1.json" > "$TMPROOT/md" && mv "$TMPROOT/md" "$MEMBERS/$1.json" }
+
+print "\n...and a verdict with no channel recorded names both endpoints"
+export STUB_GH_COMMENTS=0
+export STUB_GH_INLINE=0
+reset
+export STUB_GH_INLINE=1
+verdict --findings 2 >/dev/null
+mdrop "$REVIEWER" verdict_channel      # as a pre-upgrade member file would be
+settle "$REVIEWER" >/dev/null
+relayed=$(sent_to %1)
+contains "the fixer is pointed at the issue-level channel" "gh pr view 42 --comments" "$relayed"
+contains "and at the inline one" "pulls/42/comments" "$relayed"
+contains "and told the channel is unknown" "was not recorded" "$relayed"
+unset STUB_GH_COMMENTS STUB_GH_INLINE
+
+# `gh pr view --comments` does not surface inline review comments, so an
+# unknown channel must not be described as covered by it alone.
+lacks "no claim that one endpoint covers both" "covers both" "$relayed"
+
+print "\n...and a missing inline baseline fails closed rather than passing"
+export STUB_GH_COMMENTS=0
+export STUB_GH_INLINE=0
+reset
+mdrop "$REVIEWER" pair_inline_baseline # linked before the field existed
+export STUB_GH_INLINE=3                # inline comments from earlier rounds
+out=$(verdict --findings 1 2>&1)
+contains "the verdict is refused" "no comments published since this round started" "$out"
+eq "and nothing is recorded" "" "$(mget "$REVIEWER" verdict_findings)"
+export STUB_GH_COMMENTS=1              # a real issue-level comment this round
+out=$(verdict --findings 1 2>&1)
+eq "the channel with a real baseline still satisfies it" issue "$(mget "$REVIEWER" verdict_channel)"
+unset STUB_GH_COMMENTS STUB_GH_INLINE
 
 # ── two-argument option guards ───────────────────────────────────────
 # zsh's `shift 2` with one positional left fails *and leaves $# unchanged*, so
