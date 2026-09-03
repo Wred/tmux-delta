@@ -1441,6 +1441,7 @@ _cmd_spawn() {
 	print "  task     : ${issue:+issue #$issue}${review_pr:+PR #$review_pr}"
 	print "  profile  : ${profile:-<none>}"
 	print "  model    : ${model:-<default>}   permission-mode: ${perm:-<default>}"
+	print "  mode     : ${mode}"
 }
 
 # ─── register-member (called from wherever an agent pane is actually
@@ -5091,6 +5092,8 @@ case "${1:-}" in
 		print "            --role worker|monitor --agent claude|pi|codex|opencode"
 		print "            --model M"
 		print "            --agent-flags ARGV --mode autonomous|interactive --switch"
+		print "                                 (--mode autonomous is refused with a permission mode"
+		print "                                  that pauses for approval, e.g. acceptEdits)"
 		print "  send <session> <text>          message a session's coding agent"
 		print "  link --worker M --reviewer M   run an automatic fix/re-review loop between two"
 		print "                                 members on one PR; the manager is only pinged"
