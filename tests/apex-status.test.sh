@@ -85,7 +85,7 @@ out=$(apex status 2>&1)
 lacks "status prints no bare shell-assignment line" $'\nu=' "$out"
 
 typeset -a stray
-stray=( ${(f)"$(print -r -- "$out" | grep -E '^[a-z_]+=')"} )
+stray=( ${(f)"$(print -r -- "$out" | grep -E '^[a-z_]+=' || true)"} )
 if (( ${#stray} == 0 )); then
 	ok "no output line matches ^[a-z_]*="
 else
