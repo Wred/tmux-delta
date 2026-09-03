@@ -2495,7 +2495,7 @@ _pair_finish() {
 # coreutils — so on the very platform it is developed on the bound would
 # silently not exist. A watchdog child needs nothing that is not already here.
 #
-# git's stdout goes to a temp file rather than up the caller's command
+# git's stdout goes to that file rather than up the caller's command
 # substitution, and this is load-bearing, not tidiness. Over a real transport
 # git spawns a helper (ssh, git-remote-https) that inherits stdout, so TERMing
 # git alone leaves the helper holding the write end of the substitution's pipe
@@ -2508,35 +2508,40 @@ _pair_finish() {
 # harmless rather than merely unnoticed:
 #
 #   - the transport helper. It is the whole reason stdout is a file, so of
-#     course it survives killing git; it goes on writing into a file that has
-#     already been unlinked and exits when its own timeout expires. It is not
+#     course it survives killing git; it goes on writing into a file that was
+#     unlinked before git ever started, and exits when its own timeout
+#     expires — after which the kernel reclaims the blocks. It is not
 #     killed as a process group because there is no job control here, so the
 #     group is tmux-apex's own — a group TERM would take the caller with it.
 #   - the watchdog's `sleep`. It is orphaned by the TERM aimed at its parent,
 #     and the `kill` it would have gone on to run died with that parent.
 #
-# The trap owns the temp file on every path, including the one the body cannot
-# reach: an interrupt arriving mid-probe. Three things about its form, each
-# verified rather than assumed:
+# The temp file is unlinked the moment it exists, and the probe then works
+# through the two descriptors already open on it. Nothing can leak it, on any
+# path, because after those three lines there is no name left to clean up:
+# not a signal, not a `_die`, not SIGKILL.
 #
-#   - EXIT, not INT/TERM/HUP, so signal disposition is left completely alone.
-#     Trapping the signals here would swallow them for the duration of a probe
-#     — and `watch` arms INT/TERM to clear its pidfile and exit, which must
-#     still happen. An EXIT trap runs during that unwinding anyway.
-#   - the path is expanded now, at trap-set time, not `'rm -f "$tmp"'`. The
-#     function's locals are already gone by the time an EXIT trap fires, so
-#     the deferred form quietly runs `rm -f ""` and leaks the file.
-#   - function-local (`localtraps`), so the caller's own EXIT trap survives,
-#     and the function's return value survives the trap.
+# That is why there is no trap here, and the distinction matters. An EXIT trap
+# was the obvious form and does not actually hold: zsh does not run TRAPEXIT
+# for an *untrapped* fatal signal, and `_settle` — the entry point this whole
+# bound exists for — arms nothing, so the file survived a TERM mid-probe. Only
+# `watch` arms INT/TERM, which is why the trap looked correct when tested
+# there. Adding INT/TERM/HUP with a re-raise fixes the leak and breaks
+# something worse: measured, the re-raise reaches the default disposition
+# rather than the handler `localtraps` has shadowed, so `watch` exits 143 with
+# its pidfile still on disk. Not owning the name at all beats both.
+#
+# The one honest gap is the few instructions between `mktemp` and `rm`, which
+# fork nothing and cannot block.
 _git_bounded() {
 	local secs="$1"; shift
-	local tmp rc=0
+	local tmp rc=0 wfd rfd
 	tmp=$(mktemp "${TMPDIR:-/tmp}/tmux-apex-git.XXXXXX") || return 1
-	setopt localoptions localtraps
-	trap "rm -f ${(q)tmp}" EXIT
+	exec {wfd}>"$tmp" {rfd}<"$tmp"
+	rm -f "$tmp"
 	(
 		export GIT_TERMINAL_PROMPT=0
-		git "$@" >"$tmp" 2>/dev/null &
+		git "$@" >&$wfd 2>/dev/null &
 		gitpid=$!
 		{ sleep "$secs"; kill -TERM $gitpid 2>/dev/null; } >/dev/null 2>&1 &
 		dogpid=$!
@@ -2548,7 +2553,8 @@ _git_bounded() {
 	# A watchdog TERM surfaces as 143. Report the conventional 124 instead, so
 	# a caller can tell "the bound was hit" from "git answered, negatively".
 	(( rc == 143 )) && rc=124
-	(( rc == 0 )) && cat "$tmp"
+	(( rc == 0 )) && cat <&$rfd
+	exec {wfd}>&- {rfd}<&-
 	return $rc
 }
 

@@ -249,6 +249,7 @@ for a in "$@"; do
 	[ "$a" = "ls-remote" ] || continue
 	[ -n "${STUB_GIT_LSREMOTE_FAIL:-}" ] && exit 128
 	if [ -n "${STUB_GIT_HANG:-}" ]; then
+		: > "$STUB_GIT.hang"
 		sleep 60 &
 		sleep 60
 		exit 0
@@ -332,7 +333,7 @@ reset() {
 			commit -q --allow-empty -m seed
 	fi
 	unset STUB_GIT_HEAD STUB_GIT_ABSENT STUB_GIT_LSREMOTE_FAIL STUB_GIT_HANG
-	rm -f "$STUB_GIT.n"
+	rm -f "$STUB_GIT.n" "$STUB_GIT.hang"
 	for m in "$WORKER" "$REVIEWER"; do
 		jq -nc --arg wt "$TMPROOT/wt" --argjson t 1 '{agent:"claude", worktree:$wt, status:"idle",
 			seq:1, pinged_seq:1, spawned_at:$t, updated_at:$t}' > "$MEMBERS/$m.json"
@@ -550,8 +551,36 @@ lacks "and still-absent does not relay" "Re-review" "$(sent_to %2)"
 contains "the manager is told" "PAIRED REVIEW WAITING" "$(apex pending)"
 unset STUB_GIT_ABSENT
 
-# Every probe above created a temp file for git's stdout (see `_git_bounded`).
-# None of them may still be here.
+# A probe killed while it is stalled is the case a trap could not cover: zsh
+# runs no TRAPEXIT for an untrapped fatal signal, and `_settle` arms nothing.
+# `_git_bounded` unlinks the file before git starts rather than cleaning it up
+# afterwards, so there is nothing for the signal to strand.
+print "\na probe killed mid-stall strands nothing"
+reset
+export STUB_GIT_HEAD=deadbeefdeadbeefdeadbeefdeadbeefdeadbeef
+verdict --findings 1 >/dev/null
+settle "$REVIEWER" >/dev/null
+unset STUB_GIT_HEAD
+export STUB_GIT_HANG=1 APEX_PAIR_HEAD_TIMEOUT=30
+seq=$(( $(mget "$WORKER" seq) + 1 ))
+jq -c --argjson s "$seq" '.seq = $s' "$MEMBERS/$WORKER.json" > "$TMPROOT/s" \
+	&& mv "$TMPROOT/s" "$MEMBERS/$WORKER.json"
+apex _settle "$WORKER" "$MGR" "$seq" >/dev/null 2>&1 &
+probe_pid=$!
+sleep 2
+# `|| true` on both: the suite runs under err_return, and reaping a job that
+# died of a signal is a 143 that must not abort the run.
+kill -TERM $probe_pid 2>/dev/null || true
+wait $probe_pid 2>/dev/null || true
+unset STUB_GIT_HANG APEX_PAIR_HEAD_TIMEOUT
+# Without this the assertion below could pass by killing before the probe
+# ever opened anything.
+eq "the kill really landed mid-probe" 1 "$([[ -e $STUB_GIT.hang ]] && print 1 || print 0)"
+stranded=( $TMPDIR/tmux-apex-git.*(N) )
+eq "the killed probe stranded nothing" 0 "${#stranded}"
+
+# Every probe above created a file for git's stdout (see `_git_bounded`).
+# None of them may still be here either.
 leaked=( $TMPDIR/tmux-apex-git.*(N) )
 eq "no probe leaked its stdout temp file" 0 "${#leaked}"
 
