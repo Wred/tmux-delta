@@ -837,6 +837,13 @@ export STUB_GH_COMMENTS=0
 out=$(verdict --findings 2 --override 2>&1)
 eq "verdict is recorded despite no published comments" 2 "$(mget "$REVIEWER" verdict_findings)"
 contains "the reviewer sees it went through" "recorded for round" "$out"
+eq "the bypass is recorded in member state" 1 "$(mget "$REVIEWER" verdict_override)"
+contains "the bypass is emitted as its own event" '"event":"pair-verdict-override"' "$(ev pair-verdict-override)"
+contains "the ordinary verdict event also flags it" '"override":true' "$(ev pair-verdict)"
+settle "$REVIEWER" >/dev/null
+relayed=$(sent_to %1)
+contains "the worker is told the findings were asserted, not published" "asserted via --override" "$relayed"
+lacks "and is not sent hunting for PR comments" "gh pr view 42" "$relayed"
 unset STUB_GH_COMMENTS
 
 print "\n...and a real published comment satisfies the guard"
