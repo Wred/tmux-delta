@@ -1981,6 +1981,55 @@ APEX_PAIR_DEFER_SECS=${APEX_PAIR_DEFER_SECS:-30}
 APEX_PAIR_DEFER_MAX_CHECKS=${APEX_PAIR_DEFER_MAX_CHECKS:-20}
 APEX_PAIR_DEFER_IDLE_TICKS=${APEX_PAIR_DEFER_IDLE_TICKS:-10}
 
+# _pair_defer_knobs — clamp the two knobs that bound the deferral, into
+# _PAIR_DEFER_SECS and _PAIR_DEFER_MAX.
+#
+# Neither is trusted, for the reason _send_to_pane spells out for its own ticks:
+# a knob that silently switches off the bound it exists to tune is worse than a
+# knob that is ignored. `SECS=0` fires `run-shell -d 0` immediately and burns
+# the whole re-check budget in seconds; a non-numeric value makes `run-shell`
+# error, and the `|| true` there swallows it, so there is no timer at all —
+# which removes the bound on precisely the case the header calls the important
+# one, a relay that was never submitted and so generates no transitions to ride.
+# `MAX_CHECKS=0` makes the first re-check the last, i.e. the feature off.
+# Warn rather than _die: this runs on the relay path, and a defaulted bound
+# beats refusing to adjudicate.
+_pair_defer_knobs() {
+	_PAIR_DEFER_SECS=${APEX_PAIR_DEFER_SECS}
+	_PAIR_DEFER_MAX=${APEX_PAIR_DEFER_MAX_CHECKS}
+	if [[ $_PAIR_DEFER_SECS != <-> ]] || (( _PAIR_DEFER_SECS < 1 )); then
+		print -u2 "tmux-apex: APEX_PAIR_DEFER_SECS='${APEX_PAIR_DEFER_SECS}' is not a positive integer; using 30"
+		_PAIR_DEFER_SECS=30
+	fi
+	if [[ $_PAIR_DEFER_MAX != <-> ]] || (( _PAIR_DEFER_MAX < 1 )); then
+		print -u2 "tmux-apex: APEX_PAIR_DEFER_MAX_CHECKS='${APEX_PAIR_DEFER_MAX_CHECKS}' is not a positive integer; using 20"
+		_PAIR_DEFER_MAX=20
+	fi
+}
+
+# _pair_defer_write <manager> <from> <pair> <target> <prev-round> <prev-turn> <text> <residue> <checks>
+#
+# Write the record to both halves. Shared by the arm and the re-arm so the two
+# cannot disagree about which fields make up a deferral, and so a re-check that
+# defers again updates the same set of members the arm wrote.
+_pair_defer_write() {
+	local manager="$1" from="$2" pair="$3" target="$4"
+	local prev_round="$5" prev_turn="$6" text="$7" residue="$8" checks="$9"
+	local rec m
+	rec=$(jq -nc --arg t "$target" --arg text "$text" --arg res "$residue" \
+		--arg from "$from" --arg pair "$pair" --arg pt "$prev_turn" \
+		--argjson pr "${prev_round:-1}" --argjson n "${checks:-0}" \
+		'{pair_defer_target:$t, pair_defer_text:$text, pair_defer_residue:$res,
+		  pair_defer_from:$from, pair_defer_pair:$pair,
+		  pair_defer_prev_round:$pr, pair_defer_prev_turn:$pt,
+		  pair_defer_checks:$n}')
+	for m in "$from" "$pair"; do
+		[[ -n $m ]] || continue
+		[[ -f $(apex_member_file "$manager" "$m") ]] || continue
+		apex_member_merge "$manager" "$m" "$rec"
+	done
+}
+
 # _pair_defer_arm <manager> <from> <pair> <target> <prev-round> <prev-turn> <text> [residue]
 #
 # Record an unconfirmed relay for later adjudication and schedule the first
@@ -2000,18 +2049,8 @@ _pair_defer_arm() {
 	text=${text//$'\n'/ }
 	text=${text//$'\r'/ }
 
-	local rec m
-	rec=$(jq -nc --arg t "$target" --arg text "$text" --arg res "$residue" \
-		--arg from "$from" --arg pair "$pair" --arg pt "$prev_turn" \
-		--argjson pr "${prev_round:-1}" --argjson n 0 \
-		'{pair_defer_target:$t, pair_defer_text:$text, pair_defer_residue:$res,
-		  pair_defer_from:$from, pair_defer_pair:$pair,
-		  pair_defer_prev_round:$pr, pair_defer_prev_turn:$pt,
-		  pair_defer_checks:$n}')
-	for m in "$from" "$pair"; do
-		[[ -n $m ]] || continue
-		apex_member_merge "$manager" "$m" "$rec"
-	done
+	_pair_defer_write "$manager" "$from" "$pair" "$target" \
+		"$prev_round" "$prev_turn" "$text" "$residue" 0
 	apex_event "$manager" "$(jq -nc --arg s "$from" --arg t "$target" \
 		'{event:"pair-relay-deferred-armed", session:$s, target:$t}')"
 	_pair_defer_schedule "$manager" "$from"
@@ -2022,23 +2061,77 @@ _pair_defer_arm() {
 # outlive a hook process or hold a sleeping watcher open.
 _pair_defer_schedule() {
 	local manager="$1" member="$2"
-	tmux run-shell -b -d "$APEX_PAIR_DEFER_SECS" \
+	local _PAIR_DEFER_SECS _PAIR_DEFER_MAX
+	_pair_defer_knobs
+	tmux run-shell -b -d "$_PAIR_DEFER_SECS" \
 		"${SELF} _pair-defer-check ${(q)member} ${(q)manager}" 2>/dev/null || true
 }
 
-# _pair_defer_clear <manager> <member> — drop the record from both halves.
+# _pair_defer_clear <manager> <member> — drop the record from every half.
+#
+# The record names its own members, so clear by those rather than by which half
+# happened to call: pair_defer_pair is the *target*, identical in both files, so
+# deriving "the other one" from it clears the caller twice and leaves the sender
+# armed — and a sender still armed after its relay was confirmed goes on to
+# re-check a resolved relay and can roll back a round that landed.
 _pair_defer_clear() {
-	local manager="$1" member="$2" pair m
-	pair=$(apex_member_get "$manager" "$member" pair_defer_pair 2>/dev/null)
-	[[ -n $pair ]] || pair=$(apex_member_get "$manager" "$member" pair 2>/dev/null)
-	for m in "$member" "$pair"; do
+	local manager="$1" member="$2" m
+	local -a members
+	members=("$member")
+	for m in \
+		$(apex_member_get "$manager" "$member" pair_defer_from 2>/dev/null) \
+		$(apex_member_get "$manager" "$member" pair_defer_pair 2>/dev/null) \
+		$(apex_member_get "$manager" "$member" pair 2>/dev/null)
+	do
 		[[ -n $m ]] || continue
+		(( ${members[(Ie)$m]} )) && continue
+		members+=("$m")
+	done
+	for m in "${members[@]}"; do
 		[[ -f $(apex_member_file "$manager" "$m") ]] || continue
 		apex_member_merge "$manager" "$m" \
 			'{"pair_defer_target":"","pair_defer_text":"","pair_defer_residue":"",
 			  "pair_defer_from":"","pair_defer_pair":"","pair_defer_prev_turn":"",
-			  "pair_defer_checks":0}'
+			  "pair_defer_prev_round":0,"pair_defer_checks":0}'
 	done
+}
+
+# _pair_defer_claim <manager> <member>
+#
+# Take the record off both halves under a lock and hand it to the caller in
+# _PAIR_DEFER_*. Returns 1 when there was nothing to take.
+#
+# A deferral has two independent triggers by design — the timer and either
+# half's idle transition — and adjudicating one is a read-modify-write over a
+# two-second sampling window, so overlap is not a corner case. Claiming the
+# record makes the decision single-shot: the loser finds nothing outstanding
+# and returns to the normal loop instead of escalating a second time or rolling
+# a round back underneath a sibling's _pair_advance. The still-deferred path
+# re-arms what it claimed, which is also what keeps the two halves' re-check
+# counters from diverging and doubling the bound.
+_pair_defer_claim() {
+	setopt localoptions no_err_return
+	local manager="$1" member="$2" lock held=""
+	lock="$APEX_ROOT/$manager/.pair-defer.lock"
+	apex_lock_acquire "$lock" && held=yes
+
+	_PAIR_DEFER_TARGET=$(apex_member_get "$manager" "$member" pair_defer_target 2>/dev/null)
+	if [[ -n $_PAIR_DEFER_TARGET ]]; then
+		_PAIR_DEFER_TEXT=$(apex_member_get "$manager" "$member" pair_defer_text 2>/dev/null)
+		_PAIR_DEFER_RESIDUE=$(apex_member_get "$manager" "$member" pair_defer_residue 2>/dev/null)
+		_PAIR_DEFER_FROM=$(apex_member_get "$manager" "$member" pair_defer_from 2>/dev/null)
+		_PAIR_DEFER_PAIR=$(apex_member_get "$manager" "$member" pair_defer_pair 2>/dev/null)
+		_PAIR_DEFER_PREV_ROUND=$(apex_member_get "$manager" "$member" pair_defer_prev_round 2>/dev/null)
+		_PAIR_DEFER_PREV_TURN=$(apex_member_get "$manager" "$member" pair_defer_prev_turn 2>/dev/null)
+		_PAIR_DEFER_CHECKS=$(apex_member_get "$manager" "$member" pair_defer_checks 2>/dev/null)
+		[[ -n $_PAIR_DEFER_FROM ]] || _PAIR_DEFER_FROM="$member"
+		[[ $_PAIR_DEFER_CHECKS == <-> ]] || _PAIR_DEFER_CHECKS=0
+		[[ $_PAIR_DEFER_PREV_ROUND == <-> ]] || _PAIR_DEFER_PREV_ROUND=1
+		_pair_defer_clear "$manager" "$member"
+	fi
+
+	[[ -n $held ]] && apex_lock_release "$lock"
+	[[ -n $_PAIR_DEFER_TARGET ]]
 }
 
 # _pair_defer_settle <manager> <member>
@@ -2052,26 +2145,24 @@ _pair_defer_clear() {
 _pair_defer_settle() {
 	setopt localoptions no_err_return
 	local manager="$1" member="$2"
-	local target text residue from pair prev_round prev_turn checks
-	target=$(apex_member_get "$manager" "$member" pair_defer_target 2>/dev/null)
-	[[ -n $target ]] || return 0
-	text=$(apex_member_get "$manager" "$member" pair_defer_text 2>/dev/null)
-	residue=$(apex_member_get "$manager" "$member" pair_defer_residue 2>/dev/null)
-	from=$(apex_member_get "$manager" "$member" pair_defer_from 2>/dev/null)
-	pair=$(apex_member_get "$manager" "$member" pair_defer_pair 2>/dev/null)
-	prev_round=$(apex_member_get "$manager" "$member" pair_defer_prev_round 2>/dev/null)
-	prev_turn=$(apex_member_get "$manager" "$member" pair_defer_prev_turn 2>/dev/null)
-	checks=$(apex_member_get "$manager" "$member" pair_defer_checks 2>/dev/null)
-	[[ -n $from ]] || from="$member"
-	[[ $checks == <-> ]] || checks=0
-	[[ $prev_round == <-> ]] || prev_round=1
+	local _PAIR_DEFER_TARGET _PAIR_DEFER_TEXT _PAIR_DEFER_RESIDUE
+	local _PAIR_DEFER_FROM _PAIR_DEFER_PAIR _PAIR_DEFER_PREV_ROUND
+	local _PAIR_DEFER_PREV_TURN _PAIR_DEFER_CHECKS
+	local _PAIR_DEFER_SECS _PAIR_DEFER_MAX
+	_pair_defer_knobs
+	_pair_defer_claim "$manager" "$member" || return 0
+
+	local target="$_PAIR_DEFER_TARGET" text="$_PAIR_DEFER_TEXT"
+	local residue="$_PAIR_DEFER_RESIDUE" from="$_PAIR_DEFER_FROM"
+	local pair="$_PAIR_DEFER_PAIR" prev_round="$_PAIR_DEFER_PREV_ROUND"
+	local prev_turn="$_PAIR_DEFER_PREV_TURN"
+	local -i checks=$_PAIR_DEFER_CHECKS
 
 	local pr; pr=$(apex_member_get "$manager" "$from" pair_pr 2>/dev/null)
 
 	# A partner that has gone away answers the question outright, and it is the
 	# one answer that cannot improve by waiting.
 	if ! _member_alive "$target"; then
-		_pair_defer_clear "$manager" "$member"
 		_pair_rollback "$manager" "$from" "$pair" "$prev_round" "$prev_turn"
 		_pair_escalate "$manager" "$from" stuck \
 			"PAIRED REVIEW STUCK: a relay on PR #${pr} was left unconfirmed while its target pane ($target) was busy, and that session has since gone. Whatever it was working on is not coming back to this loop."
@@ -2080,7 +2171,6 @@ _pair_defer_settle() {
 
 	local pane; pane=$(_agent_pane "$target" 2>/dev/null)
 	if [[ -z $pane ]]; then
-		_pair_defer_clear "$manager" "$member"
 		_pair_rollback "$manager" "$from" "$pair" "$prev_round" "$prev_turn"
 		_pair_escalate "$manager" "$from" stuck \
 			"PAIRED REVIEW STUCK: a relay on PR #${pr} was left unconfirmed, and ${target} no longer has a reachable agent pane to re-check."
@@ -2088,74 +2178,65 @@ _pair_defer_settle() {
 	fi
 
 	# One capture answers both halves of the question about the same instant,
-	# for the reason _box_line_of exists.
+	# for the reason _box_line_of exists. The first capture is iteration 0 of
+	# the sample rather than a block of its own: "the box drained" is the same
+	# conclusion whether it is true on arrival or two ticks in, and stating it
+	# once is what stops the two readings drifting apart.
 	local -i ticks static=0 j
 	ticks=${APEX_PAIR_DEFER_IDLE_TICKS}
 	(( ticks < 1 )) && ticks=1
 	local sig sig0 box
 	sig0=$(_pane_activity_sig "$pane" 2>/dev/null)
 	box=$(_box_line_of "$sig0")
-	if ! _box_pending "$box" "$text" "$residue"; then
-		# The box drained. The relay was submitted after all — which is what the
-		# busy pane was weak evidence for all along — so this is an ordinary
-		# delivery that took longer to prove than the window allowed.
-		_pair_defer_clear "$manager" "$member"
-		apex_event "$manager" "$(jq -nc --arg s "$target" --arg text "$text" \
-			--argjson n "$checks" \
-			'{event:"pair-relay", session:$s, text:$text,
-			  confirmed_late:true, defer_checks:$n}')"
-		return 0
-	fi
-
-	for (( j = 1; j <= ticks; j++ )); do
-		sleep 0.2
-		sig=$(_pane_activity_sig "$pane" 2>/dev/null)
-		box=$(_box_line_of "$sig")
-		# Drained mid-sample: same answer as above, one tick later.
+	for (( j = 0; j <= ticks; j++ )); do
+		if (( j > 0 )); then
+			sleep 0.2
+			sig=$(_pane_activity_sig "$pane" 2>/dev/null)
+			box=$(_box_line_of "$sig")
+		fi
 		if ! _box_pending "$box" "$text" "$residue"; then
-			_pair_defer_clear "$manager" "$member"
+			# The box drained. The relay was submitted after all — which is what
+			# the busy pane was weak evidence for all along — so this is an
+			# ordinary delivery that took longer to prove than the window allowed.
 			apex_event "$manager" "$(jq -nc --arg s "$target" --arg text "$text" \
 				--argjson n "$checks" \
 				'{event:"pair-relay", session:$s, text:$text,
 				  confirmed_late:true, defer_checks:$n}')"
 			return 0
 		fi
-		if [[ $sig == "$sig0" ]]; then
-			(( static += 1 ))
-		else
-			sig0="$sig"; static=0
+		if (( j > 0 )); then
+			if [[ $sig == "$sig0" ]]; then
+				(( static += 1 ))
+			else
+				sig0="$sig"; static=0
+			fi
 		fi
 	done
 
 	if (( static >= ticks )); then
 		# Our text in the box and not one cell changed for the whole sample:
 		# this is the reading that means something. Nobody took the relay.
-		_pair_defer_clear "$manager" "$member"
 		_pair_rollback "$manager" "$from" "$pair" "$prev_round" "$prev_turn"
 		_pair_escalate "$manager" "$from" stuck \
 			"PAIRED REVIEW STUCK: the relay on PR #${pr} is still sitting unsent in ${target}'s input box, and that pane has now been completely idle with it there — so it was never submitted and the partner was never woken. Read the pane, submit or clear the box, then 'pair-resume' this member."
 		return 1
 	fi
 
-	checks=$(( checks + 1 ))
-	if (( checks >= APEX_PAIR_DEFER_MAX_CHECKS )); then
+	(( checks += 1 ))
+	if (( checks >= _PAIR_DEFER_MAX )); then
 		# Still busy, but a deferral with no floor is the silent deadlock #36
 		# refused to allow. Hand it over saying exactly that, and say which of
 		# the two readings ran out — a pane that never stopped working is a
 		# different thing to explain than a pane that stalled.
-		_pair_defer_clear "$manager" "$member"
 		_pair_escalate "$manager" "$from" stuck \
 			"PAIRED REVIEW STUCK: a relay on PR #${pr} has been unconfirmed for ${checks} re-checks — ${target}'s pane has been busy with our text in its input box the whole time and never went quiet. It is most likely working on the relay and the box is just stale, so read the pane before doing anything: if it is working, let it finish and push, then 'pair-resume'. The round was not rolled back, because a round is most likely running."
 		return 1
 	fi
 
-	local m
-	for m in "$member" "$pair"; do
-		[[ -n $m ]] || continue
-		[[ -f $(apex_member_file "$manager" "$m") ]] || continue
-		apex_member_merge "$manager" "$m" \
-			"$(jq -nc --argjson n "$checks" '{pair_defer_checks:$n}')"
-	done
+	# Still busy: put the record back, with this re-check counted, on the same
+	# two halves the arm wrote it to.
+	_pair_defer_write "$manager" "$from" "$pair" "$target" \
+		"$prev_round" "$prev_turn" "$text" "$residue" "$checks"
 	apex_event "$manager" "$(jq -nc --arg s "$target" --argjson n "$checks" \
 		'{event:"pair-relay-still-deferred", session:$s, defer_checks:$n}')"
 	_pair_defer_schedule "$manager" "$member"
@@ -2491,7 +2572,7 @@ _cmd_unlink() {
 			'{"pair":"","pair_role":"","pair_state":"","pair_turn":"","pair_message":"",
 			  "pair_defer_target":"","pair_defer_text":"","pair_defer_residue":"",
 			  "pair_defer_from":"","pair_defer_pair":"","pair_defer_prev_turn":"",
-			  "pair_defer_checks":0}'
+			  "pair_defer_prev_round":0,"pair_defer_checks":0}'
 	done
 	apex_event "$manager" "$(jq -nc --arg s "$member" '{event:"pair-unlink", session:$s}')"
 	print "Unlinked ${member}${pair:+ and $pair}."

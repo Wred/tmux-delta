@@ -250,6 +250,8 @@ EVENTS="$XDG_CACHE_HOME/tmux-delta/apex/$MGR/events.jsonl"
 apex() { "$APEX" "$@" 2>&1 || true }
 # Last event of a given type, as compact JSON ("" if none).
 ev() { jq -c --arg e "$1" 'select(.event == $e)' "$EVENTS" 2>/dev/null | tail -1 }
+# How many events of a given type the log holds.
+ev_count() { jq -c --arg e "$1" 'select(.event == $e)' "$EVENTS" 2>/dev/null | wc -l | tr -d ' ' }
 
 mget() { jq -r --arg k "$2" '.[$k] // "" | tostring' "$MEMBERS/$1.json" }
 
@@ -666,6 +668,11 @@ export APEX_PAIR_DEFER_IDLE_TICKS=2
 apex _pair-defer-check "$REVIEWER" "$MGR" >/dev/null
 eq "the deferral survives" "$WORKER" "$(mget "$REVIEWER" pair_defer_target)"
 eq "and counts the re-check" 1 "$(mget "$REVIEWER" pair_defer_checks)"
+# On both halves, or the counters diverge as the two trigger paths take turns
+# and the bound below is quietly worth twice what it says.
+eq "on both halves" 1 "$(mget "$WORKER" pair_defer_checks)"
+eq "and the record is still whole on the other half" 1 \
+	"$(mget "$WORKER" pair_defer_prev_round)"
 eq "the loop is still active" active "$(mget "$REVIEWER" pair_state)"
 lacks "and still nothing for the manager" "STUCK" "$(apex pending)"
 
@@ -691,6 +698,63 @@ contains "and gives the recovery order, not just the symptom" \
 # what issue #29's guard exists to refuse.
 eq "the round is left alone, because one is probably running" 2 \
 	"$(mget "$WORKER" pair_round)"
+
+# Neither bound knob is trusted, for the reason _send_to_pane clamps its own:
+# a value that switches off the bound it exists to tune is worse than a value
+# that is ignored. MAX_CHECKS=0 makes the first re-check the last, i.e. the
+# deferral off; SECS=0 fires the timer immediately and burns the budget in
+# seconds, and a non-numeric value makes `run-shell` error into the `|| true`
+# so there is no timer at all — removing the bound on exactly the case that
+# has no transitions to ride.
+print "\nthe defer bounds are clamped, not trusted"
+reset --max=3
+verdict --findings 2 >/dev/null
+export STUB_PANE_TEXT='[apex from:apex-pair] PAIRED REVIEW'
+export STUB_PANE_NO_DRAIN=1
+export STUB_PANE_BUSY=1
+export APEX_SEND_SETTLE_TICKS=6
+settle "$REVIEWER" >/dev/null
+unset APEX_SEND_SETTLE_TICKS
+export APEX_PAIR_DEFER_IDLE_TICKS=2
+export APEX_PAIR_DEFER_MAX_CHECKS=0
+export APEX_PAIR_DEFER_SECS=nope
+out=$(apex _pair-defer-check "$REVIEWER" "$MGR")
+unset APEX_PAIR_DEFER_MAX_CHECKS APEX_PAIR_DEFER_SECS APEX_PAIR_DEFER_IDLE_TICKS
+unset STUB_PANE_TEXT STUB_PANE_NO_DRAIN STUB_PANE_BUSY
+contains "a zero check bound is refused out loud" "APEX_PAIR_DEFER_MAX_CHECKS" "$out"
+contains "and so is a non-numeric delay" "APEX_PAIR_DEFER_SECS" "$out"
+eq "the deferral still defers on the documented default" "$WORKER" \
+	"$(mget "$REVIEWER" pair_defer_target)"
+eq "rather than escalating on the first re-check" active \
+	"$(mget "$REVIEWER" pair_state)"
+
+# The deferral has two independent triggers by design, so adjudicating it is a
+# read-modify-write two callers can enter at once. Claiming the record makes
+# the decision single-shot: the second caller finds nothing outstanding and
+# returns to the normal loop rather than escalating again or rolling a round
+# back underneath the first caller's advance.
+print "\nadjudicating a deferral is single-shot"
+reset --max=3
+verdict --findings 2 >/dev/null
+export STUB_PANE_TEXT='[apex from:apex-pair] PAIRED REVIEW'
+export STUB_PANE_NO_DRAIN=1
+export STUB_PANE_BUSY=1
+export APEX_SEND_SETTLE_TICKS=6
+settle "$REVIEWER" >/dev/null
+unset APEX_SEND_SETTLE_TICKS STUB_PANE_BUSY       # pane quiet, text still there
+export APEX_PAIR_DEFER_IDLE_TICKS=2
+apex _pair-defer-check "$REVIEWER" "$MGR" >/dev/null
+eq "the first caller escalates" stuck "$(mget "$REVIEWER" pair_state)"
+eq "and rolls the round back" 1 "$(mget "$WORKER" pair_round)"
+# Re-arm the state a live loop would be in and let the losing trigger fire.
+apex_probe_round=$(mget "$WORKER" pair_round)
+apex _pair-defer-check "$WORKER" "$MGR" >/dev/null
+apex _pair-defer-check "$REVIEWER" "$MGR" >/dev/null
+unset APEX_PAIR_DEFER_IDLE_TICKS STUB_PANE_TEXT STUB_PANE_NO_DRAIN
+eq "a second trigger finds nothing to adjudicate" "$apex_probe_round" \
+	"$(mget "$WORKER" pair_round)"
+eq "and does not re-escalate" 1 \
+	"$(ev_count pair-relay-deferred-armed)"
 
 # The other reading, and the only one that means undelivered: our text in the
 # box and the pane not repainting a single cell. Nobody took it. This is the
@@ -735,6 +799,14 @@ unset APEX_SEND_SETTLE_TICKS STUB_PANE_NO_DRAIN STUB_PANE_BUSY STUB_PANE_TEXT
 settle "$WORKER" >/dev/null
 eq "the deferral is resolved by the transition" "" \
 	"$(mget "$WORKER" pair_defer_target)"
+# Clearing has to reach the *sender*, and the record is the only thing that
+# knows which half that is: pair_defer_pair names the target in both files, so
+# deriving "the other one" from it clears the settling half twice and leaves the
+# sender armed — which then re-checks a relay already confirmed and can roll
+# back a round that landed. That is the false escalation this file exists to
+# stop, arriving by a different door.
+eq "and cleared on the sender half as well" "" \
+	"$(mget "$REVIEWER" pair_defer_target)"
 eq "the loop is still active" active "$(mget "$WORKER" pair_state)"
 eq "and the same transition advances the loop" reviewer "$(mget "$WORKER" pair_turn)"
 contains "so the reviewer is asked to re-review" "Re-review" "$(sent_to %2)"
