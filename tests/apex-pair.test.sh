@@ -1530,6 +1530,45 @@ out=$(verdict --findings 1 2>&1)
 eq "round 2 verdict is recorded" 1 "$(mget "$REVIEWER" verdict_findings)"
 unset STUB_GH_COMMENTS
 
+# ── the live-upgrade window ──────────────────────────────────────────
+# A pair linked *before* per-channel evidence existed has neither a
+# verdict_channel nor a pair_inline_baseline in its member file, and this
+# repo is reloaded in place (`tmux source`) while loops are mid-flight. Both
+# states have to behave, and both are where a relocated #60/#47 would hide.
+mdrop() { jq -c --arg k "$2" 'del(.[$k])' "$MEMBERS/$1.json" > "$TMPROOT/md" && mv "$TMPROOT/md" "$MEMBERS/$1.json" }
+
+print "\n...and a verdict with no channel recorded names both endpoints"
+export STUB_GH_COMMENTS=0
+export STUB_GH_INLINE=0
+reset
+export STUB_GH_INLINE=1
+verdict --findings 2 >/dev/null
+mdrop "$REVIEWER" verdict_channel      # as a pre-upgrade member file would be
+settle "$REVIEWER" >/dev/null
+relayed=$(sent_to %1)
+contains "the fixer is pointed at the issue-level channel" "gh pr view 42 --comments" "$relayed"
+contains "and at the inline one" "pulls/42/comments" "$relayed"
+contains "and told the channel is unknown" "was not recorded" "$relayed"
+unset STUB_GH_COMMENTS STUB_GH_INLINE
+
+# `gh pr view --comments` does not surface inline review comments, so an
+# unknown channel must not be described as covered by it alone.
+lacks "no claim that one endpoint covers both" "covers both" "$relayed"
+
+print "\n...and a missing inline baseline fails closed rather than passing"
+export STUB_GH_COMMENTS=0
+export STUB_GH_INLINE=0
+reset
+mdrop "$REVIEWER" pair_inline_baseline # linked before the field existed
+export STUB_GH_INLINE=3                # inline comments from earlier rounds
+out=$(verdict --findings 1 2>&1)
+contains "the verdict is refused" "no comments published since this round started" "$out"
+eq "and nothing is recorded" "" "$(mget "$REVIEWER" verdict_findings)"
+export STUB_GH_COMMENTS=1              # a real issue-level comment this round
+out=$(verdict --findings 1 2>&1)
+eq "the channel with a real baseline still satisfies it" issue "$(mget "$REVIEWER" verdict_channel)"
+unset STUB_GH_COMMENTS STUB_GH_INLINE
+
 # ── two-argument option guards ───────────────────────────────────────
 # zsh's `shift 2` with one positional left fails *and leaves $# unchanged*, so
 # an unguarded `while (( $# ))` parser spins forever. `verdict` is run by the

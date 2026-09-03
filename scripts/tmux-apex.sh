@@ -1856,7 +1856,13 @@ _pair_worker_msg() {
 			inline) where="They are inline review comments, anchored to a file and line: read them with 'gh api repos/{owner}/{repo}/pulls/${pr}/comments'." ;;
 			both)   where="Some are inline review comments anchored to a file and line and some are issue-level comments on the PR: read both with 'gh api repos/{owner}/{repo}/pulls/${pr}/comments' and 'gh pr view ${pr} --comments'." ;;
 			issue)  where="They are issue-level comments on the PR, not inline ones: read them with 'gh pr view ${pr} --comments' ('gh api repos/{owner}/{repo}/pulls/${pr}/comments' returns nothing for this round, which is expected)." ;;
-			*)      where="Read them with 'gh pr view ${pr} --comments', which covers both issue-level and inline comments." ;;
+			# No channel recorded: a verdict from before verdict_channel
+			# existed, i.e. a pair linked across this upgrade. Name both
+			# endpoints and say the channel is unknown — `gh pr view
+			# --comments` does *not* surface inline review comments (see
+			# _pair_comment_counts), so claiming it covers both would
+			# relocate the very #60 failure this branch fixes.
+			*)      where="Check both 'gh pr view ${pr} --comments' and 'gh api repos/{owner}/{repo}/pulls/${pr}/comments' — which channel they are in was not recorded." ;;
 		esac
 		print -r -- "PAIRED REVIEW round ${round}: the reviewer on PR #${pr} recorded ${findings} finding(s) worth addressing. ${where} If nothing readable turns up, report that back rather than assuming you're looking in the wrong place. Fix every BUG/CONCERN finding and push to the PR branch; for anything you disagree with, reply on that review thread saying why rather than silently skipping it. Do NOT message the manager or wait for a human — when your commits are pushed, just stop. The reviewer is re-invoked automatically."
 	fi
@@ -3128,7 +3134,21 @@ _cmd_verdict() {
 				_die "verdict: refusing --findings ${findings} — could not confirm findings were published on PR #${pr} (failed to query GitHub); nothing recorded. Post the findings first, or pass --note TEXT to record them inline. (--override exists only for a genuine can't-publish case — e.g. no network — and is recorded as a bypass, visible to the human, not a quiet way past this)"
 			pub_issue=${counts%% *}; pub_inline=${counts##* }
 			base_issue=$(apex_member_get "$manager" "$member" pair_comment_baseline); [[ $base_issue == <-> ]] || base_issue=0
-			base_inline=$(apex_member_get "$manager" "$member" pair_inline_baseline); [[ $base_inline == <-> ]] || base_inline=0
+			# An *absent* inline baseline is not a zero one. Unlike
+			# pair_comment_baseline, which `link` has always stamped, this
+			# field is new: a pair linked before it existed has no value to
+			# compare against, and defaulting to 0 would let inline comments
+			# from *earlier* rounds pass this round's guard — the #47
+			# false-pass, reintroduced for the length of the upgrade window.
+			# So treat unmeasurable as not-grown, and let only the channel
+			# with a real baseline satisfy the guard. A non-numeric value is
+			# corruption rather than absence and still clamps to 0.
+			base_inline=$(apex_member_get "$manager" "$member" pair_inline_baseline)
+			if [[ -z $base_inline ]]; then
+				base_inline=$pub_inline
+			elif [[ $base_inline != <-> ]]; then
+				base_inline=0
+			fi
 			# When both grew, say so: naming only one would leave the fixer
 			# unaware of half the findings, which is the same
 			# guard-and-relay disagreement in the other direction.
