@@ -58,6 +58,11 @@ lacks() {
 BIN="$TMPROOT/bin"; mkdir -p "$BIN"
 export PATH="$BIN:$PATH"
 export TMUX=fake-socket
+# `recover` waits for a resumed pane's agent to come up before nudging it. The
+# stub pane never execs anything, so every recover of a resumable member would
+# otherwise pay the full real-world ceiling before giving up.
+export APEX_RECOVER_NUDGE_WAIT=1
+export STUB_PANE_CMD=""
 export XDG_CACHE_HOME="$TMPROOT/cache"
 APEX_ROOT="$XDG_CACHE_HOME/tmux-delta/apex"
 
@@ -80,6 +85,10 @@ display-message)
 		# pane target: resolve the pane's session (or echo the pane id back)
 		case "$fmt" in
 			'#S') awk -F'\t' -v p="$target" '$1==p{print $2}' "$STUB/panes" 2>/dev/null ;;
+			# What `_pane_is_agent` asks. Empty by default, so a freshly split
+			# pane reads as the shell it actually is for the first second or
+			# two — which is the case `recover` has to refuse to type into.
+			'#{pane_current_command}') print -r -- "${STUB_PANE_CMD:-}" ;;
 			*)    print -r -- "$target" ;;
 		esac
 	elif [[ -n $target ]]; then
@@ -469,6 +478,17 @@ eq "the recovered record keeps issue" 42     "$(print -r -- "$rec" | jq -r '.iss
 eq "the recovered record carries no PR"  ""  "$(print -r -- "$rec" | jq -r '.review_pr')"
 eq "the recovered pane is tagged with one task" "issue:42" "$(pane_opt "$new_pane" @apex_task)"
 
+# The pane exists but is still a shell, so the continuation cannot be
+# delivered. The one thing recover must not do here is stay quiet about it:
+# "the pane is back" and "the worker is working" are different claims, and
+# reporting the first as the second is how two members sat at an empty prompt
+# for ~24h (issue #42).
+contains "recover says when it could not nudge a resumed member" "NOT nudged" "$out"
+contains "…and says the member will not start on its own" "waiting at an empty prompt" "$out"
+contains "…and hands over the send to run by hand" "send repo-fix-issue-42:" "$out"
+cev=$(grep -F '"event":"recover-continue"' "$APEX_ROOT/$MANAGER/events.jsonl" | tail -1)
+eq "…and records the undelivered nudge" false "$(print -r -- "$cev" | jq -r '.delivered')"
+
 ev=$(grep -F '"event":"recover"' "$APEX_ROOT/$MANAGER/events.jsonl" | tail -1)
 eq "the recover event records that it resumed" true "$(print -r -- "$ev" | jq -r '.resumed')"
 eq "the recover event names the pane it replaced" "repo-fix-issue-42:%7" \
@@ -501,6 +521,67 @@ eq "the event does not claim a resume" false "$(print -r -- "$ev" | jq -r '.resu
 
 # Selecting one member must leave the others alone.
 lacks "a named member is recovered alone" "repo-gone-issue-9" "$out"
+
+# ─── 4b. a resumed member is told to continue (issue #42) ────────────
+
+print "\na resumed member is nudged to continue"
+
+# DELTA_AGENT_RESUME takes precedence over DELTA_AGENT_PROMPT (section 2), so a
+# recovered agent restores its context and then waits at an empty prompt: it
+# resumes *waiting*, not *working*. `starting` was not reportable, no hook ever
+# fired, and nothing in the system could say so — two workers sat like that for
+# ~24h. `recover` now delivers the continuation a human otherwise has to type.
+#
+# Reusing $WT keeps the worker transcript resolvable: `recover` reads the id off
+# disk and refuses to trust the record alone, so a member with no transcript
+# takes the fresh path instead and is never nudged.
+member "resumed:%21" "$(jq -nc --arg wt "$WT" \
+	'{role:"worker", worktree:$wt, issue:"42", review_pr:"", agent:"claude",
+	  mode:"autonomous", status:"idle", seq:6}')"
+
+stub_reset_log
+out=$(STUB_PANE_CMD=node apex recover --yes resumed:%21 2>&1)
+contains "the resumed member is nudged" "Nudged it to continue" "$out"
+lacks "…and recover does not report it as unnudged" "NOT nudged" "$out"
+
+keys=$(grep -F 'send-keys' "$STUB/log")
+contains "the continuation is typed into the new pane" "[apex from:recover]" "$keys"
+contains "…and tells it to pick up where it left off" "Pick up where you left off" "$keys"
+contains "…and is submitted" "Enter" "$keys"
+
+# The whole point of the resume path is that a recovered agent cannot re-run its
+# task and duplicate the commits, the comment and the PR. A continuation is not
+# a task prompt, and this is the assertion that keeps it that way.
+lacks "the nudge is not the task prompt" \
+	"$(delta_task_prompt 42 '' autonomous)" "$keys"
+lacks "…so it cannot re-assign the issue to itself" "--add-assignee" "$keys"
+
+cev=$(grep -F '"event":"recover-continue"' "$APEX_ROOT/$MANAGER/events.jsonl" | tail -1)
+eq "the delivery is recorded" true "$(print -r -- "$cev" | jq -r '.delivered')"
+contains "…against the new member key" "resumed:%" \
+	"$(print -r -- "$cev" | jq -r '.session')"
+
+# A member recovered onto a *fresh* conversation was launched with the task
+# prompt and is already working; nudging it would be a second instruction on
+# top of the first, and the two would race.
+FRESHWT="$TMPROOT/wt/no-transcript-issue-78"; mkdir -p "$FRESHWT"
+member "no-transcript-issue-78:%23" "$(jq -nc --arg wt "$FRESHWT" \
+	'{role:"worker", worktree:$wt, issue:"78", review_pr:"", agent:"claude",
+	  mode:"autonomous"}')"
+out=$(STUB_PANE_CMD=node apex recover --yes no-transcript-issue-78:%23 2>&1)
+contains "a fresh recover says so"     "fresh conversation" "$out"
+lacks "…and is not nudged"             "Nudged it to continue" "$out"
+lacks "…nor reported as needing one"   "NOT nudged" "$out"
+
+# The knob exists for an operator who wants the old behaviour. Turning the
+# nudge off must not turn the reporting off with it — a silently unnudged
+# member is the bug, not the nudge.
+member "optout:%22" "$(jq -nc --arg wt "$WT" \
+	'{role:"worker", worktree:$wt, issue:"42", review_pr:"", agent:"claude",
+	  mode:"autonomous", status:"idle", seq:6}')"
+out=$(STUB_PANE_CMD=node APEX_RECOVER_NUDGE=0 apex recover --yes optout:%22 2>&1)
+contains "the nudge can be turned off"      "NOT nudged (APEX_RECOVER_NUDGE=0)" "$out"
+contains "…and it still says who needs one" "send optout:" "$out"
 
 # ─── 5. recycled pane ids ────────────────────────────────────────────
 

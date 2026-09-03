@@ -189,6 +189,103 @@ eq "a delivered escalation is not re-reported" "" "$(_apex_pending_sig "$MGR")"
 member 'w:%7' working 4 3 ''
 eq "an empty pair message is not an escalation" "" "$(_apex_pending_sig "$MGR")"
 
+# ── a member that never took its first turn (issue #42) ──────────────
+# `starting` is written at registration and only ever moved off by the
+# member's own hooks, so an agent whose launch failed — or that came back
+# from `recover` and is sitting at an empty prompt — holds `starting` with
+# seq 0 for the life of the pane. Every reporting path agreed it had nothing
+# to say, and two workers sat like that for ~24h. Past APEX_STARTING_STALE
+# that is a failure, not a state.
+print "\nstale starting"
+
+# member_started <id> <status> <seq> <pinged_seq> <age-seconds>
+member_started() {
+	apex_init_dirs "$MGR"
+	jq -nc --arg st "$2" --argjson seq "$3" --argjson p "$4" \
+		--argjson t "$(( $(date +%s) - $5 ))" \
+		'{status:$st, seq:$seq, pinged_seq:$p, pair_message:"", spawned_at:$t}' \
+		> "$(apex_member_file "$MGR" "$1")"
+}
+
+reset
+member_started 'w:%7' starting 0 -1 5
+eq "a member that just started is not reported" "" "$(_apex_pending_sig "$MGR")"
+
+member_started 'w:%7' starting 0 -1 60
+eq "…and is reported once it is stale" "w:%7#0" \
+	"$(APEX_STARTING_STALE=30 _apex_pending_sig "$MGR")"
+
+# The default is what an unconfigured manager actually gets, so pin the
+# threshold itself rather than only the knob-overridden path.
+member_started 'w:%7' starting 0 -1 899
+eq "the default threshold has not been reached at 899s" "" "$(_apex_pending_sig "$MGR")"
+member_started 'w:%7' starting 0 -1 901
+eq "…and has at 901s" "w:%7#0" "$(_apex_pending_sig "$MGR")"
+
+# Gated on seq, not on status alone: a member that has run turns has a live
+# agent, and whatever put it back at `starting` is a different problem than
+# "it never started".
+member_started 'w:%7' starting 4 3 5000
+eq "a member that has taken turns is never a stalled start" "" \
+	"$(_apex_pending_sig "$MGR")"
+
+# Records predating spawned_at must read as healthy, not as stalled: the
+# false positive sends the manager to poke a working member, and there is no
+# way to tell a missing timestamp from an ancient one.
+reset
+member 'w:%7' starting 0 -1
+eq "a record with no spawned_at is never stale" "" "$(_apex_pending_sig "$MGR")"
+
+# One-shot, like every other reportable state — the manager is told, and then
+# left to decide, not re-interrupted every second by a condition that by
+# definition will not change on its own.
+reset
+member_started 'w:%7' starting 0 0 5000
+eq "a delivered stalled start is not re-reported" "" "$(_apex_pending_sig "$MGR")"
+
+# `pending` has to say something a manager can act on, and its usual line —
+# read the facts, decide what to tell it — is the wrong reflex here: nothing
+# has happened yet and the real question is whether the agent is running.
+reset
+member_started 'w:%7' starting 0 -1 5000
+out=$(_cmd_pending 2>/dev/null)
+contains "pending names the member"        "session=w:%7" "$out"
+contains "…says it never took a turn"     "never taken a turn" "$out"
+contains "…names the recover/empty-prompt cause" "waiting at an empty prompt" "$out"
+contains "…and hands over the send to run" "send w:%7" "$out"
+lacks "…and does not claim it is idle"    "status=idle" "$out"
+
+# Same invariant as above, over the states this clause introduces: the cheap
+# 1s gate and `pending` must not disagree, or the watcher stays quiet through
+# exactly the stall it was added to surface.
+typeset -a SDISAGREE=()
+typeset -i SREPORTED=0 SCHECKED=0
+for st in starting idle; do
+	for seq in 0 4; do
+		for age in 5 5000; do
+			reset
+			member_started 'w:%7' "$st" "$seq" -1 "$age"
+			p=$(pending_reports); g=$(gate_reports)
+			(( SCHECKED += 1 )) || true; (( SREPORTED += p )) || true
+			[[ $p == "$g" ]] || SDISAGREE+=("status=$st seq=$seq age=${age}s: pending=$p gate=$g")
+		done
+	done
+done
+eq "pending and the gate agree on stalled starts" "" "${(j:; :)SDISAGREE}"
+eq "…over all 8 states"           8 "$SCHECKED"
+eq "…and some of them do report"  5 "$SREPORTED"
+
+# A garbage threshold must not silently disable every reporting path at once.
+# `--argjson` would fail, which makes every jq in the file exit non-zero,
+# which reads as "nothing to report" everywhere — the exact silence this
+# clause exists to end. So it is clamped, loudly, not trusted.
+reset
+member 'w:%7' idle 3 -1
+err=$(APEX_STARTING_STALE=soon _apex_pending_sig "$MGR" 2>&1 >/dev/null)
+contains "a non-numeric threshold is reported" "APEX_STARTING_STALE" "$err"
+eq "…and does not take the rest of reportability down with it" "w:%7#3" \
+	"$(APEX_STARTING_STALE=soon _apex_pending_sig "$MGR" 2>/dev/null)"
+
 # ── nudging ──────────────────────────────────────────────────────────
 print "_apex_watch_tick"
 

@@ -2482,11 +2482,71 @@ _cmd_status() {
 # wake the member back into `working` before the manager next pulls, which
 # would otherwise defer "READY FOR HUMAN REVIEW" by a whole agent turn —
 # likeliest in exactly the cases that need it soonest.
-_APEX_REPORTABLE_JQ='def reportable:
+#
+# The second half of the predicate is the member that never reached its first
+# turn (issue #42). `starting` is written once, at registration, and is only
+# ever moved off by the member's own hooks — so an agent whose launch failed,
+# whose hooks are not wired, or that came back from `recover` and is sitting at
+# an empty prompt stays `starting` with seq 0 for as long as the pane lives,
+# and every reporting path used to agree it had nothing to say. That was a
+# silent 24h stall on two workers. Past APEX_STARTING_STALE seconds, never
+# having taken a turn is not a state, it is a failure, so report it.
+#
+# Gated on seq 0 as well as on status, not status alone: a member that has run
+# turns and is somehow back at `starting` has a live agent and a different
+# problem. And gated on `spawned_at` being present — records written before
+# that field existed read as "spawned just now" and are never called stale,
+# which is the safe direction for a check whose false positive tells the
+# manager to go poke a healthy worker.
+#
+# Note that this reports *once*, like every other reportable state: the
+# `--mark-delivered` CAS advances pinged_seq to 0, which equals the stalled
+# member's seq, so the member falls out of the predicate again. One nudge is
+# the whole point — it breaks the silence and hands the manager a member key.
+# It deliberately does not keep repeating, because a manager that has been
+# told and has chosen to wait should not be re-interrupted every minute.
+_APEX_REPORTABLE_JQ='def stalled_start:
+	.status == "starting"
+	and (.seq // 0) == 0
+	and (.spawned_at != null)
+	and ($now - .spawned_at) >= $stale;
+def reportable:
 	((.seq // 0) != (.pinged_seq // -1))
 	and (((.pair_message // "") != "")
-	     or .status == "idle" or .status == "attention");
+	     or .status == "idle" or .status == "attention"
+	     or stalled_start);
 '
+
+# How long a member may sit at `starting`, never having taken a turn, before
+# reportable calls it a failure. Generous by default: a cold agent launch on a
+# loaded machine is seconds, not minutes, but a spawn that is merely slow must
+# never be reported as broken.
+APEX_STARTING_STALE=${APEX_STARTING_STALE:-900}
+
+# _apex_reportable_args — the jq bindings `reportable` needs, into
+# $_APEX_REPORTABLE_ARGS.
+#
+# The predicate is shared by three readers precisely so they cannot drift, and
+# it now takes two bindings; handing each reader the job of assembling them
+# would put the drift straight back, one call site at a time. `now` is read per
+# call rather than once at startup because the watcher holds one process open
+# for days.
+#
+# The knob is clamped here rather than validated at some door, because there is
+# no single door: `pending` runs from the manager's hooks, the sig runs from the
+# watcher, and each per-file read runs on its own. A non-numeric value would
+# make `--argjson` fail, which makes every jq in this file exit non-zero, which
+# reads as "nothing to report" everywhere at once — the exact silence this
+# check exists to end.
+typeset -ga _APEX_REPORTABLE_ARGS
+_apex_reportable_args() {
+	local stale=$APEX_STARTING_STALE
+	if [[ $stale != <-> ]]; then
+		print -u2 "tmux-apex: APEX_STARTING_STALE='${APEX_STARTING_STALE}' is not a whole number of seconds; using 900"
+		stale=900
+	fi
+	_APEX_REPORTABLE_ARGS=(--argjson now "$(date +%s)" --argjson stale "$stale")
+}
 
 _cmd_pending() {
 	local mark=false a
@@ -2496,7 +2556,9 @@ _cmd_pending() {
 	manager=$(_require_manager)
 	APEX_SESSION="$manager"
 
-	local s st seq rawseq role task facts summary pair_msg
+	_apex_reportable_args
+
+	local s st seq rawseq role task facts summary pair_msg spawned age
 	for s in ${(f)"$(apex_members "$manager")"}; do
 		[[ -z $s ]] && continue
 
@@ -2515,7 +2577,7 @@ _cmd_pending() {
 		# must not touch `_member_facts`, so the two still *enumerate* members
 		# differently. Only the predicate is shared, which is the part that
 		# drifted.
-		jq -e "$_APEX_REPORTABLE_JQ"'reportable' \
+		jq -e "${_APEX_REPORTABLE_ARGS[@]}" "$_APEX_REPORTABLE_JQ"'reportable' \
 			"$(apex_member_file "$manager" "$s")" >/dev/null 2>&1 || continue
 
 		st=$(apex_member_get "$manager" "$s" status)
@@ -2530,6 +2592,17 @@ _cmd_pending() {
 
 		if [[ -n $pair_msg ]]; then
 			print "[apex] session=${s} role=${role} ${task:+task=${task} }— ${pair_msg} (${summary})"
+		elif [[ $st == starting ]]; then
+			# A stalled start needs a different line from every other report,
+			# because the manager's usual reflex — read the member's facts, decide
+			# what to tell it next — is wrong here. Nothing has happened yet, the
+			# facts line describes a worktree nobody has touched, and the actual
+			# question is whether the agent is even running. Say that, and say the
+			# two things that fix it.
+			spawned=$(apex_member_get "$manager" "$s" spawned_at)
+			age=""
+			[[ $spawned == <-> ]] && age=" for $(( $(date +%s) - spawned ))s"
+			print "[apex] session=${s} role=${role} ${task:+task=${task} }status=starting${age} — it has never taken a turn. Its agent may have failed to launch, its hooks may not be wired (${SELF} doctor), or it was recovered and is waiting at an empty prompt. Look at the pane, then either '${SELF} send ${s} <continue where you left off>' or recover/respawn it. Not reported again unless it changes."
 		else
 			print "[apex] session=${s} role=${role} ${task:+task=${task} }status=${st} — ${summary}. Full state: ${SELF} status --json"
 		fi
@@ -2863,6 +2936,96 @@ _apex_session_label() {
 	delta_session_label "$1" "$2" "${3:-}"
 }
 
+# How long `recover` waits for a resumed agent's pane to actually be running an
+# agent before it gives up on nudging it. A cold launch is seconds; this is the
+# ceiling for "something went wrong", and it is what a `recover --yes` of a
+# broken member costs in wall-clock, so it is not generous.
+APEX_RECOVER_NUDGE_WAIT=${APEX_RECOVER_NUDGE_WAIT:-60}
+
+# _apex_wait_for_agent <pane> <seconds> — block until <pane> is running a
+# coding agent, or give up.
+#
+# Needed because a freshly split pane is a *shell* for the first second or two:
+# tmux returns the pane id the moment the split exists, long before
+# `direnv exec … zsh -ic 'claude …'` has execed anything. Sending into it then
+# would run the message as a shell command, which _pane_is_agent exists to
+# prevent — so the choice is to wait for the agent or not to nudge at all.
+_apex_wait_for_agent() {
+	local pane="$1" secs="$2"
+	local -i ticks
+	[[ $secs == <-> ]] || secs=60
+	ticks=$(( secs * 2 ))
+	(( ticks < 1 )) && ticks=1
+	local -i i
+	for (( i = 1; i <= ticks; i++ )); do
+		_pane_is_agent "$pane" && return 0
+		(( i < ticks )) && sleep 0.5
+	done
+	return 1
+}
+
+# _apex_continue_resumed <manager> <member> <pane> — tell a just-resumed agent
+# to carry on (issue #42).
+#
+# The resume path gives DELTA_AGENT_RESUME precedence over DELTA_AGENT_PROMPT on
+# purpose, so a recovered worker cannot re-run its task and duplicate commits.
+# The cost of that correctness is that the agent comes back and sits at an empty
+# prompt forever: `status` says `starting`, seq never moves, and (before the
+# reportable change above) nothing anywhere would ever say so. Two workers sat
+# like that for ~24h.
+#
+# So `recover` delivers the nudge a human otherwise has to type. This is not the
+# task prompt — see delta_resume_continuation — so the no-duplicate-work
+# property the resume path buys is untouched.
+#
+# Synchronous, and reported line by line, on purpose. A backgrounded nudge would
+# make `recover --yes` return before anyone knows whether the member is actually
+# working, which is the same "looks like recovery worked" failure the transcript
+# resolution above was written to avoid. Waiting a few seconds per member is the
+# cheaper half of that trade, and it means the printed output — the only thing
+# the manager reads — states plainly which members were nudged and which are
+# still sitting at a prompt.
+_apex_continue_resumed() {
+	local manager="$1" member="$2" pane="$3" text rc=0
+	source "${SCRIPTS}/lib/agent-prompts.sh"
+	text=$(delta_resume_continuation)
+
+	local -a ev=(--arg s "$member")
+	if [[ ${APEX_RECOVER_NUDGE:-1} != 1 ]]; then
+		print "  NOT nudged (APEX_RECOVER_NUDGE=${APEX_RECOVER_NUDGE}): it is waiting at an empty prompt and will not start on its own."
+		print "  Send it a continuation yourself: ${SELF} send ${member} <continue where you left off>"
+		apex_event "$manager" "$(jq -nc "${ev[@]}" \
+			'{event:"recover-continue", session:$s, delivered:false, reason:"disabled"}')"
+		return 0
+	fi
+
+	if ! _apex_wait_for_agent "$pane" "$APEX_RECOVER_NUDGE_WAIT"; then
+		print "  NOT nudged: pane ${pane} was still not running an agent after ${APEX_RECOVER_NUDGE_WAIT}s, so it is waiting at an empty prompt and will not start on its own."
+		print "  Its launch may have failed. Look at the pane; if the agent is up, ${SELF} send ${member} <continue where you left off>"
+		apex_event "$manager" "$(jq -nc "${ev[@]}" \
+			'{event:"recover-continue", session:$s, delivered:false,
+			  reason:"pane never came up as an agent"}')"
+		return 0
+	fi
+
+	_deliver "$member" recover "$text" || rc=$?
+	if (( rc != 0 )); then
+		print "  NOT nudged: delivery failed (rc=${rc}); it is waiting at an empty prompt."
+		print "  Retry with: ${SELF} send ${member} <continue where you left off>"
+		apex_event "$manager" "$(jq -nc "${ev[@]}" --argjson rc "$rc" \
+			'{event:"recover-continue", session:$s, delivered:false, deliver_rc:$rc}')"
+		return 0
+	fi
+
+	print "  Nudged it to continue (${_DELIVER_VIA})."
+	[[ -n ${APEX_SEND_UNCONFIRMED:-} ]] \
+		&& print "  NOTE: its input box never drained; assumed submitted, not re-sent."
+	apex_event "$manager" "$(jq -nc "${ev[@]}" --arg text "$text" \
+		--arg via "${_DELIVER_VIA:-}" --arg unconf "${APEX_SEND_UNCONFIRMED:-}" \
+		'{event:"recover-continue", session:$s, delivered:true, via:$via, text:$text}
+		 + (if $unconf != "" then {unconfirmed:true} else {} end)')"
+}
+
 # recover [--yes] [member ...] — put crashed members back, with their
 # conversations intact.
 #
@@ -3034,6 +3197,10 @@ _cmd_recover() {
 
 		if [[ -n $sid ]]; then
 			print "Recovered $new_key (resumed conversation $sid)"
+			# A resumed agent restores context and waits; a fresh one was launched
+			# with the task prompt and is already working. Only the first needs
+			# telling to carry on, and only the first must never be re-prompted.
+			_apex_continue_resumed "$manager" "$new_key" "$pane"
 		else
 			print "Recovered $new_key (fresh conversation — nothing resumable found)"
 		fi
@@ -3139,6 +3306,7 @@ _apex_watch_statefile() { printf '%s/watch-state.json' "$(apex_dir "$1")"; }
 
 _apex_pending_sig() {
 	local manager="$1" dir
+	_apex_reportable_args
 	dir=$(apex_members_dir "$manager")
 	local -a files=("$dir"/*.json(N)) names=()
 	(( ${#files} )) || return 0
@@ -3153,7 +3321,8 @@ _apex_pending_sig() {
 	# legal), which would split one name into two and misalign every name after
 	# it, but they cannot contain a newline.
 	local sig rc=0
-	sig=$(jq -rs --arg names "${(pj:\n:)names}" "$_APEX_REPORTABLE_JQ"'
+	sig=$(jq -rs --arg names "${(pj:\n:)names}" \
+		"${_APEX_REPORTABLE_ARGS[@]}" "$_APEX_REPORTABLE_JQ"'
 		($names | split("\n")) as $n
 		| [ range(0; length) as $i
 		    | .[$i]
@@ -3176,7 +3345,7 @@ _apex_pending_sig() {
 	local -a out=()
 	local i one
 	for (( i = 1; i <= ${#files}; i++ )); do
-		one=$(jq -r "$_APEX_REPORTABLE_JQ"'
+		one=$(jq -r "${_APEX_REPORTABLE_ARGS[@]}" "$_APEX_REPORTABLE_JQ"'
 			select(reportable)
 			| "#\(.seq // 0)\(if (.pair_message // "") != "" then "!" else "" end)"
 			' "${files[$i]}" 2>/dev/null) || continue
@@ -3812,6 +3981,7 @@ case "${1:-}" in
 		print "                                  uncommitted or unpushed work)"
 		print "  recover [--yes] [member ...]   re-create dead members' panes, resuming"
 		print "                                 their conversations (after a tmux crash)"
+		print "                                 and nudging each resumed agent to continue"
 		print "  profiles                       list available spawn profiles"
 		print "  doctor                         check that ping-delivery hooks are wired"
 		[[ -n ${1:-} ]] && exit 1
