@@ -228,6 +228,36 @@ esac
 exit 0
 EOF
 chmod +x "$BIN/tmux" "$BIN/gh"
+
+# git stub: `ls-remote` only — everything else is the real thing, because the
+# worktree below is a real repo and the code under test reads a real branch
+# name out of it. The loop's "did the branch move?" check (issue #48) asks the
+# remote, and there is no remote here to ask.
+#
+# The default answers with a *different* SHA on every read, so a round's
+# baseline stamp and the later comparison never collide: that is the pushed
+# case, which is what almost every test in this file means by "the worker went
+# idle". Tests that mean "nothing was pushed" pin STUB_GIT_HEAD to a fixed
+# value; STUB_GIT_ABSENT models a branch the remote does not have at all, and
+# STUB_GIT_LSREMOTE_FAIL an unreachable one.
+cat > "$BIN/git" <<'EOF'
+#!/usr/bin/env bash
+for a in "$@"; do
+	[ "$a" = "ls-remote" ] || continue
+	[ -n "${STUB_GIT_LSREMOTE_FAIL:-}" ] && exit 128
+	[ -n "${STUB_GIT_ABSENT:-}" ] && exit 0
+	if [ -n "${STUB_GIT_HEAD:-}" ]; then
+		printf '%s\trefs/heads/stub\n' "$STUB_GIT_HEAD"
+	else
+		n=$(( $(cat "$STUB_GIT.n" 2>/dev/null || echo 0) + 1 ))
+		printf '%s\n' "$n" > "$STUB_GIT.n"
+		printf '%040d\trefs/heads/stub\n' "$n"
+	fi
+	exit 0
+done
+exec /usr/bin/git "$@"
+EOF
+chmod +x "$BIN/git"
 export PATH="$BIN:$PATH"
 
 export XDG_CACHE_HOME="$TMPROOT/cache"
@@ -236,6 +266,8 @@ export STUB_PANES="$TMPROOT/panes"
 export STUB_PANE_SESSION=wt
 export STUB_SENT="$TMPROOT/sent.tsv"
 export STUB_GH="$TMPROOT/gh.log"
+# Not a log: only `$STUB_GIT.n` is used, as the ls-remote stub's SHA counter.
+export STUB_GIT="$TMPROOT/git-stub"
 export STUB_SESSION=mgr
 export TMUX=fake-socket
 
@@ -278,6 +310,16 @@ reset() {
 
 	local m
 	mkdir -p "$TMPROOT/wt"
+	# A real repo on a real branch: _pair_pushed_head resolves the branch name
+	# with git and treats a detached or non-repo worktree as unknowable, which
+	# would make every push check fail open and assert nothing.
+	if [[ ! -d $TMPROOT/wt/.git ]]; then
+		/usr/bin/git -C "$TMPROOT/wt" init -q -b apex-issue-9
+		/usr/bin/git -C "$TMPROOT/wt" -c user.email=t@t -c user.name=t \
+			commit -q --allow-empty -m seed
+	fi
+	unset STUB_GIT_HEAD STUB_GIT_ABSENT STUB_GIT_LSREMOTE_FAIL
+	rm -f "$STUB_GIT.n"
 	for m in "$WORKER" "$REVIEWER"; do
 		jq -nc --arg wt "$TMPROOT/wt" --argjson t 1 '{agent:"claude", worktree:$wt, status:"idle",
 			seq:1, pinged_seq:1, spawned_at:$t, updated_at:$t}' > "$MEMBERS/$m.json"
@@ -357,6 +399,110 @@ contains "re-review names the PR"          "/my-pr-review 42"    "$relayed"
 contains "re-review re-states the verdict duty" "verdict --none" "$relayed"
 eq "the turn passes back to the reviewer" reviewer "$(mget "$WORKER" pair_turn)"
 eq "manager still not pinged" "" "$(apex pending)"
+
+# ── worker went idle without pushing (issue #48) ─────────────────────
+#
+# Idle is the only signal the transition carries, and a worker parked on a
+# human decision — exactly what its prompt tells it to do — looks identical to
+# one that pushed the round's fixes. Relaying anyway spent a round of the cap
+# on re-reviewing an unchanged commit, which is what happened on PR #46.
+print "\nworker idle without a push does not relay"
+reset
+# Pin the remote tip: the reviewer's relay stamps this as round 2's baseline,
+# and the worker's idle reads back the same value.
+export STUB_GIT_HEAD=deadbeefdeadbeefdeadbeefdeadbeefdeadbeef
+verdict --findings 2 >/dev/null
+settle "$REVIEWER" >/dev/null
+eq "the baseline is stamped on the worker"   "$STUB_GIT_HEAD" "$(mget "$WORKER" pair_worker_head)"
+eq "and on the reviewer"                     "$STUB_GIT_HEAD" "$(mget "$REVIEWER" pair_worker_head)"
+: > "$STUB_SENT"
+
+settle "$WORKER" >/dev/null
+lacks "the reviewer is not asked to re-review" "Re-review" "$(sent_to %2)"
+eq "the turn stays with the worker"    worker   "$(mget "$WORKER" pair_turn)"
+eq "the round is not spent"            2        "$(mget "$WORKER" pair_round)"
+eq "the loop stays active"             active   "$(mget "$WORKER" pair_state)"
+contains "and it is recorded"          '"event":"pair-no-push"' "$(ev pair-no-push)"
+
+# A worker that stopped without doing the work is the manager's problem, not
+# the reviewer's, so the transition falls through to `pending` rather than
+# being swallowed by the loop.
+out=$(apex pending)
+contains "the manager is told"                 "PAIRED REVIEW WAITING" "$out"
+contains "and told what it means"              "without pushing anything" "$out"
+contains "and that no round was spent"         "no round was spent"    "$out"
+contains "and where to look"                   "worker's pane"         "$out"
+eq "reported once, not per pane" 1 "$(print -r -- "$out" | grep -c 'PAIRED REVIEW WAITING')"
+# One-shot, like every other pair message: a worker parked on a decision the
+# manager has already been handed must not re-interrupt it every transition.
+apex pending --mark-delivered >/dev/null
+eq "and not repeated once delivered" "" "$(apex pending)"
+eq "the message is cleared" "" "$(mget "$WORKER" pair_message)"
+
+print "\n…and the loop resumes on its own once the push lands"
+export STUB_GIT_HEAD=cafebabecafebabecafebabecafebabecafebabe
+settle "$WORKER" >/dev/null
+contains "the reviewer is finally asked to re-review" "Re-review" "$(sent_to %2)"
+eq "the turn passes back to the reviewer" reviewer "$(mget "$WORKER" pair_turn)"
+unset STUB_GIT_HEAD
+
+# "Moved" has to mean pushed, not committed: the reviewer reads the PR, so a
+# commit only the worktree has is no more reviewable than no commit at all.
+print "\na local commit that was never pushed does not count as movement"
+reset
+export STUB_GIT_HEAD=deadbeefdeadbeefdeadbeefdeadbeefdeadbeef
+verdict --findings 1 >/dev/null
+settle "$REVIEWER" >/dev/null
+: > "$STUB_SENT"
+/usr/bin/git -C "$TMPROOT/wt" -c user.email=t@t -c user.name=t \
+	commit -q --allow-empty -m 'local only'
+settle "$WORKER" >/dev/null
+lacks "an unpushed commit still does not relay" "Re-review" "$(sent_to %2)"
+contains "the manager is told instead" "PAIRED REVIEW WAITING" "$(apex pending)"
+unset STUB_GIT_HEAD
+
+# The check exists to catch one recognisable non-event. When it cannot see —
+# offline remote, no worktree — it must not be the thing that stops a loop
+# which would otherwise run: fail open, exactly as before the check existed.
+print "\nan unreachable remote falls open to the old behaviour"
+reset
+verdict --findings 1 >/dev/null
+settle "$REVIEWER" >/dev/null
+: > "$STUB_SENT"
+export STUB_GIT_LSREMOTE_FAIL=1
+settle "$WORKER" >/dev/null
+contains "the relay still goes out" "Re-review" "$(sent_to %2)"
+eq "and the turn still passes" reviewer "$(mget "$WORKER" pair_turn)"
+unset STUB_GIT_LSREMOTE_FAIL
+
+print "\nand so does a baseline that was never stamped"
+reset
+verdict --findings 1 >/dev/null
+settle "$REVIEWER" >/dev/null
+# Model a loop linked before this field existed, or one whose baseline query
+# failed at stamp time: the field is empty, not a stale SHA.
+jq -c '.pair_worker_head = ""' "$MEMBERS/$WORKER.json" > "$TMPROOT/nb" \
+	&& mv "$TMPROOT/nb" "$MEMBERS/$WORKER.json"
+: > "$STUB_SENT"
+export STUB_GIT_HEAD=deadbeefdeadbeefdeadbeefdeadbeefdeadbeef
+settle "$WORKER" >/dev/null
+contains "no baseline means relay" "Re-review" "$(sent_to %2)"
+unset STUB_GIT_HEAD
+
+# A branch the remote has never heard of is a knowable answer, not an unknown
+# one, and it is the answer a worker that has pushed nothing at all gives. It
+# must not read as "cannot tell" and fail open — that is the whole of #46.
+print "\na branch absent from the remote is a definite no-push"
+reset
+export STUB_GIT_ABSENT=1
+verdict --findings 1 >/dev/null
+settle "$REVIEWER" >/dev/null
+eq "absence is stamped distinguishably" "-" "$(mget "$WORKER" pair_worker_head)"
+: > "$STUB_SENT"
+settle "$WORKER" >/dev/null
+lacks "and still-absent does not relay" "Re-review" "$(sent_to %2)"
+contains "the manager is told" "PAIRED REVIEW WAITING" "$(apex pending)"
+unset STUB_GIT_ABSENT
 
 # ── termination: no findings left ────────────────────────────────────
 print "\nempty verdict terminates the loop"

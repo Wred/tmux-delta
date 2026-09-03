@@ -341,6 +341,20 @@ Add `--max-rounds N` (default 5) if a PR deserves more or fewer attempts before
 it escalates as "not converging". `tmux-apex.sh unlink <member>` drops the
 pairing if you want to drive it manually again.
 
+Do **not** link a pair whose PR is openly blocked on a human decision — a PR
+body that says "waiting on X" or "draft until then" is a worker that will go
+idle without pushing. Get the answer, relay it, and link once the worker is
+actually able to work. The loop no longer burns a round on this — an idle
+transition with an unchanged remote tip is reported to you instead of relayed —
+but it does still interrupt you, and getting the answer first avoids that.
+
+A `PAIRED REVIEW WAITING` ping is that case: the worker went idle without
+pushing, so nothing was relayed and no round was spent. Read its pane and its
+PR body — it has almost always stopped on a decision. Answer it with
+`tmux-apex.sh send`; once it pushes, its next idle continues the loop with no
+further action from you. `pair-resume` is not the remedy here: the loop is not
+stuck, and re-invoking the reviewer now re-reviews the same commit.
+
 If you spawn a reviewer and *don't* link it, you own every round-trip. Only do
 that for a one-shot review you have no intention of iterating on.
 

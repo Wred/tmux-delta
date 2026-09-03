@@ -1800,6 +1800,8 @@ _cmd_send() {
 #   pair_max_rounds cap; exceeding it escalates as "stuck", never loops on
 #   pair_turn       worker | reviewer — whose idle transition relays next
 #   pair_state      active | complete | stuck
+#   pair_worker_head  remote tip of the worker's branch when its turn began;
+#                   unchanged at its idle means it pushed nothing (issue #48)
 #   pair_message    escalation text for `pending` to surface, once terminal
 #   verdict_round / verdict_findings / verdict_note   last recorded verdict
 #   verdict_override  "1" iff that verdict bypassed the published-comment guard
@@ -2453,6 +2455,38 @@ _pair_finish() {
 		"READY FOR HUMAN REVIEW: the paired reviewer found no further findings worth addressing on PR #${pr} after ${round} round(s). ${ready_note} ${next_step}"
 }
 
+# _pair_pushed_head <worktree> — what the remote currently reports for this
+# worktree's branch, as the loop's answer to "did the work actually move?"
+#
+# Prints the tip SHA, or the literal `-` when the remote answers and has no
+# such branch (nothing pushed yet). Returns 1, printing nothing, when the
+# answer is not knowable — no worktree, detached HEAD, or a remote that could
+# not be reached. The three outcomes must stay distinct: callers relay on
+# unknown and hold on unchanged, and collapsing them turns one into the other.
+#
+# Pushed, not committed, is the question — the reviewer reads the PR, so a
+# local commit the remote has never seen is no more reviewable than no commit
+# at all.
+#
+# The same two shortcuts are unavailable here as in `_commits_ahead`, for the
+# same reason (issue #31): an apex worktree's `remote.origin.fetch` is narrowed
+# to `main`, so `@{upstream}` resolves against a local ref nothing updates and
+# `--not --remotes` has no `origin/<branch>` ref to consult at all. Both would
+# answer confidently and wrongly. Ask the remote.
+#
+# GIT_TERMINAL_PROMPT=0 so a remote wanting credentials fails fast instead of
+# blocking an unattended settle callback on a prompt nobody will answer.
+_pair_pushed_head() {
+	local wt="$1" branch out rc=0 sha
+	[[ -n $wt && -d $wt ]] || return 1
+	branch=$(git -C "$wt" symbolic-ref --short HEAD 2>/dev/null) || return 1
+	[[ -n $branch ]] || return 1
+	out=$(GIT_TERMINAL_PROMPT=0 git -C "$wt" ls-remote origin "refs/heads/${branch}" 2>/dev/null) || rc=$?
+	(( rc == 0 )) || return 1
+	sha=$(printf '%s' "$out" | head -1 | cut -f1)
+	print -r -- "${sha:--}"
+}
+
 # _pair_advance <manager> <member>
 #
 # Returns 0 if this idle transition was consumed by the loop (so the caller
@@ -2507,16 +2541,25 @@ _pair_advance() {
 		fi
 
 		local next=$(( round + 1 ))
+		# Record what the worker's branch looks like on the remote *now*, so
+		# its own idle transition can tell "pushed the fixes" from "stopped
+		# without pushing" (issue #48). Written unconditionally, empty when
+		# unknowable: a stale baseline from an earlier round would compare
+		# against the wrong tip, and an absent one is the fail-open case the
+		# worker side already handles.
+		local whead=""
+		whead=$(_pair_pushed_head "$(apex_member_get "$manager" "$pair" worktree)") || whead=""
 		# Write the partner's pair state *before* delivering, not after.
 		# Delivery wakes the partner agent, whose own `event set` merges
 		# {status,seq} into the same member file. apex_member_merge now holds
 		# the record's mutex, so neither write can lose the other's fields;
 		# the ordering is kept anyway because it is the cheaper guarantee —
 		# the partner's write blocks rather than racing.
-		apex_member_merge "$manager" "$member" \
-			"$(jq -nc --argjson r "$next" '{pair_round:$r, pair_turn:"worker"}')"
-		apex_member_merge "$manager" "$pair" \
-			"$(jq -nc --argjson r "$next" '{pair_round:$r, pair_turn:"worker"}')"
+		local turn_worker
+		turn_worker=$(jq -nc --argjson r "$next" --arg h "$whead" \
+			'{pair_round:$r, pair_turn:"worker", pair_worker_head:$h}')
+		apex_member_merge "$manager" "$member" "$turn_worker"
+		apex_member_merge "$manager" "$pair" "$turn_worker"
 		local msg rrc=0
 		msg=$(_pair_worker_msg "$pr" "$next" "$findings" "$note" "$voverride")
 		_pair_relay "$manager" "$pair" "$msg" || rrc=$?
@@ -2539,6 +2582,45 @@ _pair_advance() {
 			return 0
 		fi
 	else
+		# Relay only when the branch actually moved (issue #48). Idle is the
+		# only signal this transition carries, and a worker goes idle for three
+		# different reasons: it pushed the round's fixes, it stopped to await a
+		# human decision exactly as its prompt instructs, or it stopped early
+		# for some other reason. Relaying all three spends a round of the cap
+		# on a re-review of unchanged code, which produces a duplicate finding
+		# set the reviewer cannot even recognise as duplicate without comparing
+		# SHAs by hand.
+		#
+		# Unknown baseline or unknown current tip means relay: the check exists
+		# to catch a specific, recognisable non-event, and a check that cannot
+		# see is not entitled to stop a loop that would otherwise run.
+		local head_base head_now=""
+		head_base=$(apex_member_get "$manager" "$member" pair_worker_head)
+		if [[ -n $head_base ]]; then
+			head_now=$(_pair_pushed_head "$(apex_member_get "$manager" "$member" worktree)") || head_now=""
+		fi
+		if [[ -n $head_base && -n $head_now && $head_now == "$head_base" ]]; then
+			# Do not consume the round and do not consume the ping. This is a
+			# worker that stopped without doing the work — a manager-shaped
+			# problem, not a reviewer-shaped one — so let the transition fall
+			# through to `pending` the way an unlinked member's idle does, with
+			# a line saying why rather than a bare "worker went idle".
+			#
+			# The turn stays with the worker and the loop stays active, so a
+			# later push and idle relays normally with no operator action. Only
+			# pair_message is written, which `pending` delivers once and then
+			# clears: a worker parked on a human decision must not re-interrupt
+			# the manager on every subsequent transition.
+			local stall
+			stall=$(print -r -- "PAIRED REVIEW WAITING: the worker on PR #${pr} went idle in round ${round} without pushing anything — the branch tip on the remote is unchanged since the findings were relayed. No re-review was requested and no round was spent. Read the worker's pane and its PR body: it has most likely stopped on a decision only you or the human can make. Once it is unblocked and has pushed, its next idle continues the loop on its own.")
+			apex_member_merge "$manager" "$member" \
+				"$(jq -nc --arg m "$stall" '{pair_message:$m}')"
+			apex_event "$manager" "$(jq -nc --arg s "$member" --arg pr "$pr" \
+				--argjson r "$round" --arg h "$head_base" \
+				'{event:"pair-no-push", session:$s, review_pr:$pr, round:$r, head:$h}')"
+			return 1
+		fi
+
 		# Stamp this round's comment baseline on the reviewer before waking
 		# it: verdict compares against this, so a stale comment left over
 		# from an earlier round cannot keep satisfying the "findings were
@@ -2682,7 +2764,8 @@ _cmd_unlink() {
 			'{"pair":"","pair_role":"","pair_state":"","pair_turn":"","pair_message":"",
 			  "pair_defer_target":"","pair_defer_text":"","pair_defer_residue":"",
 			  "pair_defer_from":"","pair_defer_pair":"","pair_defer_prev_turn":"",
-			  "pair_defer_prev_round":0,"pair_defer_checks":0}'
+			  "pair_defer_prev_round":0,"pair_defer_checks":0,
+			  "pair_worker_head":""}'
 	done
 	apex_event "$manager" "$(jq -nc --arg s "$member" '{event:"pair-unlink", session:$s}')"
 	print "Unlinked ${member}${pair:+ and $pair}."
