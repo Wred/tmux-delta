@@ -453,7 +453,29 @@ didn't type it and neither did the human — looking like:
 ```
 
 `status=idle` means the worker finished a turn and stayed quiet — usually done,
-sometimes stuck. `status=attention` means it is blocked right now.
+sometimes stuck. `status=attention` means Claude Code said it wants input, and
+it comes with a reason in parentheses, because the flag alone could not tell
+three very different situations apart (issue #63):
+
+| Reason | What it is | What to do |
+|--------|------------|------------|
+| `attention(permission-prompt)` | Stopped at a permission/safety dialog. `bypassPermissions` does **not** override the safety classifier, so a worker spawned "fully autonomous" can sit at a modal it cannot dismiss. | The ping quotes the dialog. Read the command, then answer in its pane. Declining is often correct — the classifier is usually right. |
+| `attention(interrupted)` | Its turn was killed mid-response (an API error, or "your computer went to sleep mid-response"). The agent is alive, idle, and has no intention of continuing; there may be uncommitted work. | `tmux-apex.sh send <member> <continue where you left off>`. |
+| `attention(idle)` | Ordinary end of turn at an empty prompt. | Normal. Treat it like `status=idle`. |
+| `attention(unknown)` | Neither a dialog nor a ready input box could be recognised. | `tmux capture-pane -p -t <member>` and look. Do not read it as fine. |
+
+The reason is read off the pane live, so it is a heuristic on rendered text,
+not a fact: `unknown` genuinely means unknown and never gets rounded down to
+`idle`.
+
+The trap the reason exists for: **a blocked worker produces no further
+transitions, so it produces no further pings.** The condition most in need of
+reporting is the one that stops reporting, and "no news" reads exactly like
+"still working". So `attention` is also raised a second time, unprompted, once
+a member has been sitting in it for `APEX_ATTENTION_STALE` seconds (default
+900) without transitioning — one line per episode, the same way an unnudged
+`starting` member is surfaced. If that line arrives, nobody asked for it; go
+look.
 
 `commits_ahead` on that line may read `unknown(unpushed?)`, and in `status`
 the same field renders as `unpushed?`. That is not a bug and not a zero: a

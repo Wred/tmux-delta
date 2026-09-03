@@ -585,12 +585,31 @@ updates the pill *and*, for apex-mode members, records the transition to disk:
 | Hook | State | Recorded |
 |------|-------|----------|
 | `PreToolUse` → `set` | `working` | nothing to report yet |
-| `Notification` → `notify` | `attention` | immediate — the worker is blocked |
+| `Notification` → `notify` | `attention` | immediate — the worker wants input |
 | `Stop` → `clear` | `idle` | after `APEX_QUIET_SECS` of quiet |
 
 `Stop` fires at the end of every assistant turn, so the idle record is debounced
 via a sequence counter and `tmux run-shell -d`: several quick turns produce one
 event, not one per turn.
+
+`attention` is a boolean on the worker side, and three situations set it: a
+worker stopped at a permission/safety dialog it cannot dismiss, a worker whose
+turn was killed mid-response by an API error, and a worker that simply ended a
+turn. Only the first two need a decision, and from outside the pane all three
+look identical — which is how one worker sat blocked for seven hours while
+`status` reported it correctly the whole time (issue #63). So `status`,
+`status --json` and the ping line all classify the pane and report a reason
+alongside the state: `attention(permission-prompt)`, `attention(interrupted)`,
+`attention(idle)`, or `attention(unknown)`. For a permission prompt the dialog's
+own text is reported too, since deciding needs the command, not just the fact
+that something is being asked. `unknown` is a real answer and never collapses
+into `idle`.
+
+A blocked worker also has no transitions left to make, so it generates no
+further pings — the state most in need of reporting is the one that stops
+reporting itself. `pending` therefore raises an `attention` member a second time,
+unasked, once it has sat there for `APEX_ATTENTION_STALE` seconds (default 900)
+without moving; once per episode, like the stalled-`starting` nudge.
 
 Manager side — nothing is ever typed into the manager's pane (it used to be, via
 `send-keys`, which could splice into whatever the human was typing; see issue

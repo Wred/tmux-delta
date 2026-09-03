@@ -309,8 +309,101 @@ eq "…and still reports a genuinely stale one" "w:%7#0" \
 # That literal is a backstop, not a second configuration point. Pin the two
 # together so a changed default cannot leave a stale copy behind — the drift
 # this threshold was single-sourced to prevent.
+# ── a member left waiting in `attention` (issue #63) ─────────────────
+# The seven-hour case: `attention` is delivered once on its seq bump, and a
+# member blocked at a dialog has no further transitions to make, so nothing
+# reports it again. The condition most in need of reporting is the one that
+# stops generating reports. Past the threshold, the silence is the event.
+print "stalled attention"
+
+member_attention() {
+	# status/seq/pinged_seq/age, plus an optional already-escalated seq.
+	apex_init_dirs "$MGR"
+	jq -nc --argjson seq "$2" --argjson p "$3" \
+		--argjson t "$(( $(date +%s) - $4 ))" \
+		--argjson esc "${5:-null}" \
+		'{status:"attention", seq:$seq, pinged_seq:$p, pair_message:"",
+		  spawned_at:$t, updated_at:$t}
+		 + (if $esc == null then {} else {attention_escalated_seq:$esc} end)' \
+		> "$(apex_member_file "$MGR" "$1")"
+}
+
+reset
+member_attention 'w:%7' 5 5 5
+eq "a freshly delivered attention is not re-reported" "" "$(_apex_pending_sig "$MGR")"
+
+member_attention 'w:%7' 5 5 901
+eq "…but one still waiting past the threshold is" "w:%7#5" "$(_apex_pending_sig "$MGR")"
+
+member_attention 'w:%7' 5 5 899
+eq "the default threshold has not been reached at 899s" "" "$(_apex_pending_sig "$MGR")"
+
+member_attention 'w:%7' 5 5 60
+eq "…and the knob moves it" "w:%7#5" \
+	"$(APEX_ATTENTION_STALE=30 _apex_pending_sig "$MGR")"
+
+# pinged_seq cannot be the one-shot marker here: it already equals seq by the
+# time the escalation fires, so advancing it marks nothing and the line would
+# repeat on every pull. The escalation records the seq it fired on instead.
+member_attention 'w:%7' 5 5 5000 5
+eq "an escalated attention is not escalated twice" "" "$(_apex_pending_sig "$MGR")"
+
+member_attention 'w:%7' 6 6 5000 5
+eq "…but a later attention episode earns a fresh one" "w:%7#6" "$(_apex_pending_sig "$MGR")"
+
+# A garbage threshold must not report the whole team at once — the same
+# direction-of-failure argument as APEX_STARTING_STALE.
+member_attention 'w:%7' 5 5 5
+eq "a garbage attention threshold falls back to the default" "" \
+	"$(APEX_ATTENTION_STALE=soon zsh -c 'source "'"$SCRIPTS"'/tmux-apex.sh" >/dev/null 2>&1
+	   _apex_pending_sig "'"$MGR"'"' 2>/dev/null)"
+
+# The 1s gate and `pending` must not disagree over the states this clause
+# introduces either, or the watcher stays quiet through exactly the stall it
+# was added to surface.
+typeset -a ADISAGREE=()
+typeset -i AREPORTED=0 ACHECKED=0
+for seq in 5 6; do
+	for pinged in 5 -1; do
+		for age in 5 5000; do
+			reset
+			member_attention 'w:%7' "$seq" "$pinged" "$age" 5
+			p=$(pending_reports); g=$(gate_reports)
+			(( ACHECKED += 1 )) || true; (( AREPORTED += p )) || true
+			[[ $p == "$g" ]] || ADISAGREE+=("seq=$seq pinged=$pinged age=${age}s: pending=$p gate=$g")
+		done
+	done
+done
+eq "pending and the gate agree on stalled attention" "" "${(j:; :)ADISAGREE}"
+eq "…over all 8 states" 8 "$ACHECKED"
+eq "…and some of them do report" 6 "$AREPORTED"
+
+# The escalation line has to say the thing that makes it different from the
+# first report: how long, and that nobody asked for it.
+reset
+member_attention 'w:%7' 5 5 5000
+out=$(_cmd_pending 2>/dev/null)
+contains "the escalation names the member"      "session=w:%7" "$out"
+contains "…and says how long it has waited"     "has been waiting" "$out"
+contains "…and says why it is raising itself"   "no further pings" "$out"
+
+# Marking delivered has to actually stop it, and via the new field.
+_cmd_pending --mark-delivered >/dev/null 2>&1
+eq "delivery records the escalated seq" 5 \
+	"$(apex_member_get "$MGR" 'w:%7' attention_escalated_seq)"
+eq "…and the escalation does not repeat" "" "$(_apex_pending_sig "$MGR")"
+
+# Scoped to the named def rather than to "the first literal in the string":
+# there are two thresholds in the predicate now (starting, attention) and a
+# whole-string match would silently pin whichever came first.
+fallback_of() {
+	print -r -- "$_APEX_REPORTABLE_JQ" \
+		| awk -v want="def $1:" '$0 ~ want {inside=1} inside && match($0, /\/\/ [0-9]+;/) {print substr($0, RSTART+3, RLENGTH-4); exit}'
+}
 eq "the predicate's fallback matches the binding" "$_APEX_STARTING_STALE_DEFAULT" \
-	"$(print -r -- "$_APEX_REPORTABLE_JQ" | sed -n 's/.*\/\/ \([0-9][0-9]*\);/\1/p')"
+	"$(fallback_of stale_after)"
+eq "the attention fallback matches its binding" "$_APEX_ATTENTION_STALE_DEFAULT" \
+	"$(fallback_of attn_stale_after)"
 
 # `tonumber?` screens non-numeric, not nonsense: it takes `15m` for the default
 # without a word, and accepts `-5`, which makes the age comparison true for a

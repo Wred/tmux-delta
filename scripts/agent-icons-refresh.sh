@@ -18,9 +18,14 @@
 # Both are pane options, so they disappear with the pane — no stale icons.
 #
 # Per-agent state, most urgent first:
-#   @agent_needs_attention  blocked, wants input   U+F169F (peach)
+#   @agent_needs_attention  wants input            U+F169F (peach)
 #   @agent_working          mid-turn               U+F16A3 (green)
 #   neither                 idle but present       U+F06A9 (muted)
+#
+# "Wants input" and not "blocked": the flag is set both by a worker stopped at
+# a permission dialog and by one that merely ended its turn, and the icon
+# cannot tell them apart. `tmux-apex.sh status` can — it classifies the pane
+# and reports a reason (issue #63). Do not read urgency into this glyph.
 #
 # Two strings are written per session, because the pill for the *selected*
 # session is drawn from a different branch of status-format[0] and uses the
