@@ -1800,11 +1800,41 @@ _cmd_send() {
 #   pair_max_rounds cap; exceeding it escalates as "stuck", never loops on
 #   pair_turn       worker | reviewer — whose idle transition relays next
 #   pair_state      active | complete | stuck
-#   pair_message    escalation text for `pending` to surface, once terminal
+#   pair_worker_head  remote tip of the worker's branch when its turn began;
+#                   unchanged at its idle means it pushed nothing (issue #48)
+#   pair_message    text for `pending` to surface. Either a terminal
+#                   escalation (pair_state complete | stuck), or the
+#                   non-terminal no-push advisory of issue #48, which
+#                   leaves the loop active and the turn where it was
 #   verdict_round / verdict_findings / verdict_note   last recorded verdict
 #   verdict_override  "1" iff that verdict bypassed the published-comment guard
 
 APEX_PAIR_MAX_ROUNDS=${APEX_PAIR_MAX_ROUNDS:-5}
+# Wall-clock bound, in seconds, on the one `ls-remote` the loop makes per
+# turn (see `_pair_pushed_head`). Overridable so the tests can exercise the
+# timeout path without waiting on it.
+#
+# Validated, because a set-but-nonsense value is the vacuous pass that
+# `_commits_ahead` argues against — the failing form of the check returning
+# the passing value. `0` is the conventional spelling of "no timeout" and
+# would do the exact opposite: `sleep 0` returns at once, so the watchdog
+# TERMs git immediately, every probe reports 124, and the whole issue #48
+# branch-moved check fails open on every turn while looking like it is
+# running. A non-numeric value fails the same way, via `sleep`'s own error.
+#
+# The upper bound is the same failure in the other direction: a "bound" past
+# the transport's own timeout never fires, so it silently is not a bound.
+# 300s is far beyond any honest `ls-remote`.
+#
+# And validated by falling back rather than by `_die`, because this is read
+# on the unattended settle path, where dying is a loop that has silently
+# stopped. A nonsense knob should cost the operator their setting, not the
+# feature. The warning is unconditional so it is at least visible from any
+# foreground command, but it is not fatal to any of them.
+if [[ ${APEX_PAIR_HEAD_TIMEOUT-} != <-> ]] || (( APEX_PAIR_HEAD_TIMEOUT < 1 || APEX_PAIR_HEAD_TIMEOUT > 300 )); then
+	[[ -n ${APEX_PAIR_HEAD_TIMEOUT-} ]] && print -u2 "tmux-apex: WARNING — ignoring APEX_PAIR_HEAD_TIMEOUT=${APEX_PAIR_HEAD_TIMEOUT} (want an integer 1-300 seconds); using 5"
+	APEX_PAIR_HEAD_TIMEOUT=5
+fi
 
 _pair_worker_msg() {
 	local pr="$1" round="$2" findings="$3" note="$4" override="$5"
@@ -2453,6 +2483,128 @@ _pair_finish() {
 		"READY FOR HUMAN REVIEW: the paired reviewer found no further findings worth addressing on PR #${pr} after ${round} round(s). ${ready_note} ${next_step}"
 }
 
+# _git_bounded <secs> <git-args...> — `git "$@"` under a hard wall-clock bound.
+#
+# On success prints git's stdout and returns 0. On failure prints nothing and
+# returns git's exit status, or 124 when the bound was hit rather than reached.
+# GIT_TERMINAL_PROMPT=0 throughout: a call worth bounding is by definition one
+# nobody is watching, so a credential prompt is only ever a stall.
+#
+# `timeout(1)` is not shelled out to on purpose. It is GNU coreutils, absent
+# from a stock macOS base system, and this plugin does not otherwise require
+# coreutils — so on the very platform it is developed on the bound would
+# silently not exist. A watchdog child needs nothing that is not already here.
+#
+# git's stdout goes to that file rather than up the caller's command
+# substitution, and this is load-bearing, not tidiness. Over a real transport
+# git spawns a helper (ssh, git-remote-https) that inherits stdout, so TERMing
+# git alone leaves the helper holding the write end of the substitution's pipe
+# — the caller then blocks on EOF for exactly as long as the stall it was
+# trying to bound, and the ceiling quietly does nothing. Verified: with a
+# transport that accepts and then says nothing, the pipe form runs past a 2s
+# bound indefinitely while this form returns 124 at 2s.
+#
+# Two processes are deliberately left running past the TERM, and both are
+# harmless rather than merely unnoticed:
+#
+#   - the transport helper. It is the whole reason stdout is a file, so of
+#     course it survives killing git; it goes on writing into a file that was
+#     unlinked before git ever started, and exits when its own timeout
+#     expires — after which the kernel reclaims the blocks. It is not
+#     killed as a process group because there is no job control here, so the
+#     group is tmux-apex's own — a group TERM would take the caller with it.
+#   - the watchdog's `sleep`. It is orphaned by the TERM aimed at its parent,
+#     and the `kill` it would have gone on to run died with that parent.
+#
+# The temp file is unlinked the moment it exists, and the probe then works
+# through the two descriptors already open on it. Nothing can leak it, on any
+# path, because after those three lines there is no name left to clean up:
+# not a signal, not a `_die`, not SIGKILL.
+#
+# That is why there is no trap here, and the distinction matters. An EXIT trap
+# was the obvious form and does not actually hold: zsh does not run TRAPEXIT
+# for an *untrapped* fatal signal, and `_settle` — the entry point this whole
+# bound exists for — arms nothing, so the file survived a TERM mid-probe. Only
+# `watch` arms INT/TERM, which is why the trap looked correct when tested
+# there. Adding INT/TERM/HUP with a re-raise fixes the leak and breaks
+# something worse: measured, the re-raise reaches the default disposition
+# rather than the handler `localtraps` has shadowed, so `watch` exits 143 with
+# its pidfile still on disk. Not owning the name at all beats both.
+#
+# The one honest gap is the few instructions between `mktemp` and `rm`, which
+# fork nothing and cannot block.
+_git_bounded() {
+	local secs="$1"; shift
+	local tmp rc=0 wfd rfd
+	tmp=$(mktemp "${TMPDIR:-/tmp}/tmux-apex-git.XXXXXX") || return 1
+	exec {wfd}>"$tmp" {rfd}<"$tmp"
+	rm -f "$tmp"
+	(
+		export GIT_TERMINAL_PROMPT=0
+		git "$@" >&$wfd 2>/dev/null &
+		gitpid=$!
+		{ sleep "$secs"; kill -TERM $gitpid 2>/dev/null; } >/dev/null 2>&1 &
+		dogpid=$!
+		wait $gitpid
+		gitrc=$?
+		kill -TERM $dogpid 2>/dev/null
+		exit $gitrc
+	) || rc=$?
+	# A watchdog TERM surfaces as 143. Report the conventional 124 instead, so
+	# a caller can tell "the bound was hit" from "git answered, negatively".
+	(( rc == 143 )) && rc=124
+	(( rc == 0 )) && cat <&$rfd
+	exec {wfd}>&- {rfd}<&-
+	return $rc
+}
+
+# _pair_pushed_head <worktree> — what the remote currently reports for this
+# worktree's branch, as the loop's answer to "did the work actually move?"
+#
+# Prints the tip SHA, or the literal `-` when the remote answers and has no
+# such branch (nothing pushed yet). Returns 1, printing nothing, when the
+# answer is not knowable — no worktree, detached HEAD, or a remote that could
+# not be reached. The three outcomes must stay distinct: callers relay on
+# unknown and hold on unchanged, and collapsing them turns one into the other.
+#
+# Pushed, not committed, is the question — the reviewer reads the PR, so a
+# local commit the remote has never seen is no more reviewable than no commit
+# at all.
+#
+# The same two shortcuts are unavailable here as in `_commits_ahead`, for the
+# same reason (issue #31): an apex worktree's `remote.origin.fetch` is narrowed
+# to `main`, so `@{upstream}` resolves against a local ref nothing updates and
+# `--not --remotes` has no `origin/<branch>` ref to consult at all. Both would
+# answer confidently and wrongly. Ask the remote.
+#
+# This is a network round trip, which `_commits_ahead` makes opt-in rather than
+# automatic. That rule is not being quietly crossed here — it is about *where*
+# the round trip lands. `_commits_ahead` declines to pay on the per-hook path
+# behind `_record_status` and `pending`, which runs constantly for every member
+# and whose answer is a cosmetic number on a ping line, so the honest `null`
+# costs nothing. This probe runs at most twice per round of a single linked
+# pair, and its answer is not cosmetic: without it the loop takes the wrong
+# branch, which is the whole of issue #48. The deliberately-invoked callers
+# (`status --ask-remote`, `_reap_risk`) pay for the same trip already.
+#
+# Bounded, though, because unlike those two this one has no human watching it:
+# it runs from `_cmd_settle` under `tmux run-shell -b -d`. GIT_TERMINAL_PROMPT=0
+# only covers a remote that *asks* for something; a remote that accepts the
+# connection and then says nothing stalls for the transport's own timeout,
+# which is minutes, and stalls the settle callback with it. Hitting the bound
+# is a non-zero exit, so it lands in the existing unknown case and fails open.
+_pair_pushed_head() {
+	local wt="$1" branch out rc=0 sha
+	[[ -n $wt && -d $wt ]] || return 1
+	branch=$(git -C "$wt" symbolic-ref --short HEAD 2>/dev/null) || return 1
+	[[ -n $branch ]] || return 1
+	out=$(_git_bounded "$APEX_PAIR_HEAD_TIMEOUT" \
+		-C "$wt" ls-remote origin "refs/heads/${branch}") || rc=$?
+	(( rc == 0 )) || return 1
+	sha=$(printf '%s' "$out" | head -1 | cut -f1)
+	print -r -- "${sha:--}"
+}
+
 # _pair_advance <manager> <member>
 #
 # Returns 0 if this idle transition was consumed by the loop (so the caller
@@ -2507,16 +2659,25 @@ _pair_advance() {
 		fi
 
 		local next=$(( round + 1 ))
+		# Record what the worker's branch looks like on the remote *now*, so
+		# its own idle transition can tell "pushed the fixes" from "stopped
+		# without pushing" (issue #48). Written unconditionally, empty when
+		# unknowable: a stale baseline from an earlier round would compare
+		# against the wrong tip, and an absent one is the fail-open case the
+		# worker side already handles.
+		local whead=""
+		whead=$(_pair_pushed_head "$(apex_member_get "$manager" "$pair" worktree)") || whead=""
 		# Write the partner's pair state *before* delivering, not after.
 		# Delivery wakes the partner agent, whose own `event set` merges
 		# {status,seq} into the same member file. apex_member_merge now holds
 		# the record's mutex, so neither write can lose the other's fields;
 		# the ordering is kept anyway because it is the cheaper guarantee —
 		# the partner's write blocks rather than racing.
-		apex_member_merge "$manager" "$member" \
-			"$(jq -nc --argjson r "$next" '{pair_round:$r, pair_turn:"worker"}')"
-		apex_member_merge "$manager" "$pair" \
-			"$(jq -nc --argjson r "$next" '{pair_round:$r, pair_turn:"worker"}')"
+		local turn_worker
+		turn_worker=$(jq -nc --argjson r "$next" --arg h "$whead" \
+			'{pair_round:$r, pair_turn:"worker", pair_worker_head:$h}')
+		apex_member_merge "$manager" "$member" "$turn_worker"
+		apex_member_merge "$manager" "$pair" "$turn_worker"
 		local msg rrc=0
 		msg=$(_pair_worker_msg "$pr" "$next" "$findings" "$note" "$voverride")
 		_pair_relay "$manager" "$pair" "$msg" || rrc=$?
@@ -2539,6 +2700,45 @@ _pair_advance() {
 			return 0
 		fi
 	else
+		# Relay only when the branch actually moved (issue #48). Idle is the
+		# only signal this transition carries, and a worker goes idle for three
+		# different reasons: it pushed the round's fixes, it stopped to await a
+		# human decision exactly as its prompt instructs, or it stopped early
+		# for some other reason. Relaying all three spends a round of the cap
+		# on a re-review of unchanged code, which produces a duplicate finding
+		# set the reviewer cannot even recognise as duplicate without comparing
+		# SHAs by hand.
+		#
+		# Unknown baseline or unknown current tip means relay: the check exists
+		# to catch a specific, recognisable non-event, and a check that cannot
+		# see is not entitled to stop a loop that would otherwise run.
+		local head_base head_now=""
+		head_base=$(apex_member_get "$manager" "$member" pair_worker_head)
+		if [[ -n $head_base ]]; then
+			head_now=$(_pair_pushed_head "$(apex_member_get "$manager" "$member" worktree)") || head_now=""
+		fi
+		if [[ -n $head_base && -n $head_now && $head_now == "$head_base" ]]; then
+			# Do not consume the round and do not consume the ping. This is a
+			# worker that stopped without doing the work — a manager-shaped
+			# problem, not a reviewer-shaped one — so let the transition fall
+			# through to `pending` the way an unlinked member's idle does, with
+			# a line saying why rather than a bare "worker went idle".
+			#
+			# The turn stays with the worker and the loop stays active, so a
+			# later push and idle relays normally with no operator action. Only
+			# pair_message is written, which `pending` delivers once and then
+			# clears: a worker parked on a human decision must not re-interrupt
+			# the manager on every subsequent transition.
+			local stall
+			stall=$(print -r -- "PAIRED REVIEW WAITING: the worker on PR #${pr} went idle in round ${round} without pushing anything — the branch tip on the remote is unchanged since the findings were relayed. No re-review was requested and no round was spent. Read the worker's pane and its PR body: it has most likely stopped on a decision only you or the human can make. Once it is unblocked and has pushed, its next idle continues the loop on its own.")
+			apex_member_merge "$manager" "$member" \
+				"$(jq -nc --arg m "$stall" '{pair_message:$m}')"
+			apex_event "$manager" "$(jq -nc --arg s "$member" --arg pr "$pr" \
+				--argjson r "$round" --arg h "$head_base" \
+				'{event:"pair-no-push", session:$s, review_pr:$pr, round:$r, head:$h}')"
+			return 1
+		fi
+
 		# Stamp this round's comment baseline on the reviewer before waking
 		# it: verdict compares against this, so a stale comment left over
 		# from an earlier round cannot keep satisfying the "findings were
@@ -2633,13 +2833,14 @@ _cmd_link() {
 		--arg pair "$reviewer" --arg pr "$pr" --argjson max "$max" \
 		'{pair:$pair, pair_role:"worker", pair_pr:$pr, pair_round:1,
 		  pair_max_rounds:$max, pair_turn:"reviewer", pair_state:"active",
-		  pair_message:""}')"
+		  pair_message:"", pair_worker_head:""}')"
 	apex_member_merge "$manager" "$reviewer" "$(jq -nc \
 		--arg pair "$worker" --arg pr "$pr" --argjson max "$max" --argjson b "$rbaseline" \
 		'{pair:$pair, pair_role:"reviewer", pair_pr:$pr, pair_round:1,
 		  pair_max_rounds:$max, pair_turn:"reviewer", pair_state:"active",
-		  pair_message:"", verdict_round:"", verdict_findings:"", verdict_note:"",
-		  verdict_override:"", pair_comment_baseline:$b}')"
+		  pair_message:"", pair_worker_head:"", verdict_round:"",
+		  verdict_findings:"", verdict_note:"", verdict_override:"",
+		  pair_comment_baseline:$b}')"
 
 	apex_event "$manager" "$(jq -nc --arg w "$worker" --arg r "$reviewer" \
 		--arg pr "$pr" --argjson max "$max" \
@@ -2682,7 +2883,8 @@ _cmd_unlink() {
 			'{"pair":"","pair_role":"","pair_state":"","pair_turn":"","pair_message":"",
 			  "pair_defer_target":"","pair_defer_text":"","pair_defer_residue":"",
 			  "pair_defer_from":"","pair_defer_pair":"","pair_defer_prev_turn":"",
-			  "pair_defer_prev_round":0,"pair_defer_checks":0}'
+			  "pair_defer_prev_round":0,"pair_defer_checks":0,
+			  "pair_worker_head":""}'
 	done
 	apex_event "$manager" "$(jq -nc --arg s "$member" '{event:"pair-unlink", session:$s}')"
 	print "Unlinked ${member}${pair:+ and $pair}."
