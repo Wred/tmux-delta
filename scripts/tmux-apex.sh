@@ -1672,10 +1672,16 @@ _deliver() {
 	APEX_SEND_CLEARED=""
 	APEX_SEND_SPLICED=""
 	APEX_SEND_UNCONFIRMED=""
+	APEX_SEND_TEXT=""
 	[[ -z $target || -z $text ]] && return 1
 	_member_alive "$target" || return 1
 
 	local full="[apex from:${from:-manager}] ${text}"
+	# What was actually typed, sender tag and all. A caller that needs to
+	# recognise its own message in the input box later cannot reconstruct this
+	# from the text it passed in — and comparing the untagged text against a
+	# tagged box read fails, which reads as "the box drained" (issue #49).
+	APEX_SEND_TEXT="$full"
 
 	# Native delivery only applies to a tracked apex member — anything else
 	# (a hand-run session, or an agent with no native API) falls straight
@@ -1831,6 +1837,11 @@ _pair_reviewer_msg() {
 # (_deliver rc 5) is a failure here even though a human `send` treats it as
 # recoverable: the text sits in the box unread, so the partner never wakes.
 #
+# Returns 0 delivered, 1 undelivered (caller escalates), 2 *deferred* — the box
+# still holds the relay but the pane is repainting, so delivery is neither
+# confirmed nor refuted yet and the caller must arm a re-check rather than
+# decide (issue #49).
+#
 # Whatever the box held before the send (APEX_SEND_CLEARED, see _send_to_pane)
 # is recorded as cleared_input on the event, the same as `send` does — and on
 # the failure path too, since a draft destroyed by a relay that then failed is
@@ -1845,9 +1856,16 @@ _pair_reviewer_msg() {
 # partner agent received `<draft><relay>` as a single garbled instruction, and
 # an unattended loop has no other way to say so.
 _PAIR_RELAY_WHY=""
+# Whatever the box would not clear, so a deferred re-check can strip it before
+# asking whether the box still holds our own text (see _box_pending).
+_PAIR_RELAY_RESIDUE=""
+# The text as it went into the box, sender tag included — see APEX_SEND_TEXT.
+_PAIR_RELAY_SENT=""
 _pair_relay() {
 	local manager="$1" target="$2" text="$3" rc=0
 	_PAIR_RELAY_WHY=""
+	_PAIR_RELAY_RESIDUE=""
+	_PAIR_RELAY_SENT=""
 	# `send`'s confirmation ceiling (APEX_SEND_SETTLE_TICKS, 25 ticks = 5s) is
 	# tuned for a human at a terminal: give up quickly and let them look at the
 	# pane themselves. Here nobody is going to look, and the thing being waited
@@ -1879,16 +1897,30 @@ _pair_relay() {
 	# An unconfirmed send (_send_to_pane returned 0 without ever seeing the box
 	# drain, because the pane stayed busy) is delivered-enough for a human at a
 	# terminal: `send` prints a NOTE and they can look. Here there is nobody to
-	# look. Advancing pair_turn on it would hand the loop a state where it
-	# waits forever on a partner that may never have been woken, and the
-	# rollback machinery built for exactly that case would be unreachable — so
-	# treat it as undelivered, the same as rc 5, and let the escalation put a
-	# human on it. The cost is a false alarm when the Enter did land; the cost
-	# of the other choice is a silent deadlock, which nothing recovers from.
+	# look — and this used to be reported as undelivered and escalated, on the
+	# fail-safe argument that a loop waiting on a partner nobody woke is a
+	# silent deadlock nothing recovers from.
+	#
+	# That argument is right about the deadlock and wrong about the deadline.
+	# The confirmation window is racing the work the relay itself triggered:
+	# hand a worker N findings and the pane stays busy for as long as fixing
+	# them takes, so the more substantial the review the more certain the false
+	# alarm, and no fixed ceiling can outrun a quantity that scales with the
+	# message's own effect (issue #49; #36 raised it 5s → 30s and it still lost
+	# every race).
+	#
+	# So this is not a verdict, it is an unfinished observation: return 2 and
+	# let the caller re-check when the pane has something new to say. The
+	# fail-safe survives as a bound on the *deferral* — see _pair_defer_arm,
+	# which escalates the moment the pane goes quiet with our text still in the
+	# box (the reading that does mean undelivered) and, failing that, after a
+	# bounded number of re-checks.
 	if (( rc == 0 )) && [[ -n ${APEX_SEND_UNCONFIRMED:-} ]]; then
-		rc=5
-		_PAIR_RELAY_WHY="delivery to that pane could not be confirmed: it kept repainting for the whole confirmation window and the relay never visibly left its input box. A busy pane is weak evidence *for* delivery, so the partner may well have the message and be working on it — read the pane before treating this as a failure. If it is working, let it finish and push first: 'pair-resume' re-invokes the reviewer immediately, so resuming against unpushed work burns a round on unchanged code"
-		ev=$(print -r -- "$ev" | jq -c '. + {rc:5}')
+		_PAIR_RELAY_RESIDUE="${APEX_SEND_SPLICED:-}"
+		_PAIR_RELAY_SENT="${APEX_SEND_TEXT:-$text}"
+		apex_event "$manager" \
+			"$(print -r -- "$ev" | jq -c '{event:"pair-relay-deferred"} + .')"
+		return 2
 	fi
 	if (( rc )); then
 		if [[ -z $_PAIR_RELAY_WHY ]]; then
@@ -1920,6 +1952,233 @@ _pair_rollback() {
 			--argjson r "$round" --arg t "$turn" \
 			'{pair_round:$r, pair_turn:$t}')"
 	done
+}
+
+# ─── deferred relays (issue #49) ─────────────────────────────────────
+#
+# "The box still holds our relay" is two different facts wearing one face, and
+# only one of them is worth waking a human for:
+#
+#   box holds our text + pane has gone quiet     → nobody took it. Escalate.
+#   box holds our text + pane still repainting   → an agent is working on what
+#                                                  we just sent, and the box is
+#                                                  simply behind. Look again.
+#
+# The send path already tells them apart (it will not retype into a repainting
+# pane — issue #24), but the relay used to collapse both into "undelivered"
+# because it had nowhere to put an unfinished observation. This is that place.
+#
+# A deferral is recorded on *both* halves rather than only on the sender, so
+# either member's next idle transition can settle it (see _cmd_settle) — the
+# cheap version of #29's proposed watcher, riding transitions the loop already
+# gets instead of adding a poller. A timer is armed as well, because the case
+# that matters most produces no transitions at all: if the relay really was
+# never submitted, the partner never runs a turn, and a deferral waiting on its
+# transition would wait forever. Between them the bound is real, which is the
+# fail-safe argument #36 made, honoured with a deadline measured in "the pane
+# went quiet" rather than in seconds.
+APEX_PAIR_DEFER_SECS=${APEX_PAIR_DEFER_SECS:-30}
+APEX_PAIR_DEFER_MAX_CHECKS=${APEX_PAIR_DEFER_MAX_CHECKS:-20}
+APEX_PAIR_DEFER_IDLE_TICKS=${APEX_PAIR_DEFER_IDLE_TICKS:-10}
+
+# _pair_defer_arm <manager> <from> <pair> <target> <prev-round> <prev-turn> <text> [residue]
+#
+# Record an unconfirmed relay for later adjudication and schedule the first
+# re-check. The pair state stays *advanced*: on the evidence available the
+# relay most likely landed, and rolling the round back here would undo a round
+# that is probably running. The rollback belongs on the path that concludes it
+# did not land — _pair_defer_settle, which is why the pre-relay round and turn
+# are carried in the record.
+_pair_defer_arm() {
+	local manager="$1" from="$2" pair="$3" target="$4"
+	local prev_round="$5" prev_turn="$6" text="$7" residue="${8:-}"
+	# Match what actually reached the box, not what the caller composed:
+	# _send_to_pane collapses newlines to spaces before typing, and a
+	# re-check that compares the box against the uncollapsed message never
+	# recognises its own text — so every deferral would resolve as "the box
+	# drained", which is the false confirmation this whole path exists to avoid.
+	text=${text//$'\n'/ }
+	text=${text//$'\r'/ }
+
+	local rec m
+	rec=$(jq -nc --arg t "$target" --arg text "$text" --arg res "$residue" \
+		--arg from "$from" --arg pair "$pair" --arg pt "$prev_turn" \
+		--argjson pr "${prev_round:-1}" --argjson n 0 \
+		'{pair_defer_target:$t, pair_defer_text:$text, pair_defer_residue:$res,
+		  pair_defer_from:$from, pair_defer_pair:$pair,
+		  pair_defer_prev_round:$pr, pair_defer_prev_turn:$pt,
+		  pair_defer_checks:$n}')
+	for m in "$from" "$pair"; do
+		[[ -n $m ]] || continue
+		apex_member_merge "$manager" "$m" "$rec"
+	done
+	apex_event "$manager" "$(jq -nc --arg s "$from" --arg t "$target" \
+		'{event:"pair-relay-deferred-armed", session:$s, target:$t}')"
+	_pair_defer_schedule "$manager" "$from"
+}
+
+# _pair_defer_schedule <manager> <member> — next re-check, deferred inside the
+# tmux server the way _record_status defers _settle, so nothing here has to
+# outlive a hook process or hold a sleeping watcher open.
+_pair_defer_schedule() {
+	local manager="$1" member="$2"
+	tmux run-shell -b -d "$APEX_PAIR_DEFER_SECS" \
+		"${SELF} _pair-defer-check ${(q)member} ${(q)manager}" 2>/dev/null || true
+}
+
+# _pair_defer_clear <manager> <member> — drop the record from both halves.
+_pair_defer_clear() {
+	local manager="$1" member="$2" pair m
+	pair=$(apex_member_get "$manager" "$member" pair_defer_pair 2>/dev/null)
+	[[ -n $pair ]] || pair=$(apex_member_get "$manager" "$member" pair 2>/dev/null)
+	for m in "$member" "$pair"; do
+		[[ -n $m ]] || continue
+		[[ -f $(apex_member_file "$manager" "$m") ]] || continue
+		apex_member_merge "$manager" "$m" \
+			'{"pair_defer_target":"","pair_defer_text":"","pair_defer_residue":"",
+			  "pair_defer_from":"","pair_defer_pair":"","pair_defer_prev_turn":"",
+			  "pair_defer_checks":0}'
+	done
+}
+
+# _pair_defer_settle <manager> <member>
+#
+# Adjudicate the deferred relay recorded on <member>, if any.
+#
+# Returns 0 when there is nothing outstanding — no record, or one this call
+# resolved as delivered — so the caller can carry on with the normal loop; 1
+# when the deferral consumed the moment, either because it is still deferred or
+# because it escalated.
+_pair_defer_settle() {
+	setopt localoptions no_err_return
+	local manager="$1" member="$2"
+	local target text residue from pair prev_round prev_turn checks
+	target=$(apex_member_get "$manager" "$member" pair_defer_target 2>/dev/null)
+	[[ -n $target ]] || return 0
+	text=$(apex_member_get "$manager" "$member" pair_defer_text 2>/dev/null)
+	residue=$(apex_member_get "$manager" "$member" pair_defer_residue 2>/dev/null)
+	from=$(apex_member_get "$manager" "$member" pair_defer_from 2>/dev/null)
+	pair=$(apex_member_get "$manager" "$member" pair_defer_pair 2>/dev/null)
+	prev_round=$(apex_member_get "$manager" "$member" pair_defer_prev_round 2>/dev/null)
+	prev_turn=$(apex_member_get "$manager" "$member" pair_defer_prev_turn 2>/dev/null)
+	checks=$(apex_member_get "$manager" "$member" pair_defer_checks 2>/dev/null)
+	[[ -n $from ]] || from="$member"
+	[[ $checks == <-> ]] || checks=0
+	[[ $prev_round == <-> ]] || prev_round=1
+
+	local pr; pr=$(apex_member_get "$manager" "$from" pair_pr 2>/dev/null)
+
+	# A partner that has gone away answers the question outright, and it is the
+	# one answer that cannot improve by waiting.
+	if ! _member_alive "$target"; then
+		_pair_defer_clear "$manager" "$member"
+		_pair_rollback "$manager" "$from" "$pair" "$prev_round" "$prev_turn"
+		_pair_escalate "$manager" "$from" stuck \
+			"PAIRED REVIEW STUCK: a relay on PR #${pr} was left unconfirmed while its target pane ($target) was busy, and that session has since gone. Whatever it was working on is not coming back to this loop."
+		return 1
+	fi
+
+	local pane; pane=$(_agent_pane "$target" 2>/dev/null)
+	if [[ -z $pane ]]; then
+		_pair_defer_clear "$manager" "$member"
+		_pair_rollback "$manager" "$from" "$pair" "$prev_round" "$prev_turn"
+		_pair_escalate "$manager" "$from" stuck \
+			"PAIRED REVIEW STUCK: a relay on PR #${pr} was left unconfirmed, and ${target} no longer has a reachable agent pane to re-check."
+		return 1
+	fi
+
+	# One capture answers both halves of the question about the same instant,
+	# for the reason _box_line_of exists.
+	local -i ticks static=0 j
+	ticks=${APEX_PAIR_DEFER_IDLE_TICKS}
+	(( ticks < 1 )) && ticks=1
+	local sig sig0 box
+	sig0=$(_pane_activity_sig "$pane" 2>/dev/null)
+	box=$(_box_line_of "$sig0")
+	if ! _box_pending "$box" "$text" "$residue"; then
+		# The box drained. The relay was submitted after all — which is what the
+		# busy pane was weak evidence for all along — so this is an ordinary
+		# delivery that took longer to prove than the window allowed.
+		_pair_defer_clear "$manager" "$member"
+		apex_event "$manager" "$(jq -nc --arg s "$target" --arg text "$text" \
+			--argjson n "$checks" \
+			'{event:"pair-relay", session:$s, text:$text,
+			  confirmed_late:true, defer_checks:$n}')"
+		return 0
+	fi
+
+	for (( j = 1; j <= ticks; j++ )); do
+		sleep 0.2
+		sig=$(_pane_activity_sig "$pane" 2>/dev/null)
+		box=$(_box_line_of "$sig")
+		# Drained mid-sample: same answer as above, one tick later.
+		if ! _box_pending "$box" "$text" "$residue"; then
+			_pair_defer_clear "$manager" "$member"
+			apex_event "$manager" "$(jq -nc --arg s "$target" --arg text "$text" \
+				--argjson n "$checks" \
+				'{event:"pair-relay", session:$s, text:$text,
+				  confirmed_late:true, defer_checks:$n}')"
+			return 0
+		fi
+		if [[ $sig == "$sig0" ]]; then
+			(( static += 1 ))
+		else
+			sig0="$sig"; static=0
+		fi
+	done
+
+	if (( static >= ticks )); then
+		# Our text in the box and not one cell changed for the whole sample:
+		# this is the reading that means something. Nobody took the relay.
+		_pair_defer_clear "$manager" "$member"
+		_pair_rollback "$manager" "$from" "$pair" "$prev_round" "$prev_turn"
+		_pair_escalate "$manager" "$from" stuck \
+			"PAIRED REVIEW STUCK: the relay on PR #${pr} is still sitting unsent in ${target}'s input box, and that pane has now been completely idle with it there — so it was never submitted and the partner was never woken. Read the pane, submit or clear the box, then 'pair-resume' this member."
+		return 1
+	fi
+
+	checks=$(( checks + 1 ))
+	if (( checks >= APEX_PAIR_DEFER_MAX_CHECKS )); then
+		# Still busy, but a deferral with no floor is the silent deadlock #36
+		# refused to allow. Hand it over saying exactly that, and say which of
+		# the two readings ran out — a pane that never stopped working is a
+		# different thing to explain than a pane that stalled.
+		_pair_defer_clear "$manager" "$member"
+		_pair_escalate "$manager" "$from" stuck \
+			"PAIRED REVIEW STUCK: a relay on PR #${pr} has been unconfirmed for ${checks} re-checks — ${target}'s pane has been busy with our text in its input box the whole time and never went quiet. It is most likely working on the relay and the box is just stale, so read the pane before doing anything: if it is working, let it finish and push, then 'pair-resume'. The round was not rolled back, because a round is most likely running."
+		return 1
+	fi
+
+	local m
+	for m in "$member" "$pair"; do
+		[[ -n $m ]] || continue
+		[[ -f $(apex_member_file "$manager" "$m") ]] || continue
+		apex_member_merge "$manager" "$m" \
+			"$(jq -nc --argjson n "$checks" '{pair_defer_checks:$n}')"
+	done
+	apex_event "$manager" "$(jq -nc --arg s "$target" --argjson n "$checks" \
+		'{event:"pair-relay-still-deferred", session:$s, defer_checks:$n}')"
+	_pair_defer_schedule "$manager" "$member"
+	# Consume the ping on the way out. A deferral that is still deferring is
+	# nothing for the manager to act on — waking it once per re-check would be
+	# the same per-round tax as the false escalations, paid in a different
+	# currency. The durable record is the pair-relay-still-deferred event.
+	local seq
+	seq=$(apex_member_get "$manager" "$member" seq); [[ -n $seq ]] || seq=0
+	apex_member_merge "$manager" "$member" \
+		"$(jq -nc --argjson s "$seq" '{pinged_seq:$s}')"
+	return 1
+}
+
+# _pair-defer-check <member> <manager> — internal, fired by run-shell -d and by
+# `_settle` on either half's idle transition.
+_cmd_pair_defer_check() {
+	local member="$1" manager="$2"
+	[[ -n $member && -n $manager ]] || return 0
+	APEX_SESSION="$manager"
+	[[ -f $(apex_member_file "$manager" "$member") ]] || return 0
+	_pair_defer_settle "$manager" "$member" || return 0
+	return 0
 }
 
 # _pair_escalate <manager> <member> <state> <message>
@@ -1984,8 +2243,23 @@ _pair_finish() {
 		fi
 	fi
 
+	# What happens next is not a fixed fact about the loop, it is this repo's
+	# answer to the merge-authority question (#41/#46). The message used to
+	# assert "nothing is left for an agent to do — this needs the human's merge
+	# decision", which predates the grant existing at all and now contradicts
+	# the skill on any repo where merging *is* granted (issue #49). Read the
+	# grant and say the true thing; `unknown` and `no` are the same instruction
+	# here, which is what fail-closed means.
+	local auth next_step
+	auth=$(_apex_status_authority "$manager")
+	if [[ $auth == yes ]]; then
+		next_step="Merge authority is granted for this repo, so this is yours to finish: check the PR against the merge criteria in the apex skill and merge it if they all hold, or report why they do not. It is an independent reviewer's sign-off, so it does not need the self-review axis."
+	else
+		next_step="Merge authority is NOT granted for this repo, so do not merge: report the PR as ready-and-ineligible and leave the merge decision to the human."
+	fi
+
 	_pair_escalate "$manager" "$member" complete \
-		"READY FOR HUMAN REVIEW: the paired reviewer found no further findings worth addressing on PR #${pr} after ${round} round(s). ${ready_note} Nothing is left for an agent to do — this needs the human's merge decision."
+		"READY FOR HUMAN REVIEW: the paired reviewer found no further findings worth addressing on PR #${pr} after ${round} round(s). ${ready_note} ${next_step}"
 }
 
 # _pair_advance <manager> <member>
@@ -2052,8 +2326,17 @@ _pair_advance() {
 			"$(jq -nc --argjson r "$next" '{pair_round:$r, pair_turn:"worker"}')"
 		apex_member_merge "$manager" "$pair" \
 			"$(jq -nc --argjson r "$next" '{pair_round:$r, pair_turn:"worker"}')"
-		if ! _pair_relay "$manager" "$pair" \
-			"$(_pair_worker_msg "$pr" "$next" "$findings" "$note" "$voverride")"; then
+		local msg rrc=0
+		msg=$(_pair_worker_msg "$pr" "$next" "$findings" "$note" "$voverride")
+		_pair_relay "$manager" "$pair" "$msg" || rrc=$?
+		if (( rrc == 2 )); then
+			# Deferred, not failed: the worker's pane is busy holding our text,
+			# which is far more often the work this relay just started than a
+			# swallowed Enter. Leave the round bumped and the turn passed —
+			# both are right if it landed — and let the re-check decide.
+			_pair_defer_arm "$manager" "$member" "$pair" "$pair" \
+				"$round" reviewer "$_PAIR_RELAY_SENT" "$_PAIR_RELAY_RESIDUE"
+		elif (( rrc )); then
 			# Roll the pre-written state back: nobody performed round
 			# $next, and leaving it bumped spends one of the cap's
 			# attempts on a round that never happened — which now costs
@@ -2087,8 +2370,13 @@ _pair_advance() {
 		else
 			apex_member_merge "$manager" "$pair" '{"pair_turn":"reviewer"}'
 		fi
-		if ! _pair_relay "$manager" "$pair" \
-			"$(_pair_reviewer_msg "$pr" "$round" rereview)"; then
+		local msg rrc=0
+		msg=$(_pair_reviewer_msg "$pr" "$round" rereview)
+		_pair_relay "$manager" "$pair" "$msg" || rrc=$?
+		if (( rrc == 2 )); then
+			_pair_defer_arm "$manager" "$member" "$pair" "$pair" \
+				"$round" worker "$_PAIR_RELAY_SENT" "$_PAIR_RELAY_RESIDUE"
+		elif (( rrc )); then
 			_pair_rollback "$manager" "$member" "$pair" "$round" worker
 			_pair_escalate "$manager" "$member" stuck \
 				"PAIRED REVIEW STUCK: the worker finished round ${round} on PR #${pr} but the reviewer ($pair) could not be reached — ${_PAIR_RELAY_WHY}."
@@ -2168,8 +2456,17 @@ _cmd_link() {
 
 	# The reviewer is already running with its own review prompt and knows
 	# nothing about the verdict protocol until told.
-	if _pair_relay "$manager" "$reviewer" "$(_pair_reviewer_msg "$pr" 1 initial)"; then
+	local brief_rc=0
+	_pair_relay "$manager" "$reviewer" "$(_pair_reviewer_msg "$pr" 1 initial)" || brief_rc=$?
+	if (( brief_rc == 0 )); then
 		print "Linked pair on PR #${pr} (max ${max} rounds); reviewer briefed on the verdict protocol."
+	elif (( brief_rc == 2 )); then
+		# Deferring is for the unattended loop; `link` is run by a human who is
+		# looking at the terminal, so say what was and was not observed.
+		print "Linked pair on PR #${pr} (max ${max} rounds); the briefing is in the reviewer's input box."
+		print -u2 "tmux-apex: WARNING — the reviewer's pane repainted throughout, so the briefing's"
+		print -u2 "  submission could not be confirmed. Check the pane; if it never took, re-send it"
+		print -u2 "  or the loop will escalate as stuck for want of a verdict."
 	else
 		print -u2 "tmux-apex: WARNING — linked, but could not brief the reviewer ($reviewer)."
 		print -u2 "  it will not know to record a verdict, and the loop will escalate as stuck."
@@ -2191,7 +2488,10 @@ _cmd_unlink() {
 		[[ -n $m ]] || continue
 		[[ -f $(apex_member_file "$manager" "$m") ]] || continue
 		apex_member_merge "$manager" "$m" \
-			'{"pair":"","pair_role":"","pair_state":"","pair_turn":"","pair_message":""}'
+			'{"pair":"","pair_role":"","pair_state":"","pair_turn":"","pair_message":"",
+			  "pair_defer_target":"","pair_defer_text":"","pair_defer_residue":"",
+			  "pair_defer_from":"","pair_defer_pair":"","pair_defer_prev_turn":"",
+			  "pair_defer_checks":0}'
 	done
 	apex_event "$manager" "$(jq -nc --arg s "$member" '{event:"pair-unlink", session:$s}')"
 	print "Unlinked ${member}${pair:+ and $pair}."
@@ -2280,8 +2580,26 @@ _cmd_pair_resume() {
 			'{"verdict_round":"","verdict_findings":"","verdict_note":"","verdict_override":""}'
 	fi
 
+	# A human has now adjudicated whatever the loop was stuck on, so any relay
+	# still awaiting a verdict of its own is moot — and left armed it would fire
+	# a re-check against a pane the resume is about to make busy again, and
+	# escalate the loop straight back out of the state this command just put it
+	# in (issue #49).
+	_pair_defer_clear "$manager" "$member"
+
+	local resume_rc=0
 	_pair_relay "$manager" "$reviewer" "$(_pair_reviewer_msg "$pr" "$round" rereview)" \
-		|| _die "pair-resume: could not reach the reviewer ($reviewer)"
+		|| resume_rc=$?
+	# rc 2 is "the box still holds it and the pane is busy" — for the unattended
+	# loop that is a deferral, but a human ran this command and can look at the
+	# pane, so report it rather than either dying or claiming confirmation.
+	if (( resume_rc == 2 )); then
+		print -u2 "tmux-apex: pair-resume: the re-review request is in ${reviewer}'s input box but the pane was"
+		print -u2 "  repainting throughout, so submission could not be confirmed. It is most likely"
+		print -u2 "  working on it — check the pane before resuming again."
+	elif (( resume_rc )); then
+		_die "pair-resume: could not reach the reviewer ($reviewer)"
+	fi
 	apex_event "$manager" "$(jq -nc --arg s "$member" --argjson max "$max" \
 		'{event:"pair-resume", session:$s, max_rounds:$max}')"
 	print "Resumed the loop on PR #${pr}; reviewer re-invoked for round ${round} of ${max}."
@@ -2485,6 +2803,16 @@ _cmd_settle() {
 	[[ $(apex_member_get "$manager" "$session" settled_seq) == "$seq" ]] && return 0
 	apex_member_merge "$manager" "$session" "$(jq -nc --argjson seq "$seq" '{settled_seq:$seq}')"
 	_record_status "$manager" "$session" idle
+
+	# An outstanding deferred relay gets first refusal on this transition. It is
+	# the cheapest moment to settle one: something in the pair has just stopped
+	# working, which is precisely the new information a deferral is waiting for
+	# (issue #49). Either it resolves as delivered — and the loop carries on
+	# below, which is the common case when the *target* is the one settling,
+	# having just finished the relayed work — or it consumed the transition, by
+	# escalating or by deferring again, and there is nothing for the loop to
+	# advance on top of.
+	_pair_defer_settle "$manager" "$session" || return 0
 
 	# A linked pair relays this idle transition to its partner and marks the
 	# ping consumed, so the manager is not woken once per round-trip. The
@@ -4153,6 +4481,7 @@ case "${1:-}" in
 	recover)  shift; _cmd_recover "$@" ;;
 	profiles) shift; _cmd_profiles "$@" ;;
 	_settle)  shift; _cmd_settle "$@" ;;
+	_pair-defer-check) shift; _cmd_pair_defer_check "$@" ;;
 	_register-member) shift; _cmd_register_member "$@" ;;
 	*)
 		print "tmux-apex.sh — apex mode for tmux-delta"
