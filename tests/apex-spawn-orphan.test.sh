@@ -141,6 +141,29 @@ else
 	bad "and all of them are found" "expected at least 9 guarded callsites, found ${guarded}"
 fi
 
+# Both assertions above match on the *text* `|| exit 1`, which is not the same
+# as the guard working. In zsh a declaration fused with its assignment does not
+# propagate the command substitution's status — `local`'s own status wins:
+#
+#   f() { return 1 }
+#   g() { local m; m=$(f) || print fired }   # fired
+#   h() { local m=$(f)    || print fired }   # silent
+#
+# So `local manager=$(_require_manager) || exit 1` parses, reads as guarded,
+# counts as guarded, and is inert. Every callsite in the script uses the split
+# form today, so this is about what the guard can detect, not a live defect —
+# but "reads guarded, does nothing" is the failure mode of #67 wearing the
+# guard's own clothes, and eight of the nine callsites have no behavioural test
+# to catch it.
+#
+# Anchored to the start of the *source* line, not to `grep -n`'s `^[0-9]*:`
+# prefix: unlike the two checks above this is a single pass over the file, so
+# there is no line-number prefix to anchor to and that pattern matches nothing.
+typeset -a fused
+fused=( ${(f)"$(grep -nE '^[[:space:]]*(local|typeset|declare|export|readonly)[[:space:]][^=]*=\$\(_require_manager\)' \
+	"$SCRIPTS/tmux-apex.sh")"} )
+eq "no declaration-fused callsite" "" "${(j:, :)fused}"
+
 print
 print -- "  ${PASS} passed, ${FAIL} failed"
 (( FAIL == 0 ))

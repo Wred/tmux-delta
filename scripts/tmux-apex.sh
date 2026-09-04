@@ -774,7 +774,16 @@ _resolve_manager() {
 # tokens in a worktree that later got pruned out from under it.
 #
 # So the contract is the callsite's: write `$(_require_manager) || exit 1`,
-# never a bare `$(_require_manager)`.
+# never a bare `$(_require_manager)`. And declare the variable on its own line
+# first — `local manager=$(_require_manager) || exit 1` satisfies the wording
+# above and does nothing, because in zsh a declaration fused with its
+# assignment reports `local`'s status, not the command substitution's:
+#
+#   f() { return 1 }
+#   g() { local m; m=$(f) || print fired }   # fired
+#   h() { local m=$(f)    || print fired }   # silent
+#
+# tests/apex-spawn-orphan.test.sh enforces both halves.
 _require_manager() {
 	local m
 	m=$(_resolve_manager) || _die "no apex manager for this session. Run: tmux-apex.sh init"
