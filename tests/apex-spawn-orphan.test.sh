@@ -115,16 +115,26 @@ print -- "every callsite honours the guard"
 #
 # Matched on the assignment form, so the prose in `_require_manager`'s own
 # comment (which necessarily spells out the bare form to forbid it) is not a
-# finding. Comment lines are dropped for the same reason.
+# finding. Whole-comment lines are dropped for the same reason — and that
+# filter is anchored to `grep -n`'s line-number prefix, because an unanchored
+# `:[[:space:]]*#` matches a *trailing* comment too. This repo cites issues by
+# number constantly, so `manager=$(_require_manager) # see: #67` is ordinary
+# house style, and an unanchored filter would drop exactly the unguarded
+# callsite the check exists to find.
 typeset -a unguarded
 unguarded=( ${(f)"$(grep -n '=\$(_require_manager)' "$SCRIPTS/tmux-apex.sh" \
-	| grep -v ':[[:space:]]*#' | grep -vF '|| exit 1')"} )
+	| grep -v '^[0-9]*:[[:space:]]*#' | grep -vF '|| exit 1')"} )
 eq "no unguarded \$(_require_manager) callsite" "" "${(j:, :)unguarded}"
 
 # And the assertion has to be able to fail: a guard that matches nothing would
-# pass the check above forever.
+# pass the check above forever. The floor is deliberately a hardcoded 9 and not
+# a count derived from the script, which would be circular. Adding a guarded
+# callsite passes; removing one fails until this number is edited, which is the
+# side to err on — it costs a one-line edit and buys a look at why a command
+# stopped needing a manager.
 typeset -i guarded
-guarded=$(grep -c '=\$(_require_manager) || exit 1' "$SCRIPTS/tmux-apex.sh")
+guarded=$(grep -n '=\$(_require_manager) || exit 1' "$SCRIPTS/tmux-apex.sh" \
+	| grep -cv '^[0-9]*:[[:space:]]*#')
 if (( guarded >= 9 )); then
 	ok "and all ${guarded} of them are found"
 else
