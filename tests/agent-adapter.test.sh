@@ -94,6 +94,10 @@ contains "pins the pane so the message can be read" \
 	"set-option -p -t %7 remain-on-exit on" "$(cat "$TMUX_LOG")"
 contains "flags the pane for a human" \
 	"set-option -p -t %7 @agent_needs_attention 1" "$(cat "$TMUX_LOG")"
+# The pane flag is discarded by agent-icons-refresh.sh once the pane is a dead
+# shell, so the session-scoped write is the one apex status actually reads.
+contains "flags the session, which apex status reads" \
+	"set-option -t %7 @agent_needs_attention 1" "$(cat "$TMUX_LOG")"
 
 out=$(run DELTA_AGENT_MANAGED=1 DELTA_AGENT_SYSTEM='you are managed')
 eq   "a system prompt alone is still no task" "78" "${out%%|*}"

@@ -51,15 +51,31 @@ DELTA_AGENT_LIBDIR="${0:A:h}"
 # not set remain-on-exit anywhere in this repo, which means the pane closes and
 # every line printed below scrolls into nothing — a diagnostic nobody can read
 # is not a diagnostic. So pin the pane first: it stays as a dead pane with the
-# text on screen. The attention flag is the same one agent-icons-refresh.sh
-# reads per pane, so the session pill shows the pane wants a human instead of
-# looking idle-but-fine.
+# text on screen.
 #
-# Both are best-effort: the guard must still refuse when there is no tmux.
+# The attention flag is then set at BOTH scopes, because pinning the pane is
+# what makes the pane-scoped one useless. A dead pane's pane_current_command is
+# the login shell, and agent-icons-refresh.sh reads a flagged pane running a
+# bare shell as "the agent was killed without firing clear" and prunes it — so
+# the pane flag alone reaches nobody. The session-scoped one is what
+# `tmux-apex.sh status --json` consults (_sopt @agent_needs_attention), and the
+# manager is the consumer that matters here: tmux-dev-layout.sh has already
+# registered this pane as a member, and apex liveness is session-level, so
+# without this the member renders `agent: "idle", alive: true` forever — the
+# round-one ghost, just quieter.
+#
+# The session pill still will not show it: the pruned pane also suppresses the
+# session-aggregate fallback (agent-icons-refresh.sh gates it on pruned == 0).
+# Teaching that script to tell a dead *pane* from a dead *shell* is a real fix
+# and a separate one; apex status is the channel a manager actually reads.
+#
+# All three writes are best-effort: the guard must still refuse without tmux.
 _delta_agent_refuse() {
 	if [[ -n ${TMUX:-} && -n ${TMUX_PANE:-} ]]; then
 		tmux set-option -p -t "$TMUX_PANE" remain-on-exit on 2>/dev/null || true
 		tmux set-option -p -t "$TMUX_PANE" @agent_needs_attention 1 2>/dev/null || true
+		# No -p/-g: a pane target resolves to that pane's session.
+		tmux set-option -t "$TMUX_PANE" @agent_needs_attention 1 2>/dev/null || true
 	fi
 	local line
 	for line in "$@"; do
