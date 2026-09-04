@@ -62,11 +62,16 @@ DELTA_AGENT_LIBDIR="${0:A:h}"
 # target, where _sopt reads session options instead.
 #
 # The session pill shows neither. Pinning the pane leaves the login shell as
-# its current command, so agent-icons-refresh.sh:145-149 prunes a flagged pane
+# its current command, so agent-icons-refresh.sh:149-153 prunes a flagged pane
 # as an agent that died without firing `clear`, and pruned > 0 then suppresses
-# the session-aggregate fallback at :203. Teaching that script to tell a dead
+# the session-aggregate fallback at :208. Teaching that script to tell a dead
 # *pane* (pane_dead) from a dead *shell* is a real fix and a separate one; it
 # would change pruning for every dead pane.
+#
+# `status` classifies the flag rather than just reporting it (#63), and a
+# refused pane has no input box and no dialog, so it reports the reason as
+# `unknown` — which is a real answer there and never folds into `idle`. That is
+# the intended read: a member nobody can explain, not a member that is fine.
 #
 # All three writes are best-effort: the guard must still refuse without tmux.
 _delta_agent_refuse() {
