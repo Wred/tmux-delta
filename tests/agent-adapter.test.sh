@@ -94,9 +94,10 @@ contains "pins the pane so the message can be read" \
 	"set-option -p -t %7 remain-on-exit on" "$(cat "$TMUX_LOG")"
 contains "flags the pane for a human" \
 	"set-option -p -t %7 @agent_needs_attention 1" "$(cat "$TMUX_LOG")"
-# The pane flag is discarded by agent-icons-refresh.sh once the pane is a dead
-# shell, so the session-scoped write is the one apex status actually reads.
-contains "flags the session, which apex status reads" \
+# The pane-scoped write above is the one `tmux-apex.sh status --json` reads back
+# (_sopt resolves pane options for a member id); this one covers a bare-session
+# target. Both are written, so both are asserted.
+contains "flags the session too, for a bare-session target" \
 	"set-option -t %7 @agent_needs_attention 1" "$(cat "$TMUX_LOG")"
 
 out=$(run DELTA_AGENT_MANAGED=1 DELTA_AGENT_SYSTEM='you are managed')

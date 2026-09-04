@@ -53,21 +53,20 @@ DELTA_AGENT_LIBDIR="${0:A:h}"
 # is not a diagnostic. So pin the pane first: it stays as a dead pane with the
 # text on screen.
 #
-# The attention flag is then set at BOTH scopes, because pinning the pane is
-# what makes the pane-scoped one useless. A dead pane's pane_current_command is
-# the login shell, and agent-icons-refresh.sh reads a flagged pane running a
-# bare shell as "the agent was killed without firing clear" and prunes it — so
-# the pane flag alone reaches nobody. The session-scoped one is what
-# `tmux-apex.sh status --json` consults (_sopt @agent_needs_attention), and the
-# manager is the consumer that matters here: tmux-dev-layout.sh has already
-# registered this pane as a member, and apex liveness is session-level, so
-# without this the member renders `agent: "idle", alive: true` forever — the
-# round-one ghost, just quieter.
+# The attention flag is then set at BOTH scopes. The pane-scoped one is what
+# reaches the manager: `tmux-apex.sh status --json` reads it through _sopt,
+# which resolves to pane options for a member id (tmux-apex.sh:72-80), and
+# tmux-dev-layout.sh has already registered this pane as a member. Without it
+# the member renders `agent: "idle", alive: true` while its pane is dead — the
+# round-one ghost, just quieter. The session-scoped write covers a bare-session
+# target, where _sopt reads session options instead.
 #
-# The session pill still will not show it: the pruned pane also suppresses the
-# session-aggregate fallback (agent-icons-refresh.sh gates it on pruned == 0).
-# Teaching that script to tell a dead *pane* from a dead *shell* is a real fix
-# and a separate one; apex status is the channel a manager actually reads.
+# The session pill shows neither. Pinning the pane leaves the login shell as
+# its current command, so agent-icons-refresh.sh:145-149 prunes a flagged pane
+# as an agent that died without firing `clear`, and pruned > 0 then suppresses
+# the session-aggregate fallback at :203. Teaching that script to tell a dead
+# *pane* (pane_dead) from a dead *shell* is a real fix and a separate one; it
+# would change pruning for every dead pane.
 #
 # All three writes are best-effort: the guard must still refuse without tmux.
 _delta_agent_refuse() {
