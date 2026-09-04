@@ -71,6 +71,7 @@ delta_agent_argv() {
 	# second run of the task.
 	if [[ -n $DELTA_AGENT_RESUME ]]; then
 		agent_argv+=(--resume "$DELTA_AGENT_RESUME")
+		agent_resume_id_honored=1
 	elif [[ -n $DELTA_AGENT_PROMPT ]]; then
 		agent_argv+=("$DELTA_AGENT_PROMPT")
 	else

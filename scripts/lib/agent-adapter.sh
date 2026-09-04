@@ -33,18 +33,39 @@
 # human. Such a launch must carry a task (DELTA_AGENT_PROMPT) or a conversation
 # to resume (DELTA_AGENT_RESUME); delta_agent_exec refuses it otherwise instead
 # of falling back to a bare agent that would wait forever (#68).
+#
+# DELTA_AGENT_RESUME asks for one *specific* conversation, which most agents
+# cannot express — codex has `resume --last`, pi and opencode have `--continue`,
+# and all three mean "whatever ran last here". An adapter that does read
+# DELTA_AGENT_RESUME therefore sets `agent_resume_id_honored`; delta_agent_exec
+# refuses a resume-by-id launch through an adapter that does not, rather than
+# letting it attach to someone else's conversation.
 
 DELTA_AGENT_LIBDIR="${0:A:h}"
 
-# _delta_agent_missing <var>... — names of the listed variables that are empty,
-# joined for an error message.
-_delta_agent_missing() {
-	local -a empty=()
-	local v
-	for v in "$@"; do
-		[[ -z ${(P)v} ]] && empty+=("$v")
+# _delta_agent_refuse <line>... — report a launch we will not make, and make
+# the report survivable.
+#
+# delta_agent_exec is the pane's whole command (agent-launch.sh builds
+# `zsh -ic 'delta_agent_exec ...'`), so returning here exits the pane. tmux does
+# not set remain-on-exit anywhere in this repo, which means the pane closes and
+# every line printed below scrolls into nothing — a diagnostic nobody can read
+# is not a diagnostic. So pin the pane first: it stays as a dead pane with the
+# text on screen. The attention flag is the same one agent-icons-refresh.sh
+# reads per pane, so the session pill shows the pane wants a human instead of
+# looking idle-but-fine.
+#
+# Both are best-effort: the guard must still refuse when there is no tmux.
+_delta_agent_refuse() {
+	if [[ -n ${TMUX:-} && -n ${TMUX_PANE:-} ]]; then
+		tmux set-option -p -t "$TMUX_PANE" remain-on-exit on 2>/dev/null || true
+		tmux set-option -p -t "$TMUX_PANE" @agent_needs_attention 1 2>/dev/null || true
+	fi
+	local line
+	for line in "$@"; do
+		print -u2 -- "$line"
 	done
-	print -r -- "${(j:, :)empty}"
+	return 78
 }
 
 # delta_agent_exec <agent-command>
@@ -64,35 +85,58 @@ delta_agent_exec() {
 	# present, healthy from outside, waiting forever (#68, same shape as #42).
 	# That is a configuration failure, not a degraded success: nothing
 	# downstream can recover a worker that was never told what to do, so refuse
-	# here and name what was missing rather than burning a pane and tokens on
-	# it. Unmanaged launches are exempt on purpose — a human pressing `o` on a
-	# plain session wants exactly a bare interactive agent in this directory.
+	# and say where the task should have come from. Unmanaged launches are
+	# exempt on purpose — a human pressing `o` on a plain session wants exactly
+	# a bare interactive agent in this directory.
 	if [[ -n $DELTA_AGENT_MANAGED && -z $DELTA_AGENT_PROMPT && -z $DELTA_AGENT_RESUME ]]; then
-		print -u2 "delta_agent_exec: refusing to launch managed agent '${agent}' with no task."
-		print -u2 "  empty: $(_delta_agent_missing DELTA_AGENT_PROMPT DELTA_AGENT_RESUME DELTA_AGENT_MODEL DELTA_AGENT_SYSTEM)"
-		print -u2 "  a managed launch needs DELTA_AGENT_PROMPT (a task) or DELTA_AGENT_RESUME (a"
-		print -u2 "  conversation id); the caller derived neither, so this pane would sit idle."
+		_delta_agent_refuse \
+			"delta_agent_exec: refusing to launch managed agent '${agent}' with no task." \
+			"  DELTA_AGENT_PROMPT and DELTA_AGENT_RESUME are both empty: no task, and no" \
+			"  conversation to resume. The prompt is derived from the session's" \
+			"  CODING_AGENT_ISSUE / CODING_AGENT_PR (see tmux-dev-layout.sh), so neither" \
+			"  was set on this session — that is the thing to fix upstream."
 		return 78
 	fi
 
 	typeset -ga agent_argv=() agent_argv_fresh=()
-	unset agent_argv_fresh_set
+	unset agent_argv_fresh_set agent_resume_id_honored
 	source "$lib"
 	delta_agent_argv
+
+	# DELTA_AGENT_RESUME names one specific conversation, and only an adapter
+	# that actually reads it can honour that. The others resume "whatever ran
+	# last in this directory" instead (`codex resume --last`, `--continue`) —
+	# which is not the same conversation and, in a worktree a worker shares with
+	# its reviewer, is a coin flip between the two. That is worse than the
+	# failure it replaces: the pane comes up attached to someone else's history,
+	# looking perfectly healthy. So an adapter that cannot resume by id must be
+	# given a task instead; adapters that can set agent_resume_id_honored.
+	if [[ -n $DELTA_AGENT_RESUME && -z $DELTA_AGENT_PROMPT ]] \
+		&& (( ! ${+agent_resume_id_honored} )); then
+		_delta_agent_refuse \
+			"delta_agent_exec: adapter ${lib:t} cannot resume a specific conversation." \
+			"  DELTA_AGENT_RESUME=${DELTA_AGENT_RESUME} would be ignored and '${agent}' would" \
+			"  attach to whatever conversation ran last in this directory instead. Give this" \
+			"  agent DELTA_AGENT_PROMPT, or teach the adapter to read DELTA_AGENT_RESUME."
+		return 78
+	fi
 
 	# Resume, falling back to a fresh session when there is nothing to resume.
 	if (( ${+agent_argv_fresh_set} )); then
 		"$agent" "${agent_argv[@]}" && return 0
 
-		# An empty fresh argv means the adapter dropped every input it was
-		# given. That is fine only when there was nothing to drop (the bare
-		# human open above); with any input set it is an adapter bug, and
-		# exec'ing it would launch an agent stripped of its model, flags and
-		# system prompt instead of reporting the bug.
+		# The fallback is only worth taking if it carries what the caller asked
+		# for. An empty fresh argv while any input was set means none of it
+		# survived into the fallback, so exec'ing it would launch an agent
+		# stripped of its model, flags or system prompt. No shipped adapter can
+		# reach this — they snapshot exactly those inputs, so empty implies all
+		# empty — which is the point: it is an assertion against the next
+		# adapter, not a diagnosis of a known bug.
 		if (( ${#agent_argv_fresh} == 0 )) \
 			&& [[ -n $DELTA_AGENT_MODEL$DELTA_AGENT_FLAGS$DELTA_AGENT_SYSTEM$DELTA_AGENT_PROMPT$DELTA_AGENT_MANAGED ]]; then
-			print -u2 "delta_agent_exec: adapter ${lib:t} built an empty fresh-session argv for '${agent}'"
-			print -u2 "  while configured inputs were set; refusing to exec an unconfigured agent."
+			_delta_agent_refuse \
+				"delta_agent_exec: no configuration survived into ${lib:t}'s fresh-session argv" \
+				"  for '${agent}', though inputs were set. Refusing to exec an unconfigured agent."
 			return 78
 		fi
 
