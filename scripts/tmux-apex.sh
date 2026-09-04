@@ -761,6 +761,20 @@ _resolve_manager() {
 	return 1
 }
 
+# _require_manager — the manager session every apex command's work belongs to,
+# or a failure the caller MUST honour.
+#
+# The `_die` here cannot stop the caller on its own. Every callsite reads this
+# through `manager=$(_require_manager)`, and a command substitution is a
+# subshell: `exit 1` ends the subshell, the message reaches stderr, and the
+# parent carries on with `manager=''` and a zero `$?`. That is how #67 happened
+# — `spawn` printed "no apex manager", then went right on to create a tmux
+# session and a worktree for an agent registered to nobody: absent from
+# `status`, unreachable by `send`, invisible to `reap`, and still burning
+# tokens in a worktree that later got pruned out from under it.
+#
+# So the contract is the callsite's: write `$(_require_manager) || exit 1`,
+# never a bare `$(_require_manager)`.
 _require_manager() {
 	local m
 	m=$(_resolve_manager) || _die "no apex manager for this session. Run: tmux-apex.sh init"
@@ -1655,7 +1669,7 @@ _cmd_spawn() {
 	_spawn_check_mode "$mode" "$perm" "${agent:-claude}" "$perm_profile"
 
 	local manager
-	manager=$(_require_manager)
+	manager=$(_require_manager) || exit 1
 	APEX_SESSION="$manager"
 
 	local -a envs=(
@@ -3183,7 +3197,7 @@ _cmd_link() {
 	[[ $max == <-> ]] && (( max >= 1 )) || _die "link: --max-rounds must be a positive integer"
 
 	local manager
-	manager=$(_require_manager)
+	manager=$(_require_manager) || exit 1
 	APEX_SESSION="$manager"
 
 	local m
@@ -3258,7 +3272,7 @@ _cmd_unlink() {
 	local member="$1"
 	[[ -n $member ]] || _die "unlink: usage: unlink <session:%pane>"
 	local manager
-	manager=$(_require_manager)
+	manager=$(_require_manager) || exit 1
 	APEX_SESSION="$manager"
 
 	local pair m
@@ -3293,7 +3307,7 @@ _cmd_pair_resume() {
 	[[ -z $extend || $extend == <-> ]] || _die "pair-resume: --max-rounds must be a positive integer"
 
 	local manager
-	manager=$(_require_manager)
+	manager=$(_require_manager) || exit 1
 	APEX_SESSION="$manager"
 
 	local pair pr role round max reviewer worker
@@ -3676,7 +3690,7 @@ _cmd_status() {
 	for a in "$@"; do [[ $a == --json ]] && as_json=true; done
 
 	local manager
-	manager=$(_require_manager)
+	manager=$(_require_manager) || exit 1
 	APEX_SESSION="$manager"
 
 	local -a rows=()
@@ -3970,7 +3984,7 @@ _cmd_pending() {
 	for a in "$@"; do [[ $a == --mark-delivered ]] && mark=true; done
 
 	local manager
-	manager=$(_require_manager)
+	manager=$(_require_manager) || exit 1
 	APEX_SESSION="$manager"
 
 	local s st seq rawseq role task facts summary pair_msg spawned age
@@ -4297,7 +4311,7 @@ _cmd_reap() {
 	done
 
 	local manager
-	manager=$(_require_manager)
+	manager=$(_require_manager) || exit 1
 	APEX_SESSION="$manager"
 
 	local -a done_members=() held=() unknown=()
@@ -4572,7 +4586,7 @@ _cmd_recover() {
 	done
 
 	local manager
-	manager=$(_require_manager)
+	manager=$(_require_manager) || exit 1
 	APEX_SESSION="$manager"
 	source "${SCRIPTS}/lib/agent-prompts.sh"
 	source "${SCRIPTS}/lib/agent-launch.sh"
@@ -5146,7 +5160,7 @@ _cmd_watch() {
 	done
 
 	if [[ -z $manager ]]; then
-		manager=$(_require_manager)
+		manager=$(_require_manager) || exit 1
 	else
 		# An explicitly named session is validated like every other command's
 		# target (cf. `stop`). Without this, `watch typo` happily creates
