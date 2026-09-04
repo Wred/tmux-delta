@@ -302,10 +302,14 @@ _box_line_of() {
 #     │   2. No, and tell Claude what to do (esc)│
 #     ╰─────────────────────────────────────────╯
 #
-# so the load-bearing signal is the numbered choice list: two or more of them,
-# or one plus an explicit question. A single numbered line on its own is not
-# enough — agent output is full of "1. do this" — and requiring the question
-# text alone would be worse, since it is prose and prose gets reworded.
+# so the load-bearing signal is the numbered choice list *inside the box*,
+# with the selection caret Claude Code always renders on exactly one of them —
+# or, as a fallback for a dialog whose caret did not render, one choice plus an
+# explicit question line. A single numbered line is not enough (agent output is
+# full of "1. do this"), being inside a box is not enough either (agents on
+# this repo draw bordered tables with numbered rows), and requiring the
+# question text alone would be worse still, since it is prose and prose gets
+# reworded.
 #
 # The interrupted-turn notice has no shape to match on, only text, so that
 # half is an explicit prefix list (_APEX_INTERRUPT_PATTERNS) against unframed
@@ -325,6 +329,12 @@ _box_line_of() {
 # the sleep notice, so the full notice still matches on its own opening, but
 # on its own the phrase is something a worker writes about its own work.
 #
+# Each prefix is also kept short enough to survive the notice being *wrapped*
+# across lines by a narrow pane — "your computer went to sleep" rather than
+# "...mid-response", which a wrap can push onto the second line. The cost of a
+# longer prefix is a silent false negative; the cost of this one is nothing,
+# since nobody narrates that phrase about their own work.
+#
 # Not on the list, on purpose: "Interrupted by user" (a human stopped that
 # turn deliberately — reporting it back to the manager as a fault would be
 # reporting the manager to itself) and usage-limit notices (real stalls, but
@@ -332,7 +342,7 @@ _box_line_of() {
 # advice rather than being folded in here).
 typeset -ga _APEX_INTERRUPT_PATTERNS=(
 	'api error'
-	'your computer went to sleep mid-response'
+	'your computer went to sleep'
 	'request was aborted'
 )
 
@@ -355,7 +365,7 @@ _attention_reason_of() {
 	(( ${#lines} > 30 )) && lines=(${lines[-30,-1]})
 
 	local -i choices=0
-	local question="" caret_seen="" interrupt="" bare=""
+	local question="" caret_seen="" sel_seen="" interrupt="" bare=""
 	local -a detail=()
 	for line in $lines; do
 		local framed=""
@@ -379,6 +389,12 @@ _attention_reason_of() {
 			# "1. Yes", "❯ 2. No, and tell Claude ...". Tested before the
 			# caret check, which the "❯ " would otherwise swallow.
 			if [[ $text == ([❯\>][[:space:]]#|)<->.[[:space:]]* ]]; then
+				# Claude Code renders the selection caret on exactly one
+				# choice, and a table does not have one. `framed` alone only
+				# asks "is this inside a box", and agents on this repo draw
+				# boxes constantly — a bordered table with numbered rows was
+				# still reading as a blocked safety dialog.
+				[[ $text == [❯\>]* ]] && sel_seen=1
 				# Pre-increment: `choices++` evaluates to the *old* value, so
 				# the first one exits non-zero, and this function is sourced
 				# into the test suite's shell, which runs under `err_return`
@@ -433,7 +449,12 @@ _attention_reason_of() {
 		done
 	done
 
-	if (( choices >= 2 )) || { (( choices >= 1 )) && [[ -n $question ]] }; then
+	# Two arms, and the caret is what makes the first one safe. The second
+	# stays uncaret-ed on purpose: it is the fallback for a dialog whose caret
+	# did not render, and it pays for that looseness with an explicit question
+	# line, which a table has no reason to carry.
+	if { (( choices >= 2 )) && [[ -n $sel_seen ]] } \
+	   || { (( choices >= 1 )) && [[ -n $question ]] }; then
 		local d
 		# Oldest-first, capped: the dialog's first lines name the tool and the
 		# operation, and a ping line has to stay a line. Capped before the

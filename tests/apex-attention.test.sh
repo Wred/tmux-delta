@@ -161,6 +161,21 @@ eq "an unframed recap with several numbered lines is not a dialog" idle \
 	"$(reason_of "$(print -l -- 'Here is what I did:' '1. Fixed the parser' '2. Added a test' '3. Updated the README' '│ > │')")"
 eq "…and neither is one with a question above it" idle \
 	"$(reason_of "$(print -l -- 'I can take this two ways. Which do you want?' '1. Patch the caller' '2. Patch the callee' '│ > │')")"
+# Being inside a box is not enough either: agents on this repo draw bordered
+# tables constantly, and a numbered one has every signal a dialog has except
+# the selection caret Claude Code renders on exactly one choice.
+eq "a box-drawn numbered table is not a dialog" idle \
+	"$(reason_of "$(print -l -- \
+		'┏━━━━━━┳━━━━━━━━━━━━━━━━━━━━━━┓' \
+		'┃ Rank ┃ Fix                  ┃' \
+		'┃ 1.   gate the dialog match  ┃' \
+		'┃ 2.   anchor the notices     ┃' \
+		'┗━━━━━━┻━━━━━━━━━━━━━━━━━━━━━━┛' \
+		'│ >                           │')")"
+# The caret-less arm survives, because it is the fallback for a dialog whose
+# caret did not render — it pays for the looseness with a question line.
+eq "a caret-less dialog with a question still classifies" permission-prompt \
+	"$(reason_of "$(print -l -- '╭──╮' '│ Bash command │' '│ Do you want to proceed? │' '│ 1. Yes │' '╰──╯')")"
 # The notice has to have been *printed*, not typed: a member whose own input
 # box quotes the phrase has not been interrupted by anything.
 eq "the interrupt phrase inside the input box is not an interrupt" idle \
@@ -176,6 +191,9 @@ eq "…nor is prose about incompleteness" idle \
 # notice still counts.
 eq "a decorated notice still classifies as interrupted" interrupted \
 	"$(reason_of "$(print -l -- '· API Error: 500 upstream connect error' '│ > │')")"
+# The prefix is short enough to survive a narrow pane wrapping the notice.
+eq "a wrapped sleep notice still classifies as interrupted" interrupted \
+	"$(reason_of "$(print -l -- 'Your computer went to sleep' 'mid-response. The response above may be incomplete.' '│ > │')")"
 # A live dialog outranks an error notice above it — the dialog is what is
 # blocking now, and answering it unblocks the pane either way.
 eq "a dialog outranks an earlier API error" permission-prompt \
