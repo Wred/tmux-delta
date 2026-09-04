@@ -256,6 +256,242 @@ _box_line_of() {
 	fi
 }
 
+# _attention_reason_of <capture> — why a member showing "needs attention" is
+# showing it, as "<reason>\t<detail>".
+#
+# `@agent_needs_attention` is a boolean, and three very different situations
+# set it: a worker blocked at a permission/safety dialog it cannot dismiss
+# itself, a worker that just ended its turn at an empty prompt, and a worker
+# that finished and is waiting for follow-up. Only the first needs a decision
+# *now*, and only the first produces no further transitions — so it also
+# produces no further pings, which is how one sat blocked for seven hours
+# while `status` reported it correctly the whole time (issue #63).
+#
+# Reasons:
+#   permission-prompt  a modal choice dialog is on screen; the detail carries
+#                      its text so the manager can answer without capturing
+#                      the pane by hand.
+#   interrupted        the box is idle, but the last thing the pane printed
+#                      says the turn died mid-response — an API error, or
+#                      Claude Code's own "your computer went to sleep
+#                      mid-response, the response above may be incomplete".
+#                      The agent is alive and will not continue on its own.
+#   idle               no dialog, no error notice, input box on screen.
+#   unknown            none of those could be established — no capture, no
+#                      box, or something on screen this does not recognise.
+#
+# `unknown` is deliberately its own answer and never folds into `idle`: the
+# reassuring case is the one that gets ignored, and the whole defect here was
+# a manager reading a state that could not distinguish "fine" from "stuck".
+# `interrupted` exists for the same reason — an interrupted turn leaves a
+# pane that looks exactly like a clean end-of-turn from outside, sets the
+# same flag, and likewise produces no further transitions and so no further
+# ping. It is a distinct reason because the manager's read of it differs:
+# clean idle is self-resolving, an interrupted turn needs a send, and often
+# has uncommitted work behind it.
+#
+# Matching is on the dialog's own rendered shape rather than on any message
+# text we choose, because the text belongs to the agent, not to us. Claude
+# Code draws it inside the same box as the prompt:
+#
+#     ╭─────────────────────────────────────────╮
+#     │ Bash command                            │
+#     │   rm -f $TMPDIR/*                       │
+#     │ Do you want to proceed?                 │
+#     │ ❯ 1. Yes                                │
+#     │   2. No, and tell Claude what to do (esc)│
+#     ╰─────────────────────────────────────────╯
+#
+# so the load-bearing signal is the numbered choice list *inside the box*,
+# with the selection caret Claude Code always renders on exactly one of them —
+# or, as a fallback for a dialog whose caret did not render, one choice plus an
+# explicit question line. A single numbered line is not enough (agent output is
+# full of "1. do this"), being inside a box is not enough either (agents on
+# this repo draw bordered tables with numbered rows), and requiring the
+# question text alone would be worse still, since it is prose and prose gets
+# reworded.
+#
+# The interrupted-turn notice has no shape to match on, only text, so that
+# half is an explicit prefix list (_APEX_INTERRUPT_PATTERNS) against unframed
+# lines. Prose does get reworded, which is why an unrecognised notice has to
+# land in `idle` rather than being pretended away — the list is a way to catch
+# the known cases early, not a claim to catch all of them. It errs in the same
+# direction the dialog half does: a missed case reports a member as ordinarily
+# idle, which is what it already looked like, whereas a false positive tells
+# the manager to go send a worker that was fine.
+# Lowercased line *prefixes* that mark a turn killed mid-response. Each one is
+# how Claude Code has actually opened such a line on a stalled worker, matched
+# case-insensitively so a reworded capitalisation does not silently drop a
+# case, and anchored at the start of the line because unanchored they are
+# short enough to occur in ordinary narration (see the match site below).
+#
+# "may be incomplete" was on this list and is not any more: it is the tail of
+# the sleep notice, so the full notice still matches on its own opening, but
+# on its own the phrase is something a worker writes about its own work.
+#
+# Each prefix is also kept short enough to survive the notice being *wrapped*
+# across lines by a narrow pane — "your computer went to sleep" rather than
+# "...mid-response", which a wrap can push onto the second line. The cost of a
+# longer prefix is a silent false negative; the cost of this one is nothing,
+# since nobody narrates that phrase about their own work.
+#
+# Not on the list, on purpose: "Interrupted by user" (a human stopped that
+# turn deliberately — reporting it back to the manager as a fault would be
+# reporting the manager to itself) and usage-limit notices (real stalls, but
+# a send does not fix them, so they want their own reason and their own
+# advice rather than being folded in here).
+typeset -ga _APEX_INTERRUPT_PATTERNS=(
+	'api error'
+	'your computer went to sleep'
+	'request was aborted'
+)
+
+_attention_reason_of() {
+	setopt localoptions extendedglob
+	# Same reason _box_line_of pins it: the box-drawing characters and the ❯
+	# are multibyte, and under LC_ALL=C a bracket expression matches their
+	# individual bytes instead — which is not an error, just a silently wrong
+	# answer.
+	local -x LC_ALL
+	LC_ALL=$(_apex_utf8_locale)
+	[[ -z $LC_ALL ]] && unset LC_ALL
+
+	# `pat` is declared here rather than at its use site: a bare `local x` for
+	# a name already local to the frame *prints* it in zsh, which on a loop
+	# body means the function quietly emits "pat=..." lines into whatever is
+	# reading it (tests/apex-status.test.sh guards exactly that).
+	local cap="$1" line text pat
+	local -a lines=(${(f)cap})
+	(( ${#lines} > 30 )) && lines=(${lines[-30,-1]})
+
+	local -i choices=0
+	local question="" caret_seen="" sel_seen="" interrupt="" bare=""
+	local -a detail=()
+	for line in $lines; do
+		local framed=""
+		[[ $line == [[:space:]]#[│┃\|]* ]] && framed=1
+		text=${line##[[:space:]]#[│┃|]}
+		text=${text%[│┃|]}
+		text=${${text##[[:space:]]##}%%[[:space:]]##}
+		[[ -z $text ]] && continue
+
+		# Every dialog signal below is gated on `framed`, because the dialog
+		# is drawn inside the box and agent *output* is not. Ungated, an
+		# ordinary end-of-turn recap — "Here is what I did: 1. Fixed the
+		# parser 2. Added a test" — counts as a choice list and reports a
+		# finished worker as blocked at a safety prompt. That is the mirror
+		# image of the defect this function exists to fix, and it lands
+		# somewhere worse than a wrong label: `_cmd_status` suppresses the
+		# unsent-input warning for a permission-prompt member, so a
+		# misclassification also hides a real stuck-send.
+		if [[ -n $framed ]]; then
+			# A numbered choice, with or without the selection caret:
+			# "1. Yes", "❯ 2. No, and tell Claude ...". Tested before the
+			# caret check, which the "❯ " would otherwise swallow.
+			if [[ $text == ([❯\>][[:space:]]#|)<->.[[:space:]]* ]]; then
+				# Claude Code renders the selection caret on exactly one
+				# choice, and a table does not have one. `framed` alone only
+				# asks "is this inside a box", and agents on this repo draw
+				# boxes constantly — a bordered table with numbered rows was
+				# still reading as a blocked safety dialog.
+				[[ $text == [❯\>]* ]] && sel_seen=1
+				# Pre-increment: `choices++` evaluates to the *old* value, so
+				# the first one exits non-zero, and this function is sourced
+				# into the test suite's shell, which runs under `err_return`
+				# — the count would return out of the function at the first
+				# choice line and every dialog would classify as idle. Found
+				# that way.
+				(( ++choices ))
+				continue
+			fi
+		fi
+		# A caret line means the input box is drawn and accepting input, which
+		# is what tells "idle" apart from "unknown". It is never detail: it is
+		# the frame, not the question.
+		if [[ $text == [\>❯][[:space:]]* || $text == [\>❯] ]]; then
+			caret_seen=1
+			continue
+		fi
+		if [[ -n $framed ]]; then
+			# The question line is pulled out and re-appended last, so the
+			# detail reads operation-then-question however the dialog
+			# ordered it.
+			if [[ $text == *\? ]]; then
+				question=$text
+				continue
+			fi
+			# Everything else inside the box is what the dialog is *about* —
+			# the tool name and the command it wants to run. That is the text
+			# the decision actually turns on, so it is what the detail
+			# reports.
+			detail+=("$text")
+			continue
+		fi
+
+		# Unframed, i.e. transcript output. Interrupted-turn notices are
+		# printed here; a member that merely typed the phrase into its own
+		# input box has not been interrupted by anything.
+		#
+		# Matched as a line *prefix*, not a substring. Claude Code prints
+		# these on a line of their own, and the phrases are short enough to
+		# occur in ordinary prose — "a retry wrapper so an API error no
+		# longer aborts the poller" is the kind of sentence a worker on this
+		# repo writes at the end of a perfectly healthy turn, and reading it
+		# as a dead turn produces a spurious `send`. Anchoring costs a real
+		# notice only if Claude Code starts prefixing them with text, which
+		# leaves the member in `idle` — the direction this errs in already.
+		#
+		# Leading decoration is stripped first, so a bulleted or gutter-marked
+		# notice ("· API Error: 500") still matches.
+		bare=${text##[^[:alnum:]]##}
+		for pat in $_APEX_INTERRUPT_PATTERNS; do
+			if [[ ${bare:l} == ${pat}* ]]; then interrupt=$bare; break; fi
+		done
+	done
+
+	# Two arms, and the caret is what makes the first one safe. The second
+	# stays uncaret-ed on purpose: it is the fallback for a dialog whose caret
+	# did not render, and it pays for that looseness with an explicit question
+	# line, which a table has no reason to carry.
+	if { (( choices >= 2 )) && [[ -n $sel_seen ]] } \
+	   || { (( choices >= 1 )) && [[ -n $question ]] }; then
+		local d
+		# Oldest-first, capped: the dialog's first lines name the tool and the
+		# operation, and a ping line has to stay a line. Capped before the
+		# question is appended, so the question is never the thing that gets
+		# dropped — it is the part that says what is being asked.
+		(( ${#detail} > 3 )) && detail=(${detail[1,3]})
+		[[ -n $question ]] && detail+=("$question")
+		d=${(pj: | :)detail}
+		(( ${#d} > 220 )) && d="${d[1,217]}..."
+		print -r -- "permission-prompt	${d}"
+		return 0
+	fi
+	# A live dialog outranks an error notice above it: the dialog is the thing
+	# blocking *now*, and answering it is what unblocks the pane either way.
+	if [[ -n $interrupt ]]; then
+		local d=$interrupt
+		(( ${#d} > 220 )) && d="${d[1,217]}..."
+		print -r -- "interrupted	${d}"
+		return 0
+	fi
+	if [[ -n $caret_seen ]]; then
+		print -r -- "idle	"
+		return 0
+	fi
+	print -r -- "unknown	"
+}
+
+# _pane_attention_reason <pane> — _attention_reason_of against a live pane.
+# Answers "unknown" rather than failing when the pane cannot be read: a
+# member whose pane has gone is a member whose reason is genuinely not known.
+_pane_attention_reason() {
+	local pane="$1" cap
+	[[ -n $pane ]] || { print -r -- "unknown	"; return 0 }
+	cap=$(tmux capture-pane -p -t "$pane" 2>/dev/null) || { print -r -- "unknown	"; return 0 }
+	_attention_reason_of "$cap"
+}
+
 # _clear_pane_input <pane> — empty the agent's input box, best effort.
 # Echoes whatever is still in the box afterwards ("" on success).
 #
@@ -729,15 +965,33 @@ _member_facts() {
 	working=$(_sopt "$session" @agent_working)
 	attention=$(_sopt "$session" @agent_needs_attention)
 
+	# Why the member wants attention, not just that it does (issue #63).
+	# Computed only for members actually in the state, so the extra
+	# capture-pane costs nothing on a team that is working — and computed
+	# live here rather than stored at notify time, because the dialog can
+	# render a beat after the hook fires and a stale snapshot of this field
+	# is worse than none.
+	local attn_reason="" attn_detail="" attn_pair
+	if [[ -n $attention ]] && $alive; then
+		local apane
+		apane=$(_agent_pane "$session" 2>/dev/null)
+		attn_pair=$(_pane_attention_reason "$apane" 2>/dev/null)
+		attn_reason=${attn_pair%%$'\t'*}
+		attn_detail=${attn_pair#*$'\t'}
+		[[ -z $attn_reason ]] && attn_reason=unknown
+	fi
+
 	jq -nc \
 		--arg session "$session" --arg wt "$wt" --arg branch "$branch" \
 		--arg pr "$pr_number" --arg pr_state "$pr_state" --arg pr_draft "$pr_draft" \
 		--arg icons "$icons" --argjson ahead "${ahead:-null}" \
 		--argjson dirty "$dirty" --argjson alive "$alive" \
 		--arg working "$working" --arg attention "$attention" \
+		--arg attn_reason "$attn_reason" --arg attn_detail "$attn_detail" \
 		--arg pane_input "$pane_input" \
 		'{session:$session, alive:$alive, worktree:$wt, branch:$branch,
 		  pane_input:$pane_input,
+		  attention_reason:$attn_reason, attention_detail:$attn_detail,
 		  pr_number:$pr, pr_state:$pr_state, pr_draft:$pr_draft, pr_icons:$icons,
 		  commits_ahead:$ahead, dirty:$dirty,
 		  agent: (if $attention != "" then "needs-attention"
@@ -3458,13 +3712,20 @@ _cmd_status() {
 		return
 	fi
 	print ""
-	printf '%-34s %-8s %-10s %-12s %s\n' SESSION ROLE AGENT TASK STATE
+	# AGENT is wide because "needs-attention" now carries its reason inline —
+	# the boolean on its own was the defect (issue #63), so the reason travels
+	# in the column the manager already reads rather than in a footnote it
+	# might not.
+	printf '%-34s %-8s %-34s %-12s %s\n' SESSION ROLE AGENT TASK STATE
 	local r
 	for r in "${rows[@]}"; do
 		printf '%s' "$r" | jq -r '
 			[ .session,
 			  (.role // "?"),
-			  (if .alive then (.agent // "?") else "dead" end),
+			  (if .alive|not then "dead"
+			    elif .agent == "needs-attention" then
+			      "needs-attention(" + (if (.attention_reason // "") != "" then .attention_reason else "unknown" end) + ")"
+			    else (.agent // "?") end),
 			  ((if .issue != "" and .issue != null then "issue#" + .issue
 			    elif .review_pr != "" and .review_pr != null then "pr#" + .review_pr
 			    else "-" end)),
@@ -3480,7 +3741,7 @@ _cmd_status() {
 			     (if .dirty then "dirty" else empty end) ] | join(", "))
 			] | @tsv' \
 		| while IFS=$'\t' read -r c1 c2 c3 c4 c5; do
-			printf '%-34s %-8s %-10s %-12s %s\n' "$c1" "$c2" "$c3" "$c4" "$c5"
+			printf '%-34s %-8s %-34s %-12s %s\n' "$c1" "$c2" "$c3" "$c4" "$c5"
 		done
 	done
 	# An agent pane can show text sitting unsent in its input box. That text is
@@ -3492,7 +3753,14 @@ _cmd_status() {
 	local unsent=()
 	local u
 	for r in "${rows[@]}"; do
-		u=$(printf '%s' "$r" | jq -r '"\(.session)\t\(.pane_input // "")"')
+		# Not for a member at a permission dialog: the dialog is drawn in the
+		# same box as the prompt, so `_pane_input_line` reads its selected
+		# choice ("1. Yes") as pending input. Reporting that as unsent text is
+		# worse than saying nothing — it invites submitting it, which is
+		# answering a safety prompt by accident.
+		u=$(printf '%s' "$r" | jq -r '
+			if .attention_reason == "permission-prompt" then empty
+			else "\(.session)\t\(.pane_input // "")" end')
 		[[ ${u#*$'\t'} == "" ]] || unsent+=("$u")
 	done
 	if (( ${#unsent} )); then
@@ -3504,6 +3772,38 @@ _cmd_status() {
 		print "  next input into the empty box), not an instruction that failed to send"
 		print "  and not stray injected text. 'send' clears it before delivering, so you"
 		print "  do not need to; do not submit it by hand unless you actually want it."
+	fi
+
+	# The reason alone says which of the three situations a member is in; the
+	# dialog's own text says what the answer should be. In the seven-hour case
+	# this was written for, the correct answer was *decline*, and nothing short
+	# of the command text could have told the manager that — so print it here
+	# rather than making it a second `tmux capture-pane` the manager only runs
+	# once it already suspects something.
+	local blocked=()
+	# Declared outside the render loop below — see _attention_reason_of on why
+	# a repeated bare `local` inside a loop starts printing itself.
+	local bs="" rest=""
+	for r in "${rows[@]}"; do
+		u=$(printf '%s' "$r" | jq -r '
+			if .alive and .agent == "needs-attention"
+			   and (.attention_reason // "") != ""
+			   and .attention_reason != "idle"
+			then "\(.session)\t\(.attention_reason)\t\(.attention_detail // "")"
+			else empty end')
+		[[ -n $u ]] && blocked+=("$u")
+	done
+	if (( ${#blocked} )); then
+		print "\nMembers waiting on a decision:"
+		for r in "${blocked[@]}"; do
+			bs=${r%%$'\t'*}; rest=${r#*$'\t'}
+			printf '  %-32s %s\n' "$bs" "${rest%%$'\t'*}"
+			[[ -n ${rest#*$'\t'} ]] && printf '  %-32s %s\n' "" "${rest#*$'\t'}"
+		done
+		print "  A permission-prompt member is blocked until someone answers it and will"
+		print "  not transition again, so it will not ping again either. Read the text,"
+		print "  then answer in its pane — declining is often the right call. An"
+		print "  interrupted member is alive but done responding: '${SELF##*/} send' it."
 	fi
 
 	print "\nRecent events:"
@@ -3574,11 +3874,21 @@ def stalled_start:
 	and (.seq // 0) == 0
 	and (.spawned_at != null)
 	and (now - .spawned_at) >= stale_after;
+def attn_stale_after:
+	(env.APEX_ATTENTION_STALE | tonumber?)
+	// (env._APEX_ATTENTION_STALE_DEFAULT | tonumber?)
+	// 900;
+def stalled_attention:
+	.status == "attention"
+	and (.updated_at != null)
+	and (now - .updated_at) >= attn_stale_after
+	and (.attention_escalated_seq // -1) != (.seq // 0);
 def reportable:
-	((.seq // 0) != (.pinged_seq // -1))
-	and (((.pair_message // "") != "")
-	     or .status == "idle" or .status == "attention"
-	     or stalled_start);
+	(((.seq // 0) != (.pinged_seq // -1))
+	 and (((.pair_message // "") != "")
+	      or .status == "idle" or .status == "attention"
+	      or stalled_start))
+	or stalled_attention;
 '
 
 # How long a member may sit at `starting`, never having taken a turn, before
@@ -3610,6 +3920,25 @@ def reportable:
 # way: a clamp that reverts to one value while the warning names another.
 _APEX_STARTING_STALE_DEFAULT=900
 
+# How long a member may sit in `attention` after its one delivery before
+# `reportable` says it again — the second half of the issue-#63 fix, and the
+# half that actually closes the seven-hour hole.
+#
+# The first report of an `attention` member goes out on its seq bump like any
+# other transition, and then the reporting stops, because reporting is keyed
+# on transitions and a *blocked* member has none left to make. The condition
+# most in need of reporting is the one that stops generating reports, so "no
+# news" and "still working" read identically. Past this threshold, silence in
+# `attention` is itself the event.
+#
+# Unlike `stalled_start` this is not gated on the reason. A member Claude Code
+# has explicitly said wants input, still wanting it a quarter of an hour
+# later, is worth one line whichever of the reasons it is — and gating on the
+# reason would put the pane heuristic on the critical path of the escalation
+# that exists because the heuristic might be wrong. The reason is reported
+# alongside, live, so the manager still learns which case it is.
+_APEX_ATTENTION_STALE_DEFAULT=900
+
 # Two clamps, because the diagnostic and the safety net are independent and only
 # one of them can be inside the predicate. `<->` is the stricter test of the two
 # and it runs here: `tonumber?` screens non-numeric, not nonsense, so it takes
@@ -3624,7 +3953,17 @@ if [[ -n ${APEX_STARTING_STALE:-} && $APEX_STARTING_STALE != <-> ]]; then
 	APEX_STARTING_STALE=$_APEX_STARTING_STALE_DEFAULT
 fi
 APEX_STARTING_STALE=${APEX_STARTING_STALE:-$_APEX_STARTING_STALE_DEFAULT}
+
+# Same clamp, same reasoning, same failure direction as APEX_STARTING_STALE
+# above: a garbage value here would make `(now - .updated_at) >= x` true for
+# every member and report the whole team at once.
+if [[ -n ${APEX_ATTENTION_STALE:-} && $APEX_ATTENTION_STALE != <-> ]]; then
+	print -u2 "${SELF:-tmux-apex}: APEX_ATTENTION_STALE='${APEX_ATTENTION_STALE}' is not whole seconds; using ${_APEX_ATTENTION_STALE_DEFAULT}"
+	APEX_ATTENTION_STALE=$_APEX_ATTENTION_STALE_DEFAULT
+fi
+APEX_ATTENTION_STALE=${APEX_ATTENTION_STALE:-$_APEX_ATTENTION_STALE_DEFAULT}
 export APEX_STARTING_STALE _APEX_STARTING_STALE_DEFAULT
+export APEX_ATTENTION_STALE _APEX_ATTENTION_STALE_DEFAULT
 
 _cmd_pending() {
 	local mark=false a
@@ -3635,6 +3974,7 @@ _cmd_pending() {
 	APEX_SESSION="$manager"
 
 	local s st seq rawseq role task facts summary pair_msg spawned age
+	local attn_reason attn_detail attn_note esc since
 	for s in ${(f)"$(apex_members "$manager")"}; do
 		[[ -z $s ]] && continue
 
@@ -3666,6 +4006,34 @@ _cmd_pending() {
 		facts=$(_member_facts "$s")
 		summary=$(_facts_line "$facts")
 
+		# Why this member wants attention, and whether it is being reported
+		# only because it has been wanting it for a while (issue #63). The
+		# reason is read live off the pane, not out of the record: the record
+		# is written by the member's hook at the moment the flag flips, and
+		# the dialog can render a beat after that.
+		attn_reason=""; attn_detail=""; attn_note=""; esc=false
+		if [[ $st == attention ]]; then
+			attn_reason=$(printf '%s' "$facts" | jq -r '.attention_reason // ""')
+			attn_detail=$(printf '%s' "$facts" | jq -r '.attention_detail // ""')
+			[[ -z $attn_reason ]] && attn_reason=unknown
+			jq -e "$_APEX_REPORTABLE_JQ"'stalled_attention' \
+				"$(apex_member_file "$manager" "$s")" >/dev/null 2>&1 && esc=true
+		fi
+		case "$attn_reason" in
+			permission-prompt)
+				attn_note=" It is stopped at a permission/safety dialog it cannot dismiss itself, so it will not move or report again until someone answers it. \`bypassPermissions\` does not override the safety classifier. Read the dialog text, then answer in its pane — declining is often the right call.${attn_detail:+ Dialog: ${attn_detail}}" ;;
+			interrupted)
+				attn_note=" Its turn died mid-response, so the agent is alive and idle but has no intention of continuing, and may have uncommitted work. Tell it to carry on with '${SELF} send ${s} <continue where you left off>'.${attn_detail:+ Pane: ${attn_detail}}" ;;
+			unknown)
+				attn_note=" Its pane shows neither a dialog nor a ready input box, so why it is waiting could not be determined — look at it with 'tmux capture-pane -p -t ${s}' before assuming it is fine." ;;
+		esac
+		# Only the escalation says how long, because only there is the
+		# duration the reason for the line existing at all.
+		if $esc; then
+			since=$(apex_member_get "$manager" "$s" updated_at)
+			[[ $since == <-> ]] && attn_note=" It has been waiting $(( $(date +%s) - since ))s and has not transitioned since, which is why this is being raised without being asked — a blocked member generates no further pings.${attn_note}"
+		fi
+
 		if [[ -n $pair_msg ]]; then
 			print "[apex] session=${s} role=${role} ${task:+task=${task} }— ${pair_msg} (${summary})"
 		elif [[ $st == starting ]]; then
@@ -3680,7 +4048,10 @@ _cmd_pending() {
 			[[ $spawned == <-> ]] && age=" for $(( $(date +%s) - spawned ))s"
 			print "[apex] session=${s} role=${role} ${task:+task=${task} }status=starting${age} — it has never taken a turn. Its agent may have failed to launch, its hooks may not be wired (${SELF} doctor), or it was recovered and is waiting at an empty prompt. Look at the pane, then either '${SELF} send ${s} <continue where you left off>' or recover/respawn it. Not reported again unless it changes."
 		else
-			print "[apex] session=${s} role=${role} ${task:+task=${task} }status=${st} — ${summary}. Full state: ${SELF} status --json"
+			# attention carries its reason inline: from the ping line alone,
+			# "blocked at a dialog nobody can answer" and "ended its turn at
+			# an empty prompt" used to read identically (issue #63).
+			print "[apex] session=${s} role=${role} ${task:+task=${task} }status=${st}${attn_reason:+(${attn_reason})} — ${summary}.${attn_note} Full state: ${SELF} status --json"
 		fi
 
 		# pair_message is a one-shot escalation, not a status field: clearing
@@ -3693,10 +4064,19 @@ _cmd_pending() {
 		# transition the manager never saw. A failed CAS re-reports the member
 		# (and, for a pair escalation, repeats it) on the next pull — the safe
 		# direction, and it self-heals in one round-trip.
+		#
+		# A staleness escalation needs its own marker rather than riding on
+		# pinged_seq. pinged_seq already equals seq by the time it fires — the
+		# member's one transition was delivered long ago — so advancing it
+		# marks nothing, and the escalation would repeat on every pull. Record
+		# the seq it escalated instead: one line per attention episode, and a
+		# later transition (new seq) earns a fresh one.
 		if $mark; then
 			apex_member_merge_cas "$manager" "$s" "$(jq -nc \
-				--argjson seq "$seq" --arg msg "$pair_msg" \
-				'{pinged_seq:$seq} + (if $msg == "" then {} else {pair_message:""} end)')" \
+				--argjson seq "$seq" --arg msg "$pair_msg" --argjson esc "$esc" \
+				'{pinged_seq:$seq}
+				 + (if $msg == "" then {} else {pair_message:""} end)
+				 + (if $esc then {attention_escalated_seq:$seq} else {} end)')" \
 				seq "$rawseq" || true
 		fi
 	done
