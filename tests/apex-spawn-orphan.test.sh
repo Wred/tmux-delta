@@ -104,6 +104,33 @@ eq       "the spawn succeeds"             0 "$SPAWN_RC"
 eq       "creating the tmux session"      "apex-issue-99" "$SESSIONS_MADE"
 eq       "and its worktree"               "apex-issue-99" "$WORKTREES_MADE"
 
+print -- "every callsite honours the guard"
+
+# The two cases above cover `spawn`, but the bug class is "one callsite forgot
+# the guard" and there are nine of them. A comment on `_require_manager` asks
+# for `|| exit 1`; nothing made that true. So assert it over the script itself,
+# which covers the callsites that exist today and the next `_cmd_*` added
+# tomorrow — including the ones whose orphan would be quieter than #67's,
+# because they never create a worktree for a human to notice.
+#
+# Matched on the assignment form, so the prose in `_require_manager`'s own
+# comment (which necessarily spells out the bare form to forbid it) is not a
+# finding. Comment lines are dropped for the same reason.
+typeset -a unguarded
+unguarded=( ${(f)"$(grep -n '=\$(_require_manager)' "$SCRIPTS/tmux-apex.sh" \
+	| grep -v ':[[:space:]]*#' | grep -vF '|| exit 1')"} )
+eq "no unguarded \$(_require_manager) callsite" "" "${(j:, :)unguarded}"
+
+# And the assertion has to be able to fail: a guard that matches nothing would
+# pass the check above forever.
+typeset -i guarded
+guarded=$(grep -c '=\$(_require_manager) || exit 1' "$SCRIPTS/tmux-apex.sh")
+if (( guarded >= 9 )); then
+	ok "and all ${guarded} of them are found"
+else
+	bad "and all of them are found" "expected at least 9 guarded callsites, found ${guarded}"
+fi
+
 print
 print -- "  ${PASS} passed, ${FAIL} failed"
 (( FAIL == 0 ))
