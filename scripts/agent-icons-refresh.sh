@@ -20,14 +20,20 @@
 # Per-agent state, most urgent first:
 #   @agent_needs_attention  wants input            U+F169F, mauve
 #   @agent_working          mid-turn               U+F16A3, mauve
-#   neither                 idle but present       U+F06A9, muted grey
+#   neither                 idle but present       U+F06A9/U+F167A, pill's own text color
 #
-# Only two colors exist: mauve for "active" (working or attention — the two
-# are distinguished by icon shape, not color, since either one just means
-# "look at this pane") and muted grey for idle. Nothing is peach or green
-# any more, on purpose — the mauve is the same hue as the selected pill's own
+# Only one real accent color exists: mauve, for "active" (working or
+# attention — the two are distinguished by icon shape, not color, since
+# either one just means "look at this pane"). Nothing is peach or green any
+# more, on purpose — the mauve is the same hue as the selected pill's own
 # background, so a robot mid-turn or blocked reads as an extension of "this
 # session wants you" rather than a separate alarm color.
+#
+# Idle isn't a color at all: it renders in whatever color the rest of the
+# pill's text already is, so an idle robot reads as part of the pill rather
+# than a second signal next to it. That text color differs by pill (plain fg
+# normally, dark crust on the mauve-background selected pill), which is why
+# idle's glyph *shape* differs too — see the two-string layout below.
 #
 # "Wants input" and not "blocked": the flag is set both by a worker stopped at
 # a permission dialog and by one that merely ended its turn, and the icon
@@ -37,17 +43,19 @@
 # Two strings are written per session, because the pill for the *selected*
 # session is drawn from a different branch of status-format[0], has a mauve
 # background, and needs contrast rules of its own:
-#   @agent_icons          filled glyphs + mauve/grey, for unselected pills
-#   @agent_icons_outline  for the selected pill: idle stays filled (mauve
-#                         would work fine there, but the icon's own "idle" grey
-#                         doesn't read on a mauve background, so it's redrawn
-#                         filled in the pill's dark foreground instead);
-#                         working/attention switch to the outline glyph,
-#                         because a *filled* mauve robot on a mauve pill would
-#                         disappear — the outline is also redrawn in the dark
-#                         foreground rather than mauve, for the same reason.
-#                         Despite the name, this string is not "always
-#                         outline" — it is "whatever reads on a mauve pill".
+#   @agent_icons          for unselected pills (plain-text-colored pill):
+#                         idle draws the outline glyph in the pill's own fg,
+#                         working/attention draw filled glyphs in mauve.
+#   @agent_icons_outline  for the selected (mauve-background) pill: idle
+#                         draws the *filled* glyph in the pill's own (dark)
+#                         fg — the outline shape is idle's "on plain text"
+#                         look, no longer needed once idle already matches
+#                         whatever's behind it; working/attention flip to the
+#                         outline glyph, in the pill's dark fg rather than
+#                         mauve, because a filled mauve robot on a mauve pill
+#                         would disappear. Despite the name, this string is
+#                         not "always outline" — it is "whatever reads, and
+#                         matches the pill's text, on a mauve background".
 #
 # Usage:
 #   agent-icons-refresh.sh                 refresh the current session
@@ -60,28 +68,33 @@ set -u
 [ -z "${TMUX:-}" ] && exit 0
 
 # Nerd Font Material Design icons (supplementary PUA, 4-byte UTF-8)
-ICON_IDLE='󰚩'       # U+F06A9 nf-md-robot
-ICON_WORKING='󱚣'    # U+F16A3 nf-md-robot_excited
-ICON_ATTENTION='󱚟'  # U+F169F nf-md-robot_confused
-# Outline counterparts, for working/attention on the selected pill. There is
-# no ICON_IDLE_OUTLINE: idle on the selected pill reuses the filled ICON_IDLE
-# (see the big comment above), so an idle outline glyph is never drawn.
+ICON_IDLE='󰚩'         # U+F06A9 nf-md-robot — idle, selected pill (filled)
+ICON_IDLE_OUTLINE='󱙺' # U+F167A nf-md-robot_outline — idle, unselected pill
+ICON_WORKING='󱚣'      # U+F16A3 nf-md-robot_excited
+ICON_ATTENTION='󱚟'    # U+F169F nf-md-robot_confused
+# Outline counterparts, for working/attention on the selected pill.
 ICON_WORKING_OUTLINE='󱚤'    # U+F16A4 nf-md-robot_excited_outline
 ICON_ATTENTION_OUTLINE='󱚠'  # U+F16A0 nf-md-robot_confused_outline
 
 # Colors — overridable via @tmux_delta_color_agent_*; tmux-delta.tmux seeds
 # them from catppuccin's active flavor when catppuccin/tmux is loaded.
+#
+# Idle has no color of its own: it's drawn in whatever fg the rest of that
+# pill's text already uses, so @tmux_delta_color_agent_idle defaults to the
+# same value as @tmux_delta_color_fg (unselected pill text) and
+# @tmux_delta_color_agent_selected defaults to the same value as the selected
+# pill's own crust foreground — tmux-delta.tmux's catppuccin snapshot keeps
+# both in sync with the active flavor, same as every other agent color here.
 COLOR_IDLE=$(tmux show-option -gqv @tmux_delta_color_agent_idle 2>/dev/null)
 # Working and attention share one color: the icon shape alone tells them
 # apart, so there is nothing left for a second color to distinguish.
 COLOR_ACTIVE=$(tmux show-option -gqv @tmux_delta_color_agent_active 2>/dev/null)
-# The selected pill has a mauve background. Idle grey and active mauve both
-# lose their contrast there (mauve-on-mauve would be invisible), so anything
-# drawn on that pill — either state — gets the pill's own dark foreground
-# instead of its usual color.
+# The selected pill has a mauve background, where mauve-on-mauve would be
+# invisible, so anything drawn there — either state — gets the pill's own
+# dark foreground instead of its usual color.
 COLOR_SELECTED=$(tmux show-option -gqv @tmux_delta_color_agent_selected 2>/dev/null)
-: "${COLOR_IDLE:=#6c7086}"    # overlay0
-: "${COLOR_ACTIVE:=#cba6f7}"  # mauve
+: "${COLOR_IDLE:=#cdd6f4}"     # fg
+: "${COLOR_ACTIVE:=#cba6f7}"   # mauve
 : "${COLOR_SELECTED:=#11111b}" # crust
 
 # More agents than this in one session and the rest collapse into a +N counter,
@@ -202,7 +215,7 @@ icons_for() {
 			icons+="#[fg=${COLOR_ACTIVE}]${ICON_WORKING}"
 			outline+="#[fg=${COLOR_SELECTED}]${ICON_WORKING_OUTLINE}"
 		else
-			icons+="#[fg=${COLOR_IDLE}]${ICON_IDLE}"
+			icons+="#[fg=${COLOR_IDLE}]${ICON_IDLE_OUTLINE}"
 			outline+="#[fg=${COLOR_SELECTED}]${ICON_IDLE}"
 		fi
 		shown=$((shown + 1))

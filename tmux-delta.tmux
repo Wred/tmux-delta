@@ -67,7 +67,7 @@ for _delta_default in \
     mauve:'#cba6f7' peach:'#fab387' pink:'#f5c2e7' \
     pr_green:'#a6e3a1' pr_red:'#f38ba8' pr_peach:'#fab387' \
     pr_muted:'#6c7086' pr_sky:'#89dceb' pr_lavender:'#b4befe' \
-    agent_idle:'#6c7086' agent_active:'#cba6f7' \
+    agent_idle:'#cdd6f4' agent_active:'#cba6f7' \
     agent_selected:'#11111b'; do
   _delta_key="${_delta_default%%:*}"
   _delta_val="${_delta_default#*:}"
@@ -107,7 +107,7 @@ unset _delta_existing
 if [[ -n "$(tmux show-option -gqv @catppuccin_flavor 2>/dev/null)" ]]; then
   for _delta_pr_pair in green:pr_green red:pr_red peach:pr_peach \
       overlay0:pr_muted sky:pr_sky lavender:pr_lavender \
-      overlay0:agent_idle mauve:agent_active \
+      fg:agent_idle mauve:agent_active \
       crust:agent_selected; do
     _delta_thm="${_delta_pr_pair%%:*}"
     _delta_dst="${_delta_pr_pair##*:}"

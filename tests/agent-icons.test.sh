@@ -36,6 +36,7 @@ lacks() {
 IDLE=$'\U000F06A9'
 WORKING=$'\U000F16A3'
 ATTENTION=$'\U000F169F'
+IDLE_O=$'\U000F167A'
 WORKING_O=$'\U000F16A4'
 ATTENTION_O=$'\U000F16A0'
 
@@ -124,9 +125,9 @@ outline() {
 print "per-agent icons"
 
 out=$(icons '%1|worker|1||' '%2|reviewer|1|1|')
-contains "idle agent gets the plain robot"   "$IDLE"    "$out"
+contains "idle agent gets the outline robot"   "$IDLE_O"    "$out"
 contains "working agent gets the excited robot" "$WORKING" "$out"
-n=$(print -r -- "$out" | grep -o "$IDLE\|$WORKING\|$ATTENTION" | grep -c .)
+n=$(print -r -- "$out" | grep -o "$IDLE_O\|$WORKING\|$ATTENTION" | grep -c .)
 eq "two agent panes yield exactly two glyphs" 2 "$n"
 
 # Each agent's state is its own — the session no longer has one shared state.
@@ -138,13 +139,13 @@ contains "its working sibling keeps the excited robot" "$WORKING" "$out"
 print "presence"
 
 out=$(icons '%1||1||')
-contains "a non-apex pane with @agent_present shows an idle icon" "$IDLE" "$out"
+contains "a non-apex pane with @agent_present shows an idle icon" "$IDLE_O" "$out"
 
 out=$(icons '%1|||')
 eq "a pane with neither role nor presence shows nothing" "" "$out"
 
 out=$(icons '%1|worker||')
-contains "an apex member with no hook events yet still shows" "$IDLE" "$out"
+contains "an apex member with no hook events yet still shows" "$IDLE_O" "$out"
 
 # The launching window: _cmd_register_member refreshes the icons immediately,
 # while the pane is typically still sitting at the shell it spawned the agent
@@ -152,7 +153,7 @@ contains "an apex member with no hook events yet still shows" "$IDLE" "$out"
 # — nothing has been heard from the pane, so there is no stale presence to
 # guard against and the icon appears at registration rather than a second later.
 out=$(icons '%1|worker||||zsh')
-contains "a launching apex member shows before its first hook event" "$IDLE" "$out"
+contains "a launching apex member shows before its first hook event" "$IDLE_O" "$out"
 
 # Once the pane HAS reported in, the exemption is gone and the ordinary idle
 # check applies — otherwise an exited agent would keep an idle robot forever.
@@ -169,12 +170,12 @@ eq "a pane that only inherited the session's @apex_role is ignored" "" "$out"
 # ...and presence still stands on its own: the inherited role is discarded,
 # but a hook that fired in this pane is direct evidence of an agent.
 out=$(icons '%1|manager|1||')
-contains "an inherited role still yields an icon when the pane reported in" "$IDLE" "$out"
+contains "an inherited role still yields an icon when the pane reported in" "$IDLE_O" "$out"
 STUB_INHERITED_PANES=""
 
 # Panes without agents are ignored, not counted.
 out=$(icons '%1|worker|1||' '%2||||')
-n=$(print -r -- "$out" | grep -o "$IDLE\|$WORKING\|$ATTENTION" | grep -c .)
+n=$(print -r -- "$out" | grep -o "$IDLE_O\|$WORKING\|$ATTENTION" | grep -c .)
 eq "editor pane adds no icon" 1 "$n"
 
 # ── session-level fallback ───────────────────────────────────────────
@@ -215,11 +216,12 @@ lacks "no filled attention glyph leaks in" "$ATTENTION" "$out"
 filled=$(icons '%1|worker|1||' '%2|worker|1|1|')
 out=$(outline '%1|worker|1||' '%2|worker|1|1|')
 eq "outline keeps the same glyph count" \
-	"$(print -r -- "$filled" | grep -o "$IDLE\|$WORKING" | grep -c .)" \
+	"$(print -r -- "$filled" | grep -o "$IDLE_O\|$WORKING" | grep -c .)" \
 	"$(print -r -- "$out" | grep -o "$IDLE\|$WORKING_O" | grep -c .)"
 
-# Neither idle grey nor active mauve is readable on the selected pill's own
-# mauve background, so both get redrawn in its dark foreground instead.
+# Neither idle's plain-text color nor active mauve is readable on the
+# selected pill's own mauve background, so both get redrawn in its dark
+# foreground instead.
 contains "selected-pill idle uses the dark foreground"   "#11111b" "$out"
 n=$(print -r -- "$out" | grep -o '#11111b' | grep -c .)
 eq "selected-pill working also uses the dark foreground, not mauve" 2 "$n"
@@ -235,7 +237,7 @@ print "truncation"
 
 out=$(icons '%1|worker|1||' '%2|worker|1||' '%3|worker|1||' '%4|worker|1||' \
             '%5|worker|1||' '%6|worker|1||')
-n=$(print -r -- "$out" | grep -o "$IDLE" | grep -c .)
+n=$(print -r -- "$out" | grep -o "$IDLE_O" | grep -c .)
 eq "at most four glyphs are drawn" 4 "$n"
 contains "the rest collapse into a counter" "+2" "$out"
 
@@ -248,7 +250,7 @@ out=$(icons '%1|worker|1|||zsh')
 eq "an idle pane with no agent process shows nothing" "" "$out"
 
 out=$(icons '%1|worker|1|||node')
-contains "an idle pane still running the agent shows" "$IDLE" "$out"
+contains "an idle pane still running the agent shows" "$IDLE_O" "$out"
 
 # A working/attention pane is believed even when the foreground command is not
 # an agent: the agent's own tool call can put anything there, and second-
@@ -325,19 +327,19 @@ contains "+N goes mauve when a blocked agent is hidden" "#cba6f7]+1" "$out"
 out=$(five_with '%5|worker|1|1|')
 contains "+N goes mauve when a working agent is hidden" "#cba6f7]+1" "$out"
 out=$(five_with '%5|worker|1||')
-contains "+N stays muted when only idle agents are hidden" "#6c7086]+1" "$out"
+contains "+N matches plain text when only idle agents are hidden" "#cdd6f4]+1" "$out"
 
 # ── configurable cap ─────────────────────────────────────────────────
 print "icon cap"
 
 STUB_MAX=2
 out=$(icons '%1|worker|1||' '%2|worker|1||' '%3|worker|1||')
-n=$(print -r -- "$out" | grep -o "$IDLE" | grep -c .)
+n=$(print -r -- "$out" | grep -o "$IDLE_O" | grep -c .)
 eq "@tmux_delta_agent_icons_max caps the glyphs" 2 "$n"
 contains "and the remainder still counts" "+1" "$out"
 STUB_MAX="bogus"
 out=$(icons '%1|worker|1||' '%2|worker|1||' '%3|worker|1||' '%4|worker|1||' '%5|worker|1||')
-eq "a non-numeric cap falls back to 4" 4 "$(print -r -- "$out" | grep -o "$IDLE" | grep -c .)"
+eq "a non-numeric cap falls back to 4" 4 "$(print -r -- "$out" | grep -o "$IDLE_O" | grep -c .)"
 STUB_MAX=""
 
 # ── no-op writes ─────────────────────────────────────────────────────
