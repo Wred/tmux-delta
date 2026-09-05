@@ -5318,8 +5318,33 @@ typeset -gA APEX_HOOK_VERB=(
 	Stop             stop
 )
 
+# _apex_plugin_hooks_active — is the tmux-delta-claude plugin installed and
+# enabled? Memoized (one `claude plugin list` per process, not one per event)
+# because `_apex_hook_wired` below calls this up to four times per `doctor`
+# run and the subprocess costs ~150ms.
+#
+# Unlike the settings.json check, this is all-or-nothing: claude-plugin/hooks/
+# hooks.json wires all four ping-delivery events in one file, so there is no
+# partial-install state to distinguish — if the plugin is enabled, every event
+# it declares is wired, by construction, and re-parsing hooks.json here would
+# just be a second copy of the same fact to keep in sync.
+typeset -g _APEX_PLUGIN_ACTIVE=""
+_apex_plugin_hooks_active() {
+	[[ $_APEX_PLUGIN_ACTIVE == 1 ]] && return 0
+	[[ $_APEX_PLUGIN_ACTIVE == 0 ]] && return 1
+	_APEX_PLUGIN_ACTIVE=0
+	command -v claude >/dev/null 2>&1 || return 1
+	command -v jq >/dev/null 2>&1 || return 1
+	claude plugin list --json 2>/dev/null | jq -e '
+		any(.[]; (.id // "" | startswith("tmux-delta-claude@")) and .enabled == true)
+	' >/dev/null 2>&1 || return 1
+	_APEX_PLUGIN_ACTIVE=1
+	return 0
+}
+
 # _apex_hook_wired <event> — is apex-manager-notify.sh wired to <event>, *with
-# the right argument*, in any settings file Claude Code reads?
+# the right argument*, via the tmux-delta-claude plugin or in any settings
+# file Claude Code reads?
 #
 # The argument is part of what makes the wiring correct, not a detail: the
 # script picks its output channel from it, and the channels aren't
@@ -5327,6 +5352,11 @@ typeset -gA APEX_HOOK_VERB=(
 # SessionStart). A command wired without its verb, or with another event's
 # verb, therefore delivers nothing on two of the four events — so this check
 # would be worse than useless if it certified that as healthy.
+#
+# The settings.json scan stays after the plugin one: a settings.json this
+# script's own installer wrote before this repo shipped a plugin (see issue
+# #73) still counts as wired, so upgrading tmux-delta never makes a working
+# install look broken mid-migration.
 #
 # Deliberately loose about the path (spelling varies: ~, $HOME, the ~/.tmux
 # symlink, a worktree checkout) and about what follows on the command line
@@ -5336,6 +5366,7 @@ _apex_hook_wired() {
 	local event="$1" f
 	local verb="${APEX_HOOK_VERB[$event]}"
 	[[ -n $verb ]] || return 1
+	_apex_plugin_hooks_active && return 0
 	for f in \
 		"$HOME/.claude/settings.json" \
 		"$HOME/.claude/settings.local.json" \
@@ -5354,26 +5385,30 @@ _apex_hook_wired() {
 	return 1
 }
 
-# _apex_notify_path — the path to suggest in the fix hint.
+# _apex_repo_root_hint — a stable, existing tmux-delta clone to point fix
+# hints at.
 #
 # Not necessarily this script's own path: `doctor` often runs from a worktree
-# (that is how work on this repo happens), and hooks live in global config, so
-# a worktree path pasted into ~/.claude/settings.json outlives the worktree and
-# breaks silently once it is removed. Prefer a stable install location that
-# actually exists, and print it unexpanded so it stays stable.
-_apex_notify_path() {
+# (that is how work on this repo happens), and both hooks and the plugin
+# marketplace live in global config, so a worktree path pasted into either one
+# outlives the worktree and breaks silently once it is removed. Prefer a
+# stable install location that actually exists (checked via the notify
+# script, a proxy for "this is a real, populated clone"), and print it
+# unexpanded so it stays stable.
+_apex_repo_root_hint() {
 	local rel="scripts/apex-manager-notify.sh" p
 	for p in \
 		"$HOME/.tmux/plugins/tmux-delta" \
 		"${XDG_CONFIG_HOME:-$HOME/.config}/tmux/plugins/tmux-delta"
 	do
 		if [[ -e $p/$rel ]]; then
-			print -r -- "${p/#$HOME/~}/$rel"
+			print -r -- "${p/#$HOME/~}"
 			return
 		fi
 	done
-	print -r -- "${SCRIPTS}/apex-manager-notify.sh"
+	print -r -- "${SCRIPTS:h}"
 }
+
 
 # _cmd_doctor [--quiet] — report which delivery hooks are missing.
 # Exits 0 when all four are wired, 1 otherwise. --quiet prints nothing when
@@ -5438,17 +5473,22 @@ _cmd_doctor() {
 		return 0
 	fi
 
-	local notify="$(_apex_notify_path)"
+	local root="$(_apex_repo_root_hint)"
 	print -u2 "tmux-apex: WARNING — apex pings will not reach this agent's context."
 	print -u2 "  missing Claude Code hooks: ${(j:, :)missing}"
 	(( ${#present} )) && print -u2 "  wired already            : ${(j:, :)present}"
 	print -u2 "  (an entry wired without its argument counts as missing — the argument"
 	print -u2 "   is what selects the output channel, and the channels differ by event)"
-	print -u2 "  fix: add to ~/.claude/settings.json (see README, \"Apex mode\"):"
+	print -u2 "  fix: install this repo's Claude Code plugin (see README, \"Coding-agent"
+	print -u2 "  hooks\"), which wires all four events — and the activity-pill ones — at"
+	print -u2 "  once:"
 	print -u2 ""
-	for e in "${missing[@]}"; do
-		print -u2 "    \"$e\": [{ \"matcher\": \"\", \"hooks\": [{ \"type\": \"command\", \"command\": \"$notify ${APEX_HOOK_VERB[$e]}\" }] }]"
-	done
+	print -u2 "    $root/scripts/install-agent-hooks.sh"
+	print -u2 ""
+	print -u2 "  or by hand:"
+	print -u2 ""
+	print -u2 "    claude plugin marketplace add $root/claude-plugin"
+	print -u2 "    claude plugin install tmux-delta-claude@tmux-delta"
 	print -u2 ""
 	print -u2 "  until then, run '${SELF} pending' by hand — it reports the same events."
 	print -u2 "$watch_line"

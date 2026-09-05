@@ -59,19 +59,27 @@ export PATH="$HOME/.tmux/plugins/tmux-delta/scripts:$PATH"
 
 ### 3. Coding-agent hooks (optional — activity pills and apex-mode reporting)
 
-These hooks live outside this repo — in `~/.claude/settings.json`, in each
-agent's own extension directory, in `~/.codex/config.toml` — so cloning or
+These hooks live outside this repo — as a Claude Code plugin, in each agent's
+own extension directory, in `~/.codex/config.toml` — so cloning or
 TPM-installing tmux-delta never installs them by itself. `tmux-delta.tmux`
 closes that gap automatically: every time tmux (re)loads the plugin it
 backgrounds `scripts/install-agent-hooks.sh`, which wires whichever of
 Claude Code / pi / opencode / codex it finds installed, using absolute paths
 resolved from wherever the repo actually is (TPM's `~/.tmux/plugins/tmux-delta`,
-a manual clone elsewhere, doesn't matter). It's upsert-by-marker, so it's a
-no-op once wired and self-heals a hook left pointing at a moved clone or a
-stale verb; it never touches hook entries it doesn't own (e.g. other
-`PreToolUse` hooks already in your `settings.json`). Its output goes to
+a manual clone elsewhere, doesn't matter). It's safe to re-run — a moved clone
+or a stale wiring self-heals rather than duplicating — and it never touches
+config it doesn't own (e.g. other hooks already in your Claude Code settings,
+or an unrelated `notify` line in `config.toml`). Its output goes to
 `~/.cache/tmux-delta/install-agent-hooks.log`, not the terminal, since a
 backgrounded `run-shell` has nothing to print to.
+
+For Claude Code specifically, this means `claude-plugin/`, a self-referencing
+plugin marketplace shipped inside this repo (see issue #73) — not a
+jq-merge into `~/.claude/settings.json`, which through 2b86ba6 is how this
+used to work. Global settings a human might manage entirely by hand (e.g.
+dotfiles) never needed to know tmux-delta's internal script paths, and now
+they don't have to: installing wires the plugin instead, and the installer
+migrates away any hook entries an older run of itself had jq-merged in.
 
 Run it by hand if you want to see what it would do before the next reload
 does it for you:
@@ -170,46 +178,37 @@ just managers.
 The installer wires all of this. What follows is the manual/reference form, for
 troubleshooting or hand-editing.
 
-**Claude Code** — `~/.claude/settings.json`:
+**Claude Code** — install `claude-plugin/` from this repo's own marketplace:
 
-```json
-{
-  "hooks": {
-    "PreToolUse": [
-      { "matcher": "", "hooks": [{ "type": "command", "command": "~/.tmux/plugins/tmux-delta/scripts/agent-tmux-status.sh set" }] }
-    ],
-    "Notification": [
-      { "matcher": "", "hooks": [{ "type": "command", "command": "~/.tmux/plugins/tmux-delta/scripts/agent-tmux-status.sh notify" }] }
-    ],
-    "Stop": [
-      { "matcher": "", "hooks": [{ "type": "command", "command": "~/.tmux/plugins/tmux-delta/scripts/agent-tmux-status.sh clear" }] },
-      { "matcher": "", "hooks": [{ "type": "command", "command": "~/.tmux/plugins/tmux-delta/scripts/apex-manager-notify.sh stop", "timeout": 10 }] }
-    ],
-    "UserPromptSubmit": [
-      { "matcher": "", "hooks": [{ "type": "command", "command": "~/.tmux/plugins/tmux-delta/scripts/apex-manager-notify.sh prompt", "timeout": 10 }] }
-    ],
-    "SessionStart": [
-      { "matcher": "startup|resume", "hooks": [{ "type": "command", "command": "~/.tmux/plugins/tmux-delta/scripts/apex-manager-notify.sh session-start", "timeout": 10 }] }
-    ],
-    "PostToolBatch": [
-      { "matcher": "", "hooks": [{ "type": "command", "command": "~/.tmux/plugins/tmux-delta/scripts/apex-manager-notify.sh post-tools", "timeout": 10 }] }
-    ]
-  }
-}
+```zsh
+claude plugin marketplace add ~/.tmux/plugins/tmux-delta/claude-plugin
+claude plugin install tmux-delta-claude@tmux-delta
 ```
 
-`Stop` carries both scripts — `agent-tmux-status.sh clear` for this session's own
+That's what the installer runs. All six hooks (`PreToolUse`, `Notification`,
+`Stop` ×2, `UserPromptSubmit`, `SessionStart`, `PostToolBatch`) live in
+[`claude-plugin/hooks/hooks.json`](claude-plugin/hooks/hooks.json), addressed
+via `${CLAUDE_PLUGIN_ROOT}` rather than a path this installer has to keep
+correct by hand — for a directory-sourced marketplace like this one,
+`${CLAUDE_PLUGIN_ROOT}` resolves at hook-execution time to the live clone, not
+a cached copy, so a moved or updated clone is picked up automatically. `Stop`
+carries both scripts — `agent-tmux-status.sh clear` for this session's own
 pill and idle record, `apex-manager-notify.sh stop` for pings from members it
 manages. A session can be both a manager and somebody's worker.
 
-The argument is required and must match the event: it picks the output channel,
-and the channels are not interchangeable (plain stdout only reaches the agent on
-`UserPromptSubmit` and `SessionStart`). Wired with the wrong argument, or none,
-the script delivers nothing — deliberately, rather than writing to a channel
-nobody reads — and `tmux-apex.sh doctor` reports that event as missing. Use a
-path that will outlive the moment, too: hooks are global config, so a worktree
-path here breaks silently once the worktree is gone. The installer handles both
-concerns; `doctor` is how you check whatever is actually on disk.
+`apex-manager-notify.sh`'s argument is required and must match the event: it
+picks the output channel, and the channels are not interchangeable (plain
+stdout only reaches the agent on `UserPromptSubmit` and `SessionStart`). Wired
+with the wrong argument, or none, the script delivers nothing — deliberately,
+rather than writing to a channel nobody reads — and `tmux-apex.sh doctor`
+reports that event as missing (checking the plugin's install state first,
+then falling back to a manual `settings.json` wiring, so either form of
+install reads as healthy).
+
+If your Claude Code build predates `claude plugin` (`claude plugin --help`
+fails), the installer skips this section entirely rather than falling back to
+editing `settings.json` — upgrade to get the hooks. Uninstalling is the
+reverse: `claude plugin uninstall tmux-delta-claude@tmux-delta`.
 
 **pi** — symlink the shipped extension, which wires `agent_start` → `set` and
 `agent_settled` → `clear`:

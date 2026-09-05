@@ -1,0 +1,9 @@
+{
+  "$schema": "https://anthropic.com/claude-code/plugin.schema.json",
+  "name": "tmux-delta-claude",
+  "version": "0.1.0",
+  "description": "tmux-delta activity pills and apex-mode hook wiring for Claude Code",
+  "author": { "name": "Wred", "url": "https://github.com/Wred" },
+  "homepage": "https://github.com/Wred/tmux-delta",
+  "repository": "https://github.com/Wred/tmux-delta"
+}

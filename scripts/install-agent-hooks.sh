@@ -28,120 +28,96 @@ note()  { printf '  %s\n' "$*"; }
 skip()  { printf '  skip: %s\n' "$*"; }
 apply() { printf '  + %s\n' "$*"; }
 
-# ─── Claude Code: ~/.claude/settings.json hooks ───────────────────────
-
+# ─── Claude Code: install the tmux-delta-claude plugin ────────────────
+#
+# Through 2b86ba6 this jq-merged PreToolUse/Notification/Stop/UserPromptSubmit/
+# SessionStart/PostToolBatch entries straight into ~/.claude/settings.json —
+# global config a human might otherwise manage entirely by hand (dotfiles),
+# and the one file besides this repo's own that ever needed to know
+# tmux-delta's internal script paths. `claude-plugin/` now carries the same
+# six hooks (see claude-plugin/hooks/hooks.json), scoped to fire only while
+# the plugin is installed and enabled, addressed via ${CLAUDE_PLUGIN_ROOT}
+# instead of a path this installer has to keep correct by hand. See issue #73.
 install_claude_hooks() {
-	local settings="$HOME/.claude/settings.json"
+	command -v claude >/dev/null 2>&1 || { skip "claude: not installed"; return; }
+	claude plugin --help >/dev/null 2>&1 || { skip "claude: no 'plugin' subcommand (upgrade Claude Code)"; return; }
 	command -v jq >/dev/null 2>&1 || { skip "claude hooks: jq not found"; return; }
 
-	mkdir -p "$(dirname "$settings")"
-	[[ -f "$settings" ]] || echo '{}' > "$settings"
-	jq -e . "$settings" >/dev/null 2>&1 || { note "claude hooks: $settings is not valid JSON, skipping"; return; }
+	local plugin_dir="$REPO_ROOT/claude-plugin"
+	local plugin_id="tmux-delta-claude@tmux-delta"
 
-	# Parallel arrays: event, matcher, command, pattern (matches existing
-	# entries so they get repointed in place instead of duplicated), extra
-	# jq object merged into the hook entry (e.g. timeout).
-	#
-	# apex-manager-notify.sh takes the delivery point as a required argument,
-	# one per event, and the argument is not cosmetic: it selects the output
-	# channel, and plain stdout only reaches the agent on UserPromptSubmit and
-	# SessionStart. Wired without it — as this installer did before — the
-	# script has no way to know which channel to use, so it delivers nothing
-	# and (deliberately) consumes nothing. PostToolBatch and Stop are what make
-	# an unattended manager notice a worker at all; UserPromptSubmit alone only
-	# ever fires on a human message. See issue #7 and `tmux-apex.sh doctor`,
-	# which checks for exactly the wiring this function writes.
-	local events=(PreToolUse Notification Stop UserPromptSubmit SessionStart PostToolBatch Stop)
-	local matchers=("" "" "" "" "startup|resume" "" "")
-	local cmds=(
-		"$STATUS_SH set"
-		"$STATUS_SH notify"
-		"$STATUS_SH clear"
-		"$NOTIFY_SH prompt"
-		"$NOTIFY_SH session-start"
-		"$NOTIFY_SH post-tools"
-		"$NOTIFY_SH stop"
-	)
-	# Matched by script basename only (not the trailing verb) so a hook
-	# left wired to the wrong verb — e.g. Notification still pointing at
-	# "clear", or apex-manager-notify.sh wired with no verb at all — gets
-	# corrected in place instead of getting a duplicate second entry alongside
-	# the stale one.
-	#
-	# Stop carries one entry per script, and the two patterns are disjoint
-	# (different basenames), so upserting either leaves the other alone: a
-	# session is both its own worker, reporting idle via agent-tmux-status.sh,
-	# and possibly a manager collecting pings via apex-manager-notify.sh.
-	local pats=(
-		'(^|/)agent-tmux-status\.sh( |$)'
-		'(^|/)agent-tmux-status\.sh( |$)'
-		'(^|/)agent-tmux-status\.sh( |$)'
-		'(^|/)apex-manager-notify\.sh( |$)'
-		'(^|/)apex-manager-notify\.sh( |$)'
-		'(^|/)apex-manager-notify\.sh( |$)'
-		'(^|/)apex-manager-notify\.sh( |$)'
-	)
-	local extras=("{}" "{}" "{}" '{"timeout":10}' '{"timeout":10}' '{"timeout":10}' '{"timeout":10}')
+	# marketplace add is idempotent — re-adding the same name repoints it to
+	# whatever path is passed, which is exactly what self-heals a moved clone —
+	# so there is no need to special-case "already correct" beyond what it
+	# takes to report a clean dry run.
+	local mp_path
+	mp_path=$(claude plugin marketplace list --json 2>/dev/null \
+		| jq -r '.[] | select(.name == "tmux-delta") | .path // empty' 2>/dev/null)
+	if [[ "$mp_path" == "$plugin_dir" ]]; then
+		skip "claude: marketplace tmux-delta already at $plugin_dir"
+	elif $DRY_RUN; then
+		apply "claude: marketplace add $plugin_dir"
+	elif claude plugin marketplace add "$plugin_dir" >/dev/null 2>&1; then
+		apply "claude: marketplace add $plugin_dir"
+	else
+		note "claude: marketplace add $plugin_dir failed"
+		return
+	fi
 
-	local i event matcher cmd pat extra tmp
-	for i in "${!events[@]}"; do
-		event="${events[$i]}"; matcher="${matchers[$i]}"; cmd="${cmds[$i]}"
-		pat="${pats[$i]}"; extra="${extras[$i]}"
+	# Plain jq, not -e: a `false` result is a valid answer, not a failure, and
+	# -e would exit 1 for it — fatal under set -e once that exit status lands
+	# in a bare assignment instead of an `if`/`&&` that catches it.
+	local already_installed
+	already_installed=$(claude plugin list --json 2>/dev/null \
+		| jq --arg id "$plugin_id" 'any(.[]; .id == $id and .enabled == true)' 2>/dev/null)
+	if [[ "$already_installed" == true ]]; then
+		skip "claude: plugin $plugin_id already installed"
+	elif $DRY_RUN; then
+		apply "claude: plugin install $plugin_id"
+		return  # nothing was actually installed, so the migration below can't run yet
+	elif claude plugin install "$plugin_id" >/dev/null 2>&1; then
+		apply "claude: plugin installed ($plugin_id)"
+	else
+		note "claude: plugin install $plugin_id failed"
+		return
+	fi
 
-		tmp="$(mktemp "${settings}.XXXXXX")"
-		jq --arg event "$event" --arg matcher "$matcher" --arg cmd "$cmd" \
-		   --arg pat "$pat" --argjson extra "$extra" '
-			.hooks //= {} |
-			.hooks[$event] //= [] |
-			(.hooks[$event] | any(.hooks[]?.command? // "" | test($pat))) as $exists |
-			if $exists then
-				.hooks[$event] = (.hooks[$event] | map(
-					.hooks = (.hooks | map(
-						if (.command? // "" | test($pat)) then .command = $cmd else . end
-					))
-				))
-			else
-				.hooks[$event] += [({matcher: $matcher, hooks: [({type:"command", command: $cmd} + $extra)]})]
-			end |
-			# Collapse the duplicates that rewrite can produce. $pat matches by
-			# script basename, so if one event carries two entries for the same
-			# script — which is what an older installer using a stricter pattern
-			# leaves behind, having appended rather than repointed — both get
-			# rewritten to the identical command and the hook would then run
-			# twice per event. Keep the first, drop the rest. This only ever
-			# removes entries whose command is exactly what the pass above just
-			# wrote, so a hook belonging to anything else is never touched.
-			.hooks[$event] = (reduce .hooks[$event][] as $g ([];
-				. as $out
-				| ($g.hooks // []) as $hs
-				| ([$out[].hooks[]? | select((.command? // "") == $cmd)] | length) as $already
-				| ($hs | to_entries | map(select((.value.command? // "") == $cmd) | .key)) as $owned
-				| if ($owned | length) == 0 then $out + [$g]
-				  else
-				  	(if $already > 0 then -1 else $owned[0] end) as $keep
-				  	| ($hs | to_entries
-				  	   | map(select(((.value.command? // "") != $cmd) or (.key == $keep)) | .value)) as $kept
-				  	| if ($kept | length) == 0 then $out else $out + [$g | .hooks = $kept] end
-				  end
+	migrate_claude_settings_hooks
+}
+
+# migrate_claude_settings_hooks — remove the pre-plugin hook entries this
+# installer used to jq-merge into ~/.claude/settings.json.
+#
+# Only called once the plugin above is confirmed installed and enabled, never
+# on its own: removing the old wiring before the replacement is live would
+# leave a machine with neither. Matched the same way the old upsert was
+# (script basename, not the trailing verb), so an entry this installer never
+# wrote — someone else's PreToolUse hook, say — is never touched.
+migrate_claude_settings_hooks() {
+	local settings="$HOME/.claude/settings.json"
+	[[ -f "$settings" ]] || return
+	local pat='(^|/)(agent-tmux-status|apex-manager-notify)\.sh( |$)'
+	local tmp
+	tmp="$(mktemp "${settings}.XXXXXX")"
+	jq --arg pat "$pat" '
+		.hooks //= {} |
+		.hooks |= (
+			with_entries(.value |= (
+				map(.hooks = (.hooks | map(select((.command? // "" | test($pat)) | not))))
+				| map(select((.hooks | length) > 0))
 			))
-		' "$settings" > "$tmp"
-		if $DRY_RUN; then
-			if diff -q "$settings" "$tmp" >/dev/null; then
-				skip "claude: $event -> $(basename "$cmd") already wired"
-			else
-				apply "claude: $event -> $cmd"
-			fi
-			rm -f "$tmp"
-		else
-			if diff -q "$settings" "$tmp" >/dev/null; then
-				skip "claude: $event -> $(basename "$cmd") already wired"
-				rm -f "$tmp"
-			else
-				mv "$tmp" "$settings"
-				apply "claude: $event -> $cmd"
-			fi
-		fi
-	done
+			| with_entries(select((.value | length) > 0))
+		)
+	' "$settings" > "$tmp"
+	if diff -q "$settings" "$tmp" >/dev/null; then
+		rm -f "$tmp"
+	elif $DRY_RUN; then
+		apply "claude: remove pre-plugin hooks from $settings (superseded by plugin)"
+		rm -f "$tmp"
+	else
+		mv "$tmp" "$settings"
+		apply "claude: removed pre-plugin hooks from $settings (superseded by plugin)"
+	fi
 }
 
 # ─── symlink helper: only touch links this script itself owns ────────

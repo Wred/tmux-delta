@@ -1,0 +1,15 @@
+{
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "tmux-delta",
+  "owner": { "name": "Wred", "url": "https://github.com/Wred" },
+  "metadata": {
+    "description": "Self-referencing marketplace so tmux-delta can install its own Claude Code plugin from a local clone — see scripts/install-agent-hooks.sh."
+  },
+  "plugins": [
+    {
+      "name": "tmux-delta-claude",
+      "source": "./",
+      "description": "tmux-delta activity pills and apex-mode hook wiring for Claude Code"
+    }
+  ]
+}
