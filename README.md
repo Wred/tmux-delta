@@ -86,17 +86,22 @@ verbs:
 
 | Verb | Meaning | Unselected pill | Selected pill |
 |------|---------|-----------------|---------------|
-| `set` | agent is working | green 󱚣 `md-robot_excited` | 󱚤 `md-robot_excited_outline` |
-| `notify` | agent is blocked on you | peach 󱚟 `md-robot_confused` | 󱚠 `md-robot_confused_outline` |
-| `clear` | agent is idle | muted 󰚩 `md-robot` | 󱙺 `md-robot_outline` |
+| `set` | agent is working | mauve 󱚣 `md-robot_excited` | 󱚤 `md-robot_excited_outline` |
+| `notify` | agent is blocked on you | mauve 󱚟 `md-robot_confused` | 󱚠 `md-robot_confused_outline` |
+| `clear` | agent is idle | muted 󰚩 `md-robot` | 󰚩 `md-robot` |
 
-The pill for the **selected** session draws the outline variant of whichever
-glyph is showing (and the dark pill foreground for idle, since the muted grey is
-unreadable on mauve).
+Only two colors exist: mauve for "working" or "blocked" (the two are told
+apart by icon shape, not color) and muted grey for idle. The pill for the
+**selected** session redraws whichever glyph is showing in the pill's own dark
+foreground, since neither mauve nor muted grey reads against the pill's mauve
+background — working/blocked switch to the outline glyph on top of that (a
+*filled* mauve robot would still be invisible on a mauve pill); idle stays
+filled, since it was never mauve to begin with.
 
 Beyond `@tmux_delta_agent_icons_max` agents (default 4) the remainder collapses
-into a `+N` counter, coloured by the most urgent state hidden behind it, so a
-blocked agent in the overflow still shows up. An *idle* pane whose foreground
+into a `+N` counter, coloured mauve if an active (working or blocked) agent is
+hidden behind it, muted grey otherwise, so a blocked agent in the overflow
+still shows up. An *idle* pane whose foreground
 command is no longer an agent (`@tmux_delta_apex_agent_cmds`) is dropped — pane
 options outlive the agent process, and without that check an exited agent would
 leave an idle robot on the pill forever.
@@ -277,10 +282,9 @@ set -g @tmux_delta_color_pr_red    '#f38ba8'
 set -g @tmux_delta_color_pr_peach  '#fab387'
 set -g @tmux_delta_color_pr_muted  '#6c7086'
 set -g @tmux_delta_color_pr_sky    '#89dceb'
-set -g @tmux_delta_color_agent_idle      '#6c7086'
-set -g @tmux_delta_color_agent_working   '#a6e3a1'
-set -g @tmux_delta_color_agent_attention '#fab387'
-set -g @tmux_delta_color_agent_idle_active '#11111b'
+set -g @tmux_delta_color_agent_idle     '#6c7086'
+set -g @tmux_delta_color_agent_active   '#cba6f7'
+set -g @tmux_delta_color_agent_selected '#11111b'
 
 # Most agent icons drawn in one pill before the rest collapse into "+N"
 set -g @tmux_delta_agent_icons_max 4
@@ -898,7 +902,7 @@ them when launching the agent:
 | `@agent_present` | agent panes (pane-scoped) | `1` once a hook has fired there |
 | `@agent_working` / `@agent_needs_attention` | agent panes + session aggregate | `1` |
 | `@agent_icons` | any session | rendered per-agent icon string |
-| `@agent_icons_outline` | any session | same, outline glyphs, for the selected pill |
+| `@agent_icons_outline` | any session | same, styled to read on the selected (mauve) pill |
 
 ### Crash recovery
 

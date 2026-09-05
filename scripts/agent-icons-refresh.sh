@@ -18,9 +18,16 @@
 # Both are pane options, so they disappear with the pane — no stale icons.
 #
 # Per-agent state, most urgent first:
-#   @agent_needs_attention  wants input            U+F169F (peach)
-#   @agent_working          mid-turn               U+F16A3 (green)
-#   neither                 idle but present       U+F06A9 (muted)
+#   @agent_needs_attention  wants input            U+F169F, mauve
+#   @agent_working          mid-turn               U+F16A3, mauve
+#   neither                 idle but present       U+F06A9, muted grey
+#
+# Only two colors exist: mauve for "active" (working or attention — the two
+# are distinguished by icon shape, not color, since either one just means
+# "look at this pane") and muted grey for idle. Nothing is peach or green
+# any more, on purpose — the mauve is the same hue as the selected pill's own
+# background, so a robot mid-turn or blocked reads as an extension of "this
+# session wants you" rather than a separate alarm color.
 #
 # "Wants input" and not "blocked": the flag is set both by a worker stopped at
 # a permission dialog and by one that merely ended its turn, and the icon
@@ -28,10 +35,19 @@
 # and reports a reason (issue #63). Do not read urgency into this glyph.
 #
 # Two strings are written per session, because the pill for the *selected*
-# session is drawn from a different branch of status-format[0] and uses the
-# outline variant of whichever glyph is showing:
-#   @agent_icons          filled glyphs, for unselected pills
-#   @agent_icons_outline  md-*_outline glyphs, for the selected pill
+# session is drawn from a different branch of status-format[0], has a mauve
+# background, and needs contrast rules of its own:
+#   @agent_icons          filled glyphs + mauve/grey, for unselected pills
+#   @agent_icons_outline  for the selected pill: idle stays filled (mauve
+#                         would work fine there, but the icon's own "idle" grey
+#                         doesn't read on a mauve background, so it's redrawn
+#                         filled in the pill's dark foreground instead);
+#                         working/attention switch to the outline glyph,
+#                         because a *filled* mauve robot on a mauve pill would
+#                         disappear — the outline is also redrawn in the dark
+#                         foreground rather than mauve, for the same reason.
+#                         Despite the name, this string is not "always
+#                         outline" — it is "whatever reads on a mauve pill".
 #
 # Usage:
 #   agent-icons-refresh.sh                 refresh the current session
@@ -47,24 +63,26 @@ set -u
 ICON_IDLE='󰚩'       # U+F06A9 nf-md-robot
 ICON_WORKING='󱚣'    # U+F16A3 nf-md-robot_excited
 ICON_ATTENTION='󱚟'  # U+F169F nf-md-robot_confused
-# Outline counterparts, for the selected pill.
-ICON_IDLE_OUTLINE='󱙺'       # U+F167A nf-md-robot_outline
+# Outline counterparts, for working/attention on the selected pill. There is
+# no ICON_IDLE_OUTLINE: idle on the selected pill reuses the filled ICON_IDLE
+# (see the big comment above), so an idle outline glyph is never drawn.
 ICON_WORKING_OUTLINE='󱚤'    # U+F16A4 nf-md-robot_excited_outline
 ICON_ATTENTION_OUTLINE='󱚠'  # U+F16A0 nf-md-robot_confused_outline
 
 # Colors — overridable via @tmux_delta_color_agent_*; tmux-delta.tmux seeds
 # them from catppuccin's active flavor when catppuccin/tmux is loaded.
 COLOR_IDLE=$(tmux show-option -gqv @tmux_delta_color_agent_idle 2>/dev/null)
-COLOR_WORKING=$(tmux show-option -gqv @tmux_delta_color_agent_working 2>/dev/null)
-COLOR_ATTENTION=$(tmux show-option -gqv @tmux_delta_color_agent_attention 2>/dev/null)
-# The selected pill has a mauve background, on which the muted idle grey is
-# unreadable; it gets the pill's own dark foreground instead. Working and
-# attention keep their hues, which stay legible on mauve.
-COLOR_IDLE_ACTIVE=$(tmux show-option -gqv @tmux_delta_color_agent_idle_active 2>/dev/null)
-: "${COLOR_IDLE:=#6c7086}"        # overlay0
-: "${COLOR_WORKING:=#a6e3a1}"     # green
-: "${COLOR_ATTENTION:=#fab387}"   # peach
-: "${COLOR_IDLE_ACTIVE:=#11111b}" # crust
+# Working and attention share one color: the icon shape alone tells them
+# apart, so there is nothing left for a second color to distinguish.
+COLOR_ACTIVE=$(tmux show-option -gqv @tmux_delta_color_agent_active 2>/dev/null)
+# The selected pill has a mauve background. Idle grey and active mauve both
+# lose their contrast there (mauve-on-mauve would be invisible), so anything
+# drawn on that pill — either state — gets the pill's own dark foreground
+# instead of its usual color.
+COLOR_SELECTED=$(tmux show-option -gqv @tmux_delta_color_agent_selected 2>/dev/null)
+: "${COLOR_IDLE:=#6c7086}"    # overlay0
+: "${COLOR_ACTIVE:=#cba6f7}"  # mauve
+: "${COLOR_SELECTED:=#11111b}" # crust
 
 # More agents than this in one session and the rest collapse into a +N counter,
 # so a busy apex session can't push the pills off the status line.
@@ -163,15 +181,13 @@ icons_for() {
 			pruned=$((pruned + 1))
 			continue
 		fi
-		# Overflow keeps no glyph, but the +N counter is coloured by the most
-		# urgent state hidden behind it — with the session-wide peach pill gone,
-		# a blocked agent in the overflow would otherwise have no signal at all.
+		# Overflow keeps no glyph, but the +N counter is coloured by whether an
+		# active agent is hidden behind it — with the session-wide alarm pill
+		# gone, one in the overflow would otherwise have no signal at all.
 		if [ "$shown" -ge "$MAX_ICONS" ]; then
 			extra=$((extra + 1))
-			if [ -n "$attention" ]; then
-				extra_state=attention
-			elif [ -n "$working" ] && [ "$extra_state" = idle ]; then
-				extra_state=working
+			if [ -n "$attention" ] || [ -n "$working" ]; then
+				extra_state=active
 			fi
 			continue
 		fi
@@ -180,14 +196,14 @@ icons_for() {
 			outline+=" "
 		fi
 		if [ -n "$attention" ]; then
-			icons+="#[fg=${COLOR_ATTENTION}]${ICON_ATTENTION}"
-			outline+="#[fg=${COLOR_ATTENTION}]${ICON_ATTENTION_OUTLINE}"
+			icons+="#[fg=${COLOR_ACTIVE}]${ICON_ATTENTION}"
+			outline+="#[fg=${COLOR_SELECTED}]${ICON_ATTENTION_OUTLINE}"
 		elif [ -n "$working" ]; then
-			icons+="#[fg=${COLOR_WORKING}]${ICON_WORKING}"
-			outline+="#[fg=${COLOR_WORKING}]${ICON_WORKING_OUTLINE}"
+			icons+="#[fg=${COLOR_ACTIVE}]${ICON_WORKING}"
+			outline+="#[fg=${COLOR_SELECTED}]${ICON_WORKING_OUTLINE}"
 		else
 			icons+="#[fg=${COLOR_IDLE}]${ICON_IDLE}"
-			outline+="#[fg=${COLOR_IDLE_ACTIVE}]${ICON_IDLE_OUTLINE}"
+			outline+="#[fg=${COLOR_SELECTED}]${ICON_IDLE}"
 		fi
 		shown=$((shown + 1))
 	done <<-EOF
@@ -209,22 +225,20 @@ icons_for() {
 		attention=$(tmux show-option -t "$session" -qv @agent_needs_attention 2>/dev/null || true)
 		working=$(tmux show-option -t "$session" -qv @agent_working 2>/dev/null || true)
 		if [ -n "$attention" ]; then
-			icons="#[fg=${COLOR_ATTENTION}]${ICON_ATTENTION}"
-			outline="#[fg=${COLOR_ATTENTION}]${ICON_ATTENTION_OUTLINE}"
+			icons="#[fg=${COLOR_ACTIVE}]${ICON_ATTENTION}"
+			outline="#[fg=${COLOR_SELECTED}]${ICON_ATTENTION_OUTLINE}"
 		elif [ -n "$working" ]; then
-			icons="#[fg=${COLOR_WORKING}]${ICON_WORKING}"
-			outline="#[fg=${COLOR_WORKING}]${ICON_WORKING_OUTLINE}"
+			icons="#[fg=${COLOR_ACTIVE}]${ICON_WORKING}"
+			outline="#[fg=${COLOR_SELECTED}]${ICON_WORKING_OUTLINE}"
 		fi
 	fi
 
 	if [ "$extra" -gt 0 ]; then
 		case "$extra_state" in
-			attention) icons+=" #[fg=${COLOR_ATTENTION}]+${extra}"
-			           outline+=" #[fg=${COLOR_ATTENTION}]+${extra}" ;;
-			working)   icons+=" #[fg=${COLOR_WORKING}]+${extra}"
-			           outline+=" #[fg=${COLOR_WORKING}]+${extra}" ;;
-			*)         icons+=" #[fg=${COLOR_IDLE}]+${extra}"
-			           outline+=" #[fg=${COLOR_IDLE_ACTIVE}]+${extra}" ;;
+			active) icons+=" #[fg=${COLOR_ACTIVE}]+${extra}"
+			        outline+=" #[fg=${COLOR_SELECTED}]+${extra}" ;;
+			*)      icons+=" #[fg=${COLOR_IDLE}]+${extra}"
+			        outline+=" #[fg=${COLOR_SELECTED}]+${extra}" ;;
 		esac
 	fi
 	# TAB-separated: neither variant can contain one.

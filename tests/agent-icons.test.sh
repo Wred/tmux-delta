@@ -36,7 +36,6 @@ lacks() {
 IDLE=$'\U000F06A9'
 WORKING=$'\U000F16A3'
 ATTENTION=$'\U000F169F'
-IDLE_O=$'\U000F167A'
 WORKING_O=$'\U000F16A4'
 ATTENTION_O=$'\U000F16A0'
 
@@ -206,22 +205,25 @@ STUB_SESS_ATTENTION=""
 print "outline variants"
 
 out=$(outline '%1|worker|1||' '%2|worker|1|1|' '%3|worker|1||1')
-contains "idle uses md-robot_outline"             "$IDLE_O"      "$out"
-contains "working uses md-robot_excited_outline"  "$WORKING_O"   "$out"
-contains "blocked uses md-robot_confused_outline" "$ATTENTION_O" "$out"
-lacks "no filled idle glyph leaks in"    "$IDLE"      "$out"
-lacks "no filled working glyph leaks in" "$WORKING"   "$out"
+contains "idle stays the filled md-robot (not an outline)" "$IDLE"        "$out"
+contains "working uses md-robot_excited_outline"           "$WORKING_O"   "$out"
+contains "blocked uses md-robot_confused_outline"          "$ATTENTION_O" "$out"
+lacks "no filled working glyph leaks in"   "$WORKING"   "$out"
 lacks "no filled attention glyph leaks in" "$ATTENTION" "$out"
 
-# Same count, same order, same state colours — only the glyphs differ.
+# Same count, same order — only idle's glyph shape, and every color, differ.
 filled=$(icons '%1|worker|1||' '%2|worker|1|1|')
 out=$(outline '%1|worker|1||' '%2|worker|1|1|')
 eq "outline keeps the same glyph count" \
 	"$(print -r -- "$filled" | grep -o "$IDLE\|$WORKING" | grep -c .)" \
-	"$(print -r -- "$out" | grep -o "$IDLE_O\|$WORKING_O" | grep -c .)"
+	"$(print -r -- "$out" | grep -o "$IDLE\|$WORKING_O" | grep -c .)"
 
-# Idle grey is unreadable on the selected pill's mauve background.
-contains "selected-pill idle uses the dark foreground" "#11111b" "$out"
+# Neither idle grey nor active mauve is readable on the selected pill's own
+# mauve background, so both get redrawn in its dark foreground instead.
+contains "selected-pill idle uses the dark foreground"   "#11111b" "$out"
+n=$(print -r -- "$out" | grep -o '#11111b' | grep -c .)
+eq "selected-pill working also uses the dark foreground, not mauve" 2 "$n"
+lacks "no mauve leaks into the selected pill" "#cba6f7" "$out"
 
 STUB_SESS_WORKING=1
 out=$(outline '%1||||')
@@ -311,17 +313,17 @@ out=$(icons '%1|worker|1|1||')
 contains "an unknown foreground command keeps the working glyph" "$WORKING" "$out"
 
 # ── overflow carries the most urgent hidden state ────────────────────
-# The peach pill background is gone, so a blocked agent hidden behind +N would
-# have no signal anywhere if the counter were always muted.
+# The alarm-colored pill background is gone, so a blocked agent hidden behind
+# +N would have no signal anywhere if the counter were always muted.
 print "overflow urgency"
 
 five_with() {
 	icons '%1|worker|1||' '%2|worker|1||' '%3|worker|1||' '%4|worker|1||' "$1"
 }
 out=$(five_with '%5|worker|1||1')
-contains "+N goes peach when a blocked agent is hidden" "#fab387]+1" "$out"
+contains "+N goes mauve when a blocked agent is hidden" "#cba6f7]+1" "$out"
 out=$(five_with '%5|worker|1|1|')
-contains "+N goes green when a working agent is hidden" "#a6e3a1]+1" "$out"
+contains "+N goes mauve when a working agent is hidden" "#cba6f7]+1" "$out"
 out=$(five_with '%5|worker|1||')
 contains "+N stays muted when only idle agents are hidden" "#6c7086]+1" "$out"
 
