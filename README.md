@@ -1124,3 +1124,7 @@ safe direction and self-heals in one round-trip.
 | `gwtrm [-f] <path-or-branch>` | Remove worktree and delete branch |
 | `gwtl` | List all worktrees |
 | `gwtp` | Prune stale worktree refs |
+
+## License
+
+[MIT](LICENSE)
