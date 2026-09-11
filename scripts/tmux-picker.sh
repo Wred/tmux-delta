@@ -456,21 +456,75 @@ _open_finder() {
 	fi
 }
 
+# Hands the item back through become() rather than opening from an execute():
+# execute()+abort left a failure with nowhere to be seen, since fzf was torn
+# down before anything printed could be read. Coming back as a mode instead,
+# the open runs after fzf is gone but while the popup is still up, so a failure
+# can print there and wait to be dismissed.
 _on_ctrl_o() {
 	case "$1" in
-		"Sessions> ")  echo "execute($TMUX_PICKER --open-browser {1})+abort" ;;
-		"Issues> ")    echo "execute($TMUX_PICKER --open-browser {1})+abort" ;;
-		"Issues (mine)> ") echo "execute($TMUX_PICKER --open-browser {1})+abort" ;;
-		"PRs> ")         echo "execute($TMUX_PICKER --open-browser {1})+abort" ;;
-		"Closed PRs> ")  echo "execute($TMUX_PICKER --open-browser {1})+abort" ;;
-		"Ready> ")       echo "execute($TMUX_PICKER --open-browser {1})+abort" ;;
-		"Worktrees> ")   echo "execute($TMUX_PICKER --open-browser {1})+abort" ;;
+		"Sessions> "|"Issues> "|"Issues (mine)> "|"PRs> "|"Closed PRs> "|"Ready> "|"Worktrees> ")
+			echo "become(printf '%s\n%s' browse {1})" ;;
 	esac
 }
 
+# Records why an open failed, for _browse_or_report to show in the popup once
+# fzf has gone. Nothing is printed here: these run while fzf still owns the
+# terminal, where a stray line would be overwritten or read as an action.
+_picker_notify() {
+	_picker_error=${(j: :)${(f)1}}
+}
+
+# Attempts the open with fzf already closed but the popup still alive, so a
+# failure has somewhere to be read. The popup is `display-popup -EE`, which
+# closes the moment this script exits — hence the wait for a keypress.
+_browse_or_report() {
+	_open_browser "$1" && return 0
+	print -r -- ""
+	print -r -- "  ⚠ ${_picker_error:-could not open that in a browser}"
+	print -r -- ""
+	print -rn -- "  press any key to close "
+	read -k 1 2>/dev/null
+	return 1
+}
+
+# _gh_url <dir> <gh ...> — resolve a URL, keeping gh's stderr so an
+# unreachable host (VPN off, a GitHub Enterprise instance down for
+# maintenance) explains itself instead of collapsing into an empty string.
+# Leaves the url in _gh_url_out and the last stderr line in _gh_url_err.
+_gh_url() {
+	local dir="$1"; shift
+	local out rc
+	out=$(cd "$dir" && "$@" 2>&1); rc=$?
+	_gh_url_out=; _gh_url_err=
+	local -a lines
+	lines=(${(f)out})
+	if (( rc == 0 )) && [[ -n ${out//[[:space:]]/} ]]; then
+		_gh_url_out=${lines[1]}
+		return 0
+	fi
+	lines=(${(M)lines:#*[^[:space:]]*})
+	_gh_url_err=${lines[-1]}
+	return 1
+}
+
+# _open_gh_url <label> <dir> <gh ...>
+_open_gh_url() {
+	local label="$1" dir="$2"; shift 2
+	if _gh_url "$dir" "$@"; then
+		_open_url "$_gh_url_out" "$label"
+	else
+		_picker_notify "delta: cannot open $label — ${_gh_url_err:-gh returned no URL}"
+		return 1
+	fi
+}
+
 _open_url() {
-	local url="$1"
-	[[ -z $url ]] && return 1
+	local url="$1" label="${2:-page}"
+	if [[ -z $url ]]; then
+		_picker_notify "delta: cannot open $label — no URL available"
+		return 1
+	fi
 	if [[ "$(uname)" == "Darwin" ]]; then
 		open "$url"
 	else
@@ -495,26 +549,38 @@ _browse_repo() {
 		pr_number=$(printf '%s' "$cached" | jq -r '.pr_number // empty')
 		[[ -n $pr_number ]] && url=$(printf '%s' "$cached" | jq -r '.url // empty')
 	fi
+	# A failing `gh pr view` here is ambiguous — the branch may simply have no
+	# PR — so stay quiet and let the `gh browse` fallback below be the one that
+	# reports, since it fails for exactly the same reason when the host is down.
 	if [[ -z $pr_number ]]; then
-		pr_number=$(cd "$repo_path" && gh pr view --json number --jq '.number' 2>/dev/null)
-		[[ -n $pr_number ]] && url=$(cd "$repo_path" && gh pr view --json url --jq '.url' 2>/dev/null)
+		if _gh_url "$repo_path" gh pr view --json number,url --jq '"\(.number)\t\(.url)"'; then
+			pr_number=${_gh_url_out%%$'\t'*}
+			url=${_gh_url_out#*$'\t'}
+		fi
 	fi
 	if [[ -z $pr_number && -n $session_name ]]; then
 		local issue_number
 		issue_number=$(tmux show-environment -t "$session_name" CODING_AGENT_ISSUE 2>/dev/null | sed 's/CODING_AGENT_ISSUE=//')
 		if [[ -n $issue_number && $issue_number != -* ]]; then
-			url=$(cd "$repo_path" && gh issue view "$issue_number" --json url --jq '.url' 2>/dev/null)
+			_gh_url "$repo_path" gh issue view "$issue_number" --json url --jq '.url' && url=$_gh_url_out
 		fi
 	fi
-	[[ -z $url ]] && url=$(cd "$repo_path" && gh browse --branch "$branch" --no-browser 2>/dev/null)
-	_open_url "$url"
+	if [[ -z $url ]]; then
+		if _gh_url "$repo_path" gh browse --branch "$branch" --no-browser; then
+			url=$_gh_url_out
+		else
+			_picker_notify "delta: cannot open $branch — ${_gh_url_err:-gh returned no URL}"
+			return 1
+		fi
+	fi
+	_open_url "$url" "$branch"
 }
 
 _open_browser() {
 	local selected="$1"
 	case "$selected" in
-		issue:*) _open_url "$(gh issue view "${selected#issue:}" --json url --jq '.url' 2>/dev/null)" ;;
-		pr:*)    _open_url "$(gh pr view "${selected#pr:}" --json url --jq '.url' 2>/dev/null)" ;;
+		issue:*) _open_gh_url "issue #${selected#issue:}" . gh issue view "${selected#issue:}" --json url --jq '.url' ;;
+		pr:*)    _open_gh_url "PR #${selected#pr:}" . gh pr view "${selected#pr:}" --json url --jq '.url' ;;
 		session:*)
 			local rest="${selected#session:}"
 			local session_name="${rest%%:*}"
@@ -1133,7 +1199,6 @@ case "${1:-}" in
 	--open-finder)    _open_finder "$2";           exit ;;
 	--on-ctrl-o)      _on_ctrl_o "$2";             exit ;;
 	--on-ctrl-y)      _on_ctrl_y "$2";             exit ;;
-	--open-browser)   _open_browser "$2";          exit ;;
 esac
 
 # ─── Main ───────────────────────────────────────────────────────────
@@ -1197,7 +1262,7 @@ fi
 [[ -z $output ]] && exit 0
 
 # Parse structured output from become()
-# Line 1: mode (select | interactive | autonomous | review)
+# Line 1: mode (select | interactive | autonomous | review | browse)
 # Line 2: prefixed item (dir:… | wt:… | issue:…)
 # Line 3: fzf query (worktrees tab only)
 mode=$(echo "$output" | sed -n '1p')
@@ -1206,6 +1271,11 @@ query=$(echo "$output" | sed -n '3p')
 
 if [[ $mode == review-all ]]; then
 	_open_all_pr_reviews
+	exit 0
+fi
+
+if [[ $mode == browse ]]; then
+	_browse_or_report "$selected"
 	exit 0
 fi
 
