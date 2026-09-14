@@ -1343,8 +1343,9 @@ _cmd_init() {
 	apex_init_dirs "$session"
 	apex_write_atomic "$(apex_file "$session")" \
 		"$(jq -nc --arg s "$session" --arg r "$main" --arg p "${TMUX_PANE:-}" \
+			--arg a "${CLAUDE_CODE_SESSION_ID:-}" \
 			--argjson t "$(date +%s)" \
-			'{session:$s, repo:$r, agent_pane:$p, created_at:$t}')"
+			'{session:$s, repo:$r, agent_pane:$p, agent_session:$a, created_at:$t}')"
 	apex_event "$session" "$(jq -nc --arg s "$session" '{event:"manager-init", session:$s}')"
 
 	# Merge authority is a per-repo decision with a default of "not granted"
@@ -1439,10 +1440,72 @@ _cmd_stop() {
 # of its turns), and a watcher can die for reasons a session restart is not —
 # a crash, an OOM kill, a stray `kill`. `_apex_watch_start` is a pidfile read
 # and a `kill -0` when one is already running, so paying it per hook is fine.
+# _apex_manager_expire <session> — drop a manager role whose agent is gone.
+#
+# Same effect as `stop`, minus the "not a manager" death and the human-facing
+# print: used by relink when the pane's agent turns out to be a different
+# context than the one that ran `init`. Writes manager-stop so the next relink
+# reads the record as deliberately ended rather than re-deriving it again.
+_apex_manager_expire() {
+	local session="$1"
+	tmux set-option -u -t "$session" @apex_role 2>/dev/null
+	tmux set-option -u -t "$session" @apex_repo 2>/dev/null
+	_apex_watch_stop "$session" >/dev/null 2>&1 || true
+	apex_event "$session" "$(jq -nc '{event:"manager-stop", reason:"agent-session-changed"}')"
+	tmux refresh-client -S 2>/dev/null
+}
+
+# _apex_manager_agent_gone <session> <current-agent-session-id>
+#
+# The manager role is durable state keyed on a tmux *session name*, but apex
+# mode itself only exists inside one agent conversation — the skill that ran
+# `init`. Those two lifetimes came apart on /clear: the tmux session survives,
+# the record survives, so relink kept re-asserting @apex_role (and with it the
+# status-bar pill) onto an agent with no apex context loaded at all.
+#
+# The agent's own session id is what separates the two cases relink has to tell
+# apart. `--continue`/`--resume` carries the same id forward, so a genuine
+# resume still relinks — which is what relink was written for. /clear and a
+# fresh start mint a new one, so the role expires.
+#
+# Returns 0 (gone) only when both ids are known and differ. Unknown means keep:
+# a record written before this field existed adopts the agent it finds, so it
+# starts telling the truth from the next /clear onward rather than expiring a
+# manager that may well be live.
+_apex_manager_agent_gone() {
+	local session="$1" cur="$2" f stored
+	[[ -z $cur ]] && return 1
+	f=$(apex_file "$session")
+	[[ -f $f ]] || return 1
+	stored=$(jq -r '.agent_session // empty' "$f" 2>/dev/null)
+	if [[ -z $stored ]]; then
+		apex_write_atomic "$f" "$(jq -c --arg a "$cur" '.agent_session = $a' "$f" 2>/dev/null)" \
+			2>/dev/null || true
+		return 1
+	fi
+	[[ $stored == "$cur" ]] && return 1
+	return 0
+}
+
 _cmd_relink() {
-	local session pane
+	local session pane agent=""
+	while (( $# )); do
+		case "$1" in
+			--agent-session) agent="${2:-}"; shift 2 ;;
+			*) shift ;;
+		esac
+	done
+	[[ -z $agent ]] && agent="${CLAUDE_CODE_SESSION_ID:-}"
 	session=$(_cur_session) || return 0
 	pane="$TMUX_PANE"
+
+	# Before anything is re-derived: has the agent that owns this manager role
+	# been replaced? Checked ahead of the already-linked return below, because
+	# /clear leaves @apex_role set and that return would otherwise never look.
+	if [[ -d "$(apex_dir "$session")" ]] && _apex_manager_agent_gone "$session" "$agent"; then
+		_apex_manager_expire "$session"
+		return 0
+	fi
 
 	if [[ $(_sopt "$session" @apex_role) == manager ]]; then
 		# Already linked — but the watcher may not be (see the header above).

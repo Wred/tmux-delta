@@ -175,6 +175,16 @@ That script also self-heals `@apex_role`/`@apex_session` after a session
 restart (see `tmux-apex.sh relink`), so it needs to run for every session, not
 just managers.
 
+The same relink is what *retires* a manager role whose agent is gone. Apex mode
+lives in one agent conversation, but `@apex_role` and the state dir are keyed on
+a tmux session name and outlive it — so after `/clear` the session, the record
+and the status-bar pill all survived an agent that had no apex context left.
+Relink compares the agent session id the hook reports against the one `init`
+recorded: `--continue`/`--resume` carries it forward and still re-links, a fresh
+one expires the role exactly as `stop` would. A record written before this was
+tracked adopts the agent it finds, so it starts telling the truth from the next
+`/clear` onward.
+
 The installer wires all of this. What follows is the manual/reference form, for
 troubleshooting or hand-editing.
 
