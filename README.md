@@ -15,7 +15,7 @@ A tmux plugin providing a unified session/worktree/issue/PR picker and a dynamic
 ## Requirements
 
 **Required:**
-- tmux ≥ 3.3
+- tmux ≥ 3.6
 - fzf
 - git
 - zsh (picker and gwt scripts use zsh-specific syntax)

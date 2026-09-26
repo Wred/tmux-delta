@@ -1,7 +1,7 @@
 ---
 name: delta-apex
 description: Turns this session into an apex — a tmux-delta coordinator that delegates rather than implements. Plans work into GitHub issues, spawns worker and reviewer agents in their own git worktrees, runs as many in parallel as the dependency graph allows, tracks every session's state, carries the memory of what shipped and what is left, and merges what qualifies. Use when you want to run several coding agents in parallel and supervise them from one place instead of babysitting each session, especially across a long-lived effort.
-compatibility: Requires tmux-delta on PATH (scripts/tmux-apex.sh), tmux >= 3.3, gh (authenticated), git, jq.
+compatibility: Requires tmux-delta on PATH (scripts/tmux-apex.sh), tmux >= 3.6, gh (authenticated), git, jq.
 ---
 
 # Apex Mode
