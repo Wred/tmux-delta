@@ -1978,6 +1978,31 @@ _claude_session_for() {
 	return 1
 }
 
+# _claude_effective_mode <worktree> <session-id> — the permission mode the
+# conversation is actually running in, or nothing.
+#
+# What apex records is the mode it *asked* for (`--permission-mode` at spawn).
+# Claude Code can run a session in another one — managed policy that disables
+# bypass mode turned every `bypassPermissions` spawn of one apex run into `auto`,
+# whose classifier then blocked the reviewers from posting their findings, while
+# the member records still said bypassPermissions. Each transcript entry carries
+# the mode that turn ran under, so the last one recorded is the live answer.
+# grep, not jq: transcripts run to megabytes and only one field is wanted.
+_claude_effective_mode() {
+	local wt="$1" sid="$2" d f m
+	[[ -n $wt && -n $sid ]] || return 1
+	for d in ${(f)"$(_claude_project_dirs "$wt")"}; do
+		f="$d/$sid.jsonl"
+		[[ -f $f ]] || continue
+		m=$(grep -o '"permissionMode":"[^"]*"' "$f" 2>/dev/null | tail -n1)
+		m=${${m#*:\"}%\"}
+		[[ -n $m ]] || return 1
+		print -r -- "$m"
+		return 0
+	done
+	return 1
+}
+
 # _agent_session_for <agent> <worktree> <issue> <pr> — the agent-native
 # conversation id to resume, for whichever agents expose one.
 _agent_session_for() {
@@ -3766,13 +3791,24 @@ _cmd_status() {
 	APEX_SESSION="$manager"
 
 	local -a rows=()
-	local s facts stored merged
+	local s facts stored merged eff
 	for s in ${(f)"$(apex_members "$manager")"}; do
 		[[ -z $s ]] && continue
 		facts=$(_member_facts "$s" --with-pane-input --with-remote)
 		stored=$(cat "$(apex_member_file "$manager" "$s")" 2>/dev/null)
 		[[ -z $stored ]] && stored='{}'
-		merged=$(printf '%s\n%s\n' "$stored" "$facts" | jq -s '.[0] * .[1]')
+		# Only claude records a mode per turn; for any other agent
+		# permission_mode holds its own argv and there is nothing to compare.
+		# No transcript is the common case, not an error — `|| eff=""` keeps
+		# it from ending status under err_return.
+		eff=""
+		if [[ $(printf '%s' "$stored" | jq -r '.agent // ""') == (claude|) ]]; then
+			eff=$(_claude_effective_mode \
+				"$(printf '%s' "$stored" | jq -r '.worktree // ""')" \
+				"$(printf '%s' "$stored" | jq -r '.agent_session_id // ""')") || eff=""
+		fi
+		merged=$(printf '%s\n%s\n' "$stored" "$facts" \
+			| jq -s --arg eff "$eff" '.[0] * .[1] + {effective_permission_mode:$eff}')
 		rows+=("$merged")
 	done
 
@@ -3890,6 +3926,30 @@ _cmd_status() {
 		print "  not transition again, so it will not ping again either. Read the text,"
 		print "  then answer in its pane — declining is often the right call. An"
 		print "  interrupted member is alive but done responding: '${SELF##*/} send' it."
+	fi
+
+	# Said here, not only in --json, because a member in a stricter mode than
+	# it was spawned in does not look broken: it stalls on denials, and the
+	# spawn flag in its record argues the opposite (see _claude_effective_mode).
+	local drift=()
+	for r in "${rows[@]}"; do
+		u=$(printf '%s' "$r" | jq -r '
+			if .alive and (.permission_mode // "") != ""
+			   and .effective_permission_mode != ""
+			   and .effective_permission_mode != .permission_mode
+			then "\(.session)\t\(.effective_permission_mode)\t\(.permission_mode)"
+			else empty end')
+		[[ -n $u ]] && drift+=("$u")
+	done
+	if (( ${#drift} )); then
+		print "\nMembers running in a different permission mode than they were spawned with:"
+		for r in "${drift[@]}"; do
+			bs=${r%%$'\t'*}; rest=${r#*$'\t'}
+			printf '  %-32s running %s, spawned %s\n' "$bs" "${rest%%$'\t'*}" "${rest#*$'\t'}"
+		done
+		print "  Policy or a mode switch in the pane can override the spawn flag. In auto"
+		print "  mode any command no allow rule matches goes to a classifier that can deny"
+		print "  it — PR comments included — so expect denials rather than prompts."
 	fi
 
 	print "\nRecent events:"

@@ -436,6 +436,17 @@ Spawning does not steal the human's focus (`--switch` if you want it to).
 Workers are launched with a system prompt telling them they are managed: work to
 completion, state blockers instead of waiting, never merge or close.
 
+A `bypassPermissions` spawn is not a guarantee that nothing gets asked: policy
+can run the session in `auto` instead, where any command no allow rule matches
+goes to a classifier that blocks PR comments as external writes. `status` names
+any live member running in a different mode than it was spawned with (and
+`--json` carries `effective_permission_mode` for every claude member). Allow rules
+match on a command's prefix, so when you write a command into a member's
+instructions, write it as the plain command — `gh api --hostname <host> …`,
+`gh pr comment N -R <host>/<owner>/<repo> …` — never as `export GH_HOST=…; …`
+or `GH_HOST=… gh …`. A reviewer copies your form, and the chained form is the
+one that got two reviewers' findings blocked with nowhere to post them.
+
 ## Reacting to pings
 
 A worker's hooks report every transition, but nothing is ever typed into this

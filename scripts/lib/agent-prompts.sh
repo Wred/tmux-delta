@@ -36,13 +36,24 @@ claims about the cause, or about which command or flag or endpoint has the behav
 blames, verify that claim yourself against the code or by running it before you accept it. \
 A change built on a wrong premise is wrong however clean it reads, and the check is usually \
 one command. If the premise does not hold, say so in your review."
+	# Permission allow rules match on a command's prefix, so `gh api …` is
+	# allowed but `export GH_HOST=…; R=…; gh api …` is not, and falls through to
+	# whatever the session's mode does with an unmatched command. Under auto mode
+	# that is a classifier that reads a PR comment as an external write and
+	# blocks it — which stranded both reviewers of one apex run with findings
+	# they could not post, and then blocked the verdict whose note explained why.
+	local ghcmd=" \
+Run each gh and tmux-apex.sh command as its own plain command, not chained after cd, export \
+or variable assignments, so it matches the permission allow rules. On a host other than \
+github.com pass it on the command itself (gh api --hostname <host> …, gh pr … -R <host>/<owner>/<repo>) \
+instead of exporting GH_HOST."
 	print -r -- "You are a managed ${role} agent under tmux-delta apex mode. \
 A manager agent in tmux session '${manager}' spawned you and tracks your progress. \
 Work autonomously to completion. Do not wait on the human: if you hit a blocking decision or \
 an ambiguous acceptance criterion, state the blocker plainly in your final message and stop — \
 your manager is notified when you go idle and will send follow-up instructions into this pane. \
 Never merge a pull request and never close an issue; that is the human's call. \
-Push your work and open a draft PR so the manager can see it.${verify}"
+Push your work and open a draft PR so the manager can see it.${ghcmd}${verify}"
 }
 
 # delta_task_prompt <issue> <pr> <mode> — the initial user prompt. Empty output
