@@ -30,6 +30,7 @@ source "${SCRIPTS}/lib/apex-authority.sh"
 source "${SCRIPTS}/lib/apex-profiles.sh"
 source "${SCRIPTS}/lib/pr-cache.sh"
 source "${SCRIPTS}/lib/agent-default.sh"
+source "${SCRIPTS}/lib/agent-session.sh"
 
 APEX_QUIET_SECS=${APEX_QUIET_SECS:-30}
 
@@ -1342,11 +1343,17 @@ _cmd_init() {
 	[[ -n $TMUX_PANE ]] && tmux set-option -t "$session" @agent_pane "$TMUX_PANE"
 
 	apex_init_dirs "$session"
+	# Which agent is managing, and which of its conversations: whatever
+	# harness ran `init` (lib/agent-session.sh). The id is what later tells a
+	# resumed manager from a cleared one; see _apex_manager_agent_gone.
+	local mgr_agent mgr_session
+	mgr_agent=$(delta_agent_self) || mgr_agent=""
+	mgr_session=$(delta_agent_session_id "$mgr_agent") || mgr_session=""
 	apex_write_atomic "$(apex_file "$session")" \
 		"$(jq -nc --arg s "$session" --arg r "$main" --arg p "${TMUX_PANE:-}" \
-			--arg a "${CLAUDE_CODE_SESSION_ID:-}" \
+			--arg ag "$mgr_agent" --arg a "$mgr_session" \
 			--argjson t "$(date +%s)" \
-			'{session:$s, repo:$r, agent_pane:$p, agent_session:$a, created_at:$t}')"
+			'{session:$s, repo:$r, agent_pane:$p, agent:$ag, agent_session:$a, created_at:$t}')"
 	apex_event "$session" "$(jq -nc --arg s "$session" '{event:"manager-init", session:$s}')"
 
 	# Merge authority is a per-repo decision with a default of "not granted"
@@ -1496,7 +1503,7 @@ _cmd_relink() {
 			*) shift ;;
 		esac
 	done
-	[[ -z $agent ]] && agent="${CLAUDE_CODE_SESSION_ID:-}"
+	[[ -z $agent ]] && { agent=$(delta_agent_session_id) || agent=""; }
 	session=$(_cur_session) || return 0
 	pane="$TMUX_PANE"
 
@@ -2029,22 +2036,35 @@ _agent_session_for() {
 #
 # Why not at registration time: the id does not exist yet. The pane has only
 # just been split, the agent process is still starting, and nothing hands the id
-# to the launching process — Claude Code's own transcript is what publishes it,
-# and that file appears after the first turn. So this runs from the member's own
-# hooks instead (`event`), which is the first moment the answer exists. Guarded
-# on "already recorded" so it costs one transcript scan per member for the
-# lifetime of that member, not one per turn.
+# to the launching process. So this runs from the member's own hooks instead
+# (`event`), which is the first moment the answer exists.
+#
+# Those hooks run inside the member agent's own process tree, so the agent's
+# session variable (lib/agent-session.sh) is the live answer, for every
+# harness, at the cost of an env read. It is re-checked on every event rather
+# than once: a member that starts a new conversation (/new, /clear) must be
+# recovered into that one, not the one it left. The member record names the
+# agent, which pins the variable read, so one leaked from a parent process
+# cannot answer for it.
+#
+# Only when the agent publishes nothing does this fall back to discovering the
+# id from the agent's own session store (_agent_session_for) — once per
+# member, since that costs a transcript scan.
 _record_agent_session() {
 	local manager="$1" member="$2" have agent wt issue pr id
 	have=$(apex_member_get "$manager" "$member" agent_session_id 2>/dev/null)
-	[[ -n $have ]] && return 0
 	agent=$(apex_member_get "$manager" "$member" agent 2>/dev/null)
-	wt=$(apex_member_get "$manager" "$member" worktree 2>/dev/null)
-	[[ -n $wt && -d $wt ]] || return 0
-	issue=$(apex_member_get "$manager" "$member" issue 2>/dev/null)
-	pr=$(apex_member_get "$manager" "$member" review_pr 2>/dev/null)
-	id=$(_agent_session_for "$agent" "$wt" "$issue" "$pr") || return 0
-	[[ -n $id ]] || return 0
+	if id=$(delta_agent_session_id "${agent:-$DELTA_DEFAULT_AGENT}") && [[ -n $id ]]; then
+		[[ $id == "$have" ]] && return 0
+	else
+		[[ -n $have ]] && return 0
+		wt=$(apex_member_get "$manager" "$member" worktree 2>/dev/null)
+		[[ -n $wt && -d $wt ]] || return 0
+		issue=$(apex_member_get "$manager" "$member" issue 2>/dev/null)
+		pr=$(apex_member_get "$manager" "$member" review_pr 2>/dev/null)
+		id=$(_agent_session_for "$agent" "$wt" "$issue" "$pr") || return 0
+		[[ -n $id ]] || return 0
+	fi
 	apex_member_merge "$manager" "$member" \
 		"$(jq -nc --arg id "$id" '{agent_session_id:$id}')"
 	apex_event "$manager" "$(jq -nc --arg s "$member" --arg id "$id" \

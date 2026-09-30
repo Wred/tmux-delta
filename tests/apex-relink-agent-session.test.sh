@@ -17,6 +17,8 @@
 #   3. no id stored (a pre-change record) -> adopted, not expired
 #   4. no id knowable    -> kept, nothing written
 #   5. expiry is durable -> the next relink does not resurrect it
+#   6. other harnesses   -> a pi manager is judged by PI_SESSION_ID, and a
+#                           variable leaked from a parent agent is ignored
 
 set -u
 emulate -L zsh
@@ -99,11 +101,28 @@ setup() {
 	print -r -- manager > "$STUB/opt.session.${SESSION}._apex_role"
 }
 
+# Every agent's session variable is cleared first: the suite itself runs under
+# some coding agent, whose own id must not leak into these assertions.
+AGENT_VARS=(CLAUDE_CODE_SESSION_ID PI_SESSION_ID CODEX_THREAD_ID OPENCODE_SESSION_ID DELTA_AGENT_SESSION_ID)
 relink() {
-	( unset CLAUDE_CODE_SESSION_ID
+	( unset $AGENT_VARS
 	  [[ -n ${1:-} ]] && export CLAUDE_CODE_SESSION_ID="$1"
 	  STUB_SESSION="$SESSION" TMUX_PANE='%1' \
 		"$SCRIPTS/tmux-apex.sh" relink ) >/dev/null 2>&1 || true
+}
+
+# relink_as <agent> <var=value>... — relink from under a process named <agent>,
+# which is how lib/agent-session.sh decides whose variable to read. A symlink
+# to zsh is enough: ps reports it by the name it was exec'd as. The trailing
+# `:` keeps that shell alive as a parent instead of exec'ing into its child.
+FAKE="$TMPROOT/fake-agents"; mkdir -p "$FAKE"
+relink_as() {
+	local agent="$1"; shift
+	ln -sf "$(command -v zsh)" "$FAKE/$agent"
+	( unset $AGENT_VARS
+	  export "$@"
+	  STUB_SESSION="$SESSION" TMUX_PANE='%1' \
+		"$FAKE/$agent" -c '"$0" relink; :' "$SCRIPTS/tmux-apex.sh" ) >/dev/null 2>&1 || true
 }
 
 # ─── 1. the same conversation keeps the role ─────────────────────────
@@ -145,6 +164,25 @@ relink ""
 eq "role kept"                manager      "$(role)"
 eq "stored id untouched"      agent-aaa    "$(stored)"
 eq "no stop event written"    manager-init "$(last_ev)"
+
+# ─── 6. every harness, not just claude ───────────────────────────────
+
+print "\npi manager"
+setup pi-aaa
+relink_as pi PI_SESSION_ID=pi-aaa
+eq "the same pi conversation keeps the role" manager "$(role)"
+
+relink_as pi PI_SESSION_ID=pi-bbb
+eq "a new pi conversation expires it" "" "$(role)"
+
+setup pi-aaa
+relink_as pi PI_SESSION_ID=pi-aaa CLAUDE_CODE_SESSION_ID=leaked-from-a-parent
+eq "a variable leaked from a parent agent is ignored" manager "$(role)"
+
+print "\ncodex manager"
+setup codex-aaa
+relink_as codex CODEX_THREAD_ID=codex-bbb
+eq "a new codex thread expires it" "" "$(role)"
 
 print ""
 print "  $PASS passed, $FAIL failed"

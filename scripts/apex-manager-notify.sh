@@ -75,15 +75,19 @@ self_dir=$(dirname "$(readlink -f "$0")")
 # `post-tools` fires after every tool batch, where the cost would repeat.
 # The hook payload's session_id is the authoritative answer to "which agent
 # conversation is this?" — relink needs it to tell a resumed manager from a
-# cleared one (see _apex_manager_agent_gone). Read once; $CLAUDE_CODE_SESSION_ID
-# is the fallback for hooks that deliver no payload.
+# cleared one (see _apex_manager_agent_gone). Read once; the calling agent's own
+# session variable (lib/agent-session.sh) is the fallback for hooks that deliver
+# no payload.
 agent_session=""
 case "$event" in
 	prompt | session-start)
 		if [ ! -t 0 ] && command -v jq >/dev/null 2>&1; then
 			agent_session=$(jq -r '.session_id // empty' 2>/dev/null) || agent_session=""
 		fi
-		[ -z "$agent_session" ] && agent_session="${CLAUDE_CODE_SESSION_ID:-}"
+		if [ -z "$agent_session" ]; then
+			. "$self_dir/lib/agent-session.sh"
+			agent_session=$(delta_agent_session_id) || agent_session=""
+		fi
 		"$self_dir/tmux-apex.sh" relink --agent-session "$agent_session" 2>/dev/null
 		;;
 esac
