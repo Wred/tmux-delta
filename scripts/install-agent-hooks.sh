@@ -233,6 +233,54 @@ install_codex_hook() {
 	apply "codex: appended notify hook to $cfg"
 }
 
+# ─── codex hooks.json ─────────────────────────────────────────────────
+#
+# codex's hooks.json takes Claude Code's shape (event → [{hooks: [{type,
+# command, timeout}]}]), and the same events carry the same jobs as
+# claude-plugin/hooks/hooks.json: the pill on PreToolUse/PermissionRequest/
+# Stop, and apex manager relink + ping delivery on SessionStart and
+# UserPromptSubmit. Those two pass `json`: codex takes hook context as
+# hookSpecificOutput.additionalContext.
+#
+# Merged, not written: every entry whose command runs one of our two scripts is
+# dropped and re-added, which repoints a moved clone and never touches anyone
+# else's hooks. codex asks the human to trust a new or changed hook before
+# running it; that review is codex's, and deliberately not bypassed here.
+install_codex_hooks() {
+	command -v codex >/dev/null 2>&1 || { skip "codex hooks: codex not installed"; return; }
+	command -v jq >/dev/null 2>&1 || { skip "codex hooks: jq not found"; return; }
+	local file="$HOME/.codex/hooks.json" cur ours new
+	cur='{}'
+	if [[ -f "$file" ]]; then
+		cur=$(jq -c . "$file" 2>/dev/null) || { note "codex hooks: $file is not valid JSON — leaving it alone"; return; }
+	fi
+	ours=$(jq -nc --arg s "$STATUS_SH" --arg n "$NOTIFY_SH" '
+		def cmd($c): [{hooks: [{type: "command", command: $c, timeout: 10}]}];
+		{
+			PreToolUse:        cmd($s + " set"),
+			PermissionRequest: cmd($s + " notify"),
+			Stop:              cmd($s + " clear"),
+			SessionStart:      cmd($n + " session-start json"),
+			UserPromptSubmit:  cmd($n + " prompt json")
+		}')
+	new=$(jq -c --argjson ours "$ours" '
+		def mine: (.command? // "") | test("(^|/)(agent-tmux-status|apex-manager-notify)\\.sh( |$)");
+		.hooks //= {}
+		| .hooks |= with_entries(.value |= (map(.hooks |= map(select(mine | not))) | map(select((.hooks | length) > 0))))
+		| .hooks |= reduce ($ours | to_entries[]) as $e (.; .[$e.key] = ((.[$e.key] // []) + $e.value))
+		| .hooks |= with_entries(select((.value | length) > 0))
+	' <<< "$cur")
+	if [[ "$(jq -S . <<< "$cur")" == "$(jq -S . <<< "$new")" ]]; then
+		skip "codex hooks already in $file"
+	elif $DRY_RUN; then
+		apply "codex hooks: write tmux-delta entries to $file"
+	else
+		mkdir -p "$(dirname "$file")"
+		jq . <<< "$new" > "$file.tmp" && mv "$file.tmp" "$file"
+		apply "codex hooks: tmux-delta entries written to $file (codex will ask you to trust them)"
+	fi
+}
+
 echo "tmux-delta agent hooks — repo: $REPO_ROOT"
 $DRY_RUN && echo "(dry run — no changes will be made)"
 echo
@@ -250,5 +298,6 @@ install_opencode_plugin
 echo
 echo "codex:"
 install_codex_hook
+install_codex_hooks
 echo
 echo "Done. Restart/reload any running agent sessions to pick up new hooks."

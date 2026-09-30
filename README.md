@@ -220,47 +220,41 @@ fails), the installer skips this section entirely rather than falling back to
 editing `settings.json` — upgrade to get the hooks. Uninstalling is the
 reverse: `claude plugin uninstall tmux-delta-claude@tmux-delta`.
 
-**pi** — the installer symlinks the shipped extension to
-`~/.pi/agent/extensions/tmux-status.ts`. It wires `agent_start` → `set` and
-`agent_settled` → `clear`. A hand-copied tmux-delta extension already at that
+Every agent gets the same two things, through whatever mechanism it offers:
+the activity pill (and, for an apex member, its status reports to the manager),
+and — when it is the apex manager — relink on session start plus pending pings
+delivered into its context. The installer wires all of it.
+
+**pi** — `extensions/pi/tmux-status.ts`, symlinked to
+`~/.pi/agent/extensions/tmux-status.ts`. Pill: `agent_start` → `set`,
+`ui_prompt_start` → `notify` (it fires around every blocking
+`ctx.ui.confirm`/`select`/`input`, such as a permissions extension's approval
+prompt), `ui_prompt_end` → `set`, `agent_settled` → `clear`. Manager: relink
+and pings on `session_start` and `before_agent_start`, pings after a turn that
+ran tools (`turn_end`), and one more turn at `agent_before_settle` when a ping
+landed as the run finished. A hand-copied tmux-delta extension already at that
 path (any file that calls `agent-tmux-status.sh`) is moved aside to
 `tmux-status.ts.bak` and replaced; any other file there is left alone and
 reported in the log.
 
-It deliberately does not fire `notify`, because pi has no single "blocked" event
-— the blocking moments are the confirm prompts your own extensions raise. The
-extension exports `tmuxStatus` so you can wrap them:
+**opencode** — `extensions/opencode/tmux-status.js`, symlinked to
+`~/.config/opencode/plugin/tmux-status.js`. Pill: `tool.execute.before` → `set`,
+`permission.asked` → `notify`, `permission.replied` → `set`,
+`session.idle`/`session.error` → `clear`; if a build does not deliver the
+permission events to plugins this degrades to working/idle. Manager: relink on
+`session.created` and `chat.message`, and pings go into the system prompt of the
+next model request (`experimental.chat.system.transform`), which opencode builds
+for every step of a turn. Its `shell.env` hook exports `OPENCODE_SESSION_ID`,
+which opencode itself does not.
 
-```ts
-import { tmuxStatus } from "./tmux-status.ts";
-
-tmuxStatus("notify");
-try { choice = await ctx.ui.select(…); } finally { tmuxStatus("set"); }
-```
-
-**opencode** — symlink the shipped plugin:
-
-```zsh
-mkdir -p ~/.config/opencode/plugin
-ln -s ~/.tmux/plugins/tmux-delta/extensions/opencode/tmux-status.js \
-      ~/.config/opencode/plugin/tmux-status.js
-```
-
-It maps `tool.execute.before` → `set`, `permission.asked` → `notify`,
-`permission.replied` → `set`, and `session.idle`/`session.error` → `clear`, so
-opencode reports all three states. If a build does not deliver the permission
-events to plugins the mapping quietly degrades to working/idle.
-
-**codex** — `~/.codex/config.toml`:
-
-```toml
-notify = ["/home/you/.tmux/plugins/tmux-delta/scripts/agent-tmux-status.sh", "clear"]
-```
-
-Codex appends a JSON argument, which the script ignores. This is codex's only
-hook and it fires on turn completion, so codex gets the idle ping but neither
-the working robot nor the orange pill. *(Untested — written from the codex docs,
-not verified against an install.)*
+**codex** — tmux-delta's entries are merged into `~/.codex/hooks.json` (entries
+running tmux-delta's scripts are replaced, anyone else's are kept). Pill:
+`PreToolUse` → `set`, `PermissionRequest` → `notify`, `Stop` → `clear`.
+Manager: relink and pings on `SessionStart` and `UserPromptSubmit`, returned as
+`hookSpecificOutput.additionalContext`. codex asks you to trust new or changed
+hooks before it runs them. The older `notify` line in `~/.codex/config.toml`
+(turn completion → `clear`) is still added when there is none. *(Wired from the
+codex CLI's own hook schema; not yet verified against a live codex session.)*
 
 ### 4. Apex mode skill
 

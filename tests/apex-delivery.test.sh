@@ -43,6 +43,7 @@ contains() {
 BIN="$TMPROOT/bin"
 mkdir -p "$BIN"
 cp "$SCRIPTS/apex-manager-notify.sh" "$BIN/"
+mkdir -p "$BIN/lib" && cp "$SCRIPTS/lib/agent-session.sh" "$BIN/lib/"
 
 cat > "$BIN/tmux" <<'EOF'
 #!/usr/bin/env bash
@@ -55,7 +56,7 @@ EOF
 cat > "$BIN/tmux-apex.sh" <<'EOF'
 #!/usr/bin/env bash
 case "$1" in
-	relink)  echo relink >> "$STUB_RELINK_LOG"; exit 0 ;;
+	relink)  echo "relink $*" >> "$STUB_RELINK_LOG"; exit 0 ;;
 	pending) echo "$*" >> "$STUB_PENDING_LOG"; printf '%s' "$STUB_PENDING"; [ -n "$STUB_PENDING" ] && echo; exit 0 ;;
 esac
 exit 0
@@ -106,7 +107,10 @@ export STUB_PENDING='[apex] session=w role=worker task=issue:42 status=idle — 
 export STUB_RELINK_LOG="$TMPROOT/relink.log"
 export STUB_PENDING_LOG="$TMPROOT/pending.log"
 
-notify() { : > "$STUB_RELINK_LOG"; : > "$STUB_PENDING_LOG"; "$BIN/apex-manager-notify.sh" "$@" 2>/dev/null }
+# stdin is /dev/null, as a hook with no payload sees it: inheriting the test
+# runner's stdin (an open pipe under some harnesses) would leave `prompt`
+# waiting on a payload that never comes.
+notify() { : > "$STUB_RELINK_LOG"; : > "$STUB_PENDING_LOG"; "$BIN/apex-manager-notify.sh" "$@" 2>/dev/null </dev/null }
 
 # ── channel selection ────────────────────────────────────────────────
 # Plain stdout only reaches the agent on UserPromptSubmit and SessionStart;
@@ -129,6 +133,41 @@ for verb in prompt session-start; do
 	contains "$verb emits plain text" "pending events since you last checked" "$out"
 	eq "$verb emits no JSON" "" "$(print -r -- $out | jq -e . 2>/dev/null && print BAD)"
 done
+
+# Extensions (pi, opencode) inject the text themselves, at points that are no
+# hook at all: plain text, and no relink — they relink on their own prompt and
+# session-start calls.
+out=$(notify poll)
+contains "poll emits plain text" "pending events since you last checked" "$out"
+eq "poll does not relink" "" "$(cat "$STUB_RELINK_LOG")"
+eq "poll consumes what it prints" 1 "$(grep -c mark-delivered "$STUB_PENDING_LOG")"
+
+# codex takes hook context only as JSON, so its hooks ask for it.
+out=$(notify prompt json)
+eq "prompt json emits JSON for UserPromptSubmit" UserPromptSubmit \
+	"$(print -r -- $out | jq -r '.hookSpecificOutput.hookEventName')"
+out=$(notify session-start json)
+eq "session-start json emits JSON for SessionStart" SessionStart \
+	"$(print -r -- $out | jq -r '.hookSpecificOutput.hookEventName')"
+out=$(notify poll json)
+contains "poll has no hook to answer for, so stays text" "pending events since you last checked" "$out"
+
+# A caller that hands the id over leaves stdin as a pipe it never closes
+# (node's execFile). Reading it for a payload would block until the caller's
+# timeout killed the hook — which is how a pi manager silently got no pings.
+print "
+session id handed over"
+mkfifo "$TMPROOT/open-pipe"
+( sleep 30 > "$TMPROOT/open-pipe" ) &
+holder=$!
+start=$SECONDS
+: > "$STUB_RELINK_LOG"; : > "$STUB_PENDING_LOG"
+out=$(DELTA_AGENT_SESSION_ID=handed-over-1 "$BIN/apex-manager-notify.sh" prompt 2>/dev/null < "$TMPROOT/open-pipe")
+kill $holder 2>/dev/null
+(( SECONDS - start < 5 )) && ok "an open, silent stdin does not stall the hook" \
+	|| bad "an open, silent stdin does not stall the hook" "took $(( SECONDS - start ))s"
+eq "relink gets the handed-over id" "relink relink --agent-session handed-over-1" "$(cat "$STUB_RELINK_LOG")"
+contains "and the pings are delivered" "pending events since you last checked" "$out"
 
 # ── the misconfiguration that used to eat pings ───────────────────────
 # An argument-less command duplicated under PostToolBatch/Stop used to default

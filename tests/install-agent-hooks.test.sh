@@ -28,9 +28,10 @@ TMPROOT=$(mktemp -d "${TMPDIR:-/tmp}/install-hooks-test.XXXXXX")
 trap 'rm -rf "$TMPROOT"' EXIT
 export HOME="$TMPROOT/home"; mkdir -p "$HOME"
 BIN="$TMPROOT/bin"; mkdir -p "$BIN"
-# pi and opencode only need to exist; claude and codex are left off PATH so
-# the installer skips their CLI-driven sections instead of touching real config.
-for a in pi opencode; do print '#!/bin/sh' > "$BIN/$a"; chmod +x "$BIN/$a"; done
+# pi, opencode and codex only need to exist (HOME is throwaway, so codex's
+# config lands there); claude is left off PATH so the installer skips its
+# CLI-driven plugin install instead of touching real config.
+for a in pi opencode codex; do print '#!/bin/sh' > "$BIN/$a"; chmod +x "$BIN/$a"; done
 export PATH="$BIN:/usr/bin:/bin:/opt/homebrew/bin"
 
 run() { bash "$INSTALL" "$@" 2>&1 }
@@ -42,6 +43,12 @@ OC_EXT="$HOME/.config/opencode/plugin/tmux-status.js"
 mkdir -p "${PI_EXT:h}" "${OC_EXT:h}"
 print -r -- 'execFile(join(homedir(), ".local/scripts/agent-tmux-status.sh"), ["notify"])' > "$PI_EXT"
 ln -s "/old/clone/tmux-delta/extensions/opencode/tmux-status.js" "$OC_EXT"
+# codex hooks: someone else's, plus one of ours from a moved clone.
+CX_HOOKS="$HOME/.codex/hooks.json"; mkdir -p "${CX_HOOKS:h}"
+jq -n '{hooks: {Stop: [
+	{hooks: [{type: "command", command: "/usr/local/bin/their-hook"}]},
+	{hooks: [{type: "command", command: "/old/clone/tmux-delta/scripts/agent-tmux-status.sh clear"}]}
+]}}' > "$CX_HOOKS"
 
 print "dry run"
 out=$(run --dry-run)
@@ -56,10 +63,16 @@ eq "an old tmux-delta copy is replaced by the link" "$REPO/extensions/pi/tmux-st
 [[ -f $PI_EXT.bak && $(<"$PI_EXT.bak") == *agent-tmux-status.sh* ]] \
 	&& ok "and kept as a backup" || bad "and kept as a backup" "$(ls -la "${PI_EXT:h}")"
 eq "a moved clone's link is repointed" "$REPO/extensions/opencode/tmux-status.js" "$(readlink "$OC_EXT")"
+cx_cmds() { jq -r --arg e "$1" '.hooks[$e][]?.hooks[]?.command' "$CX_HOOKS" }
+eq "codex gets the prompt-time ping delivery" "$REPO/scripts/apex-manager-notify.sh prompt json" "$(cx_cmds UserPromptSubmit)"
+eq "and the blocked signal" "$REPO/scripts/agent-tmux-status.sh notify" "$(cx_cmds PermissionRequest)"
+eq "someone else's codex hook survives, ours is repointed" \
+	"/usr/local/bin/their-hook
+$REPO/scripts/agent-tmux-status.sh clear" "$(cx_cmds Stop)"
 
 print "second run"
 out=$(run)
-[[ $out != *replaced* && $out != *repointed* && $out != *": linked"* ]] \
+[[ $out != *replaced* && $out != *repointed* && $out != *": linked"* && $out != *"entries written"* ]] \
 	&& ok "re-running is a no-op" || bad "re-running is a no-op" "$out"
 [[ ! -e $PI_EXT.bak.1 ]] && ok "and makes no second backup" || bad "and makes no second backup" "$(ls -la "${PI_EXT:h}")"
 

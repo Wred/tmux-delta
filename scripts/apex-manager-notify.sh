@@ -13,6 +13,15 @@
 #   post-tools    PostToolBatch     — once after each tool batch resolves,
 #                                     before the next model call
 #   stop          Stop              — at the end of an assistant turn
+#   poll          (none)            — any other point, for an agent extension
+#                                     that injects the text itself (pi's
+#                                     turn_end/agent_before_settle, opencode's
+#                                     system transform). Plain text, no relink.
+#
+# Claude Code and codex call this from hooks. pi and opencode call it from
+# tmux-delta's own extensions (extensions/), which put the printed text into
+# the conversation through their own APIs — so for them `prompt` and
+# `session-start` are just "relink, then print", whatever the event is called.
 #
 # Why four events and not just the first two: UserPromptSubmit only fires on
 # a *human* message. A manager doing a long autonomous stretch — spawn, poll,
@@ -52,8 +61,13 @@ case "$event" in
 	session-start) hook_name=SessionStart;     channel=text ;;
 	post-tools)    hook_name=PostToolBatch;    channel=json ;;
 	stop)          hook_name=Stop;             channel=json ;;
+	poll)          hook_name=;                 channel=text ;;
 	*)             hook_name=;                 channel= ;;
 esac
+# An optional second argument forces the JSON channel, for a harness whose hooks
+# take context only as hookSpecificOutput (codex's hooks.json). JSON needs a
+# hook event name to answer for, so `poll` cannot take it.
+[ "${2:-}" = json ] && [ -n "$hook_name" ] && channel=json
 
 [ -z "$TMUX" ] && exit 0
 session=$(tmux display-message -p '#S' 2>/dev/null) || exit 0
@@ -78,13 +92,16 @@ self_dir=$(dirname "$(readlink -f "$0")")
 # cleared one (see _apex_manager_agent_gone). Read once; the calling agent's own
 # session variable (lib/agent-session.sh) is the fallback for hooks that deliver
 # no payload.
-agent_session=""
+# A caller that already knows the id hands it over as DELTA_AGENT_SESSION_ID
+# (tmux-delta's pi and opencode extensions), and stdin is then not a payload at
+# all — possibly a pipe that never closes, which a read would wait on forever.
+agent_session="${DELTA_AGENT_SESSION_ID:-}"
 case "$event" in
 	prompt | session-start)
-		if [ ! -t 0 ] && command -v jq >/dev/null 2>&1; then
+		if [ -z "$agent_session" ] && [ ! -t 0 ] && command -v jq >/dev/null 2>&1; then
 			agent_session=$(jq -r '.session_id // empty' 2>/dev/null) || agent_session=""
 		fi
-		if [ -z "$agent_session" ]; then
+		if [ -z "$agent_session" ] && [ -r "$self_dir/lib/agent-session.sh" ]; then
 			. "$self_dir/lib/agent-session.sh"
 			agent_session=$(delta_agent_session_id) || agent_session=""
 		fi

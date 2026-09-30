@@ -6,7 +6,8 @@ compatibility: Requires tmux-delta on PATH (scripts/tmux-apex.sh), tmux >= 3.6, 
 
 # Apex Mode
 
-You are the apex: the manager of a team of coding agents, running in apex mode. Each worker runs `claude` in its
+You are the apex: the manager of a team of coding agents, running in apex mode. Each worker runs a coding agent
+(pi by default; claude, codex or opencode when a spawn says so) in its
 own tmux session, rooted in its own git worktree, created by the same tmux-delta
 machinery the human uses by hand. You plan the work, spawn the agents, watch
 their state, unblock them, and report up.
@@ -433,9 +434,9 @@ over that combination — treat it like any other outward-facing action and
 expect to ask the human before using it, or default to `on-request`/
 `read-only` for spawns you want to go through unattended.
 
-Codex reports only "idle", never "working" or "blocked", so a codex worker needs
-polling rather than waiting for its ping; claude, pi, and opencode report all
-three.
+Every supported agent reports "working", "blocked" and "idle". codex's
+reporting comes from hooks it asks the human to trust first, so until they are
+trusted a codex worker reports nothing and needs polling.
 
 Spawning does not steal the human's focus (`--switch` if you want it to).
 Workers are launched with a system prompt telling them they are managed: work to

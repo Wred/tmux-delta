@@ -5634,15 +5634,54 @@ _apex_repo_root_hint() {
 # _cmd_doctor [--quiet] — report which delivery hooks are missing.
 # Exits 0 when all four are wired, 1 otherwise. --quiet prints nothing when
 # everything is wired, which is how `init` uses it.
+# _apex_ext_wired <agent> — is tmux-delta's integration for a non-Claude agent
+# installed where that agent loads it? Each carries the manager's relink and
+# ping delivery as well as the pill (extensions/, and codex's hooks.json).
+_apex_ext_wired() {
+	local root="${SCRIPTS:h}" f
+	case "$1" in
+		pi)       f="$HOME/.pi/agent/extensions/tmux-status.ts"
+		          [[ ${f:A} == "$root/extensions/pi/tmux-status.ts" ]] ;;
+		opencode) f="$HOME/.config/opencode/plugin/tmux-status.js"
+		          [[ ${f:A} == "$root/extensions/opencode/tmux-status.js" ]] ;;
+		codex)    jq -e '[.hooks.UserPromptSubmit[]?.hooks[]?.command]
+		                 | any(test("apex-manager-notify\\.sh prompt"))' \
+		              "$HOME/.codex/hooks.json" >/dev/null 2>&1 ;;
+		*)        return 1 ;;
+	esac
+}
+
 _cmd_doctor() {
 	local quiet=false a
 	for a in "$@"; do [[ $a == --quiet ]] && quiet=true; done
 
+	# Delivery is wired per harness, so the one to check is the agent actually
+	# managing: the one running this command, or else the one init recorded.
+	local mgr_agent mgr_rec
+	mgr_agent=$(delta_agent_self) || mgr_agent=""
+	if [[ -z $mgr_agent ]] && mgr_rec=$(_resolve_manager 2>/dev/null); then
+		mgr_agent=$(jq -r '.agent // empty' "$(apex_file "$mgr_rec")" 2>/dev/null)
+	fi
+
 	local -a missing=() present=()
 	local e
-	for e in ${=$(_apex_hook_events)}; do
-		if _apex_hook_wired "$e"; then present+=("$e"); else missing+=("$e"); fi
-	done
+	if [[ -n $mgr_agent && $mgr_agent != claude ]]; then
+		if _apex_ext_wired "$mgr_agent"; then
+			present+=("$mgr_agent integration")
+		else
+			local root="$(_apex_repo_root_hint)"
+			print -u2 "tmux-apex: WARNING — apex pings will not reach this ${mgr_agent} manager's context."
+			print -u2 "  tmux-delta's ${mgr_agent} integration is not installed where ${mgr_agent} loads it."
+			print -u2 "  fix: $root/scripts/install-agent-hooks.sh (tmux-delta runs it on every"
+			print -u2 "  plugin load; its log is ~/.cache/tmux-delta/install-agent-hooks.log)"
+			print -u2 "  until then, run '${SELF} pending' by hand — it reports the same events."
+			return 1
+		fi
+	else
+		for e in ${=$(_apex_hook_events)}; do
+			if _apex_hook_wired "$e"; then present+=("$e"); else missing+=("$e"); fi
+		done
+	fi
 
 	# The watcher is what turns those hooks from "fires on the manager's own
 	# turns" into "fires when a worker actually changes state" (issue #14).
