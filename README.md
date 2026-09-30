@@ -341,6 +341,7 @@ back to the claude adapter. Adding one is a single file defining
 | system prompt | `--append-system-prompt` | `--append-system-prompt` | *none* — prepended to the prompt | *none* — injected as `instructions` via `OPENCODE_CONFIG_CONTENT` |
 | agent flags | `--permission-mode <token>`, or verbatim if it starts with `-` | verbatim (`--approve`, `--tools …`) | verbatim (`--sandbox …`, `--ask-for-approval …`) | verbatim (`--auto`) |
 | resume | `--continue` | `--continue` | `resume --last` | `--continue` |
+| resume one conversation (`recover`) | `--resume <id>` | `--session <id>` | `resume <id>` | `--session <id>` |
 
 Resume is attempted first and falls back to a fresh session when there is
 nothing to resume.
@@ -934,12 +935,23 @@ those records, and for each one whose pane is gone it recreates the session and
 pane and restarts the agent **on its original conversation** rather than from a
 blank context.
 
-It can do that because registration records an `agent_session_id` field: the
-Claude Code conversation id, discovered from the transcript under
-`~/.claude/projects/<mangled-worktree>/<id>.jsonl` by matching `cwd` plus the
-opening task prompt (a worker and its reviewer share a worktree, so the prompt
+It can do that because each member record carries an `agent_session_id`: the
+id of the conversation it is in, for every supported agent. The member's own
+hooks report it, read from the agent's session variable
+(`CLAUDE_CODE_SESSION_ID`, `PI_SESSION_ID`, `CODEX_THREAD_ID`, or
+`OPENCODE_SESSION_ID`, which tmux-delta's opencode plugin exports; see
+`scripts/lib/agent-session.sh`). Those variables leak into child processes, so
+the nearest agent among the caller's ancestors decides which one is read. A
+member that starts a new conversation is re-recorded on its next event.
+
+When an agent publishes nothing, the id is discovered from its session store
+instead. For Claude Code that is the transcript under
+`~/.claude/projects/<mangled-worktree>/<id>.jsonl`, and for pi the session file
+under `~/.pi/agent/sessions/--<mangled-worktree>--/`, both matched by `cwd` plus
+the opening task prompt (a worker and its reviewer share a worktree, so the prompt
 is the only thing that tells them apart — hence the single copy of that text in
-`scripts/lib/agent-prompts.sh`). A slash command is stored expanded rather than
+`scripts/lib/agent-prompts.sh`). codex and opencode fall back to the newest
+conversation in the worktree. A slash command is stored expanded rather than
 verbatim, so a reviewer's `/my-pr-review 17` is folded back from its
 `<command-name>`/`<command-args>` form before matching. The marker has to be
 followed by end-of-line or a space: `/my-pr-review 4` is a prefix of
@@ -947,10 +959,11 @@ followed by end-of-line or a space: `/my-pr-review 4` is a prefix of
 id only exists after the member's first turn, so it is filled in on the member's
 first `event` call, not at spawn.
 
-The record is a cache; the transcript is the authority. `recover` re-resolves the
-id every time and says so when a recorded one no longer resolves, so a record
-that went stale (or was written empty because nothing resolved) self-heals rather
-than pinning recovery to a dead conversation. Registration writes the field
+The agent's session store is the authority. `recover` resumes the recorded id
+when the store still holds that conversation, and re-derives it otherwise,
+saying so when a recorded one no longer resolves. A record that went stale (or
+was written empty because nothing resolved) therefore self-heals rather than
+pinning recovery to a dead conversation. Registration writes the field
 unconditionally — a member is born there, so there is nothing to inherit from a
 recycled pane id. When registration does find a stale record on a pane id tmux
 reused, it replaces it and writes a `stale-record-replaced` entry to

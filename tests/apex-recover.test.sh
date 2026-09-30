@@ -1374,6 +1374,54 @@ lacks "…without invoking the picker" "must not be called" "$out"
 contains "…and kills the orphaned session instead" "kill-session -t dead-session" \
 	"$(cat "$STUB/log")"
 
+# ─── 10. every harness resumes its own recorded conversation ─────────
+
+print "\nrecover: non-claude harnesses"
+
+# A worker and its reviewer share a worktree, so the store holds two
+# conversations for it and the reviewer's is the newer. The member's recorded
+# id — reported by its own hooks — is what must be resumed, not "newest here".
+
+PI_WT="$TMPROOT/wt/pi-issue-51"; mkdir -p "$PI_WT"
+PI_MANGLED="${${PI_WT:A}#/}"
+PI_DIR="$HOME/.pi/agent/sessions/--${PI_MANGLED//\//-}--"
+mkdir -p "$PI_DIR"
+pi_session() {  # pi_session <ts> <id> <first user message>
+	{ jq -nc --arg id "$2" --arg c "${PI_WT:A}" '{type:"session", version:3, id:$id, cwd:$c}'
+	  jq -nc --arg t "$3" '{type:"message", message:{role:"user", content:[{type:"text", text:$t}]}}'
+	} > "$PI_DIR/${1}_${2}.jsonl"
+}
+pi_session 2026-09-30T10-00-00-000Z pi-worker-id "$(delta_task_prompt 51 '' autonomous)"
+sleep 0.05
+pi_session 2026-09-30T11-00-00-000Z pi-reviewer-id "/my-pr-review 60"
+member "pi-issue-51:%31" "$(jq -nc --arg wt "$PI_WT" \
+	'{role:"worker", worktree:$wt, issue:"51", review_pr:"", agent:"pi", mode:"autonomous",
+	  model:"", permission_mode:"", profile:"", agent_session_id:"pi-worker-id", status:"idle", seq:1}')"
+out=$(STUB_PANE_CMD=node APEX_RECOVER_NUDGE=0 apex recover --yes pi-issue-51:%31 2>&1)
+contains "a pi member resumes its recorded conversation" "resumed conversation pi-worker-id" "$out"
+new_pane=$(awk -F'\t' '$2=="pi-issue-51"{p=$1} END{print p}' "$STUB/panes")
+contains "…through the launch" "DELTA_AGENT_RESUME=pi-worker-id" "$(pane_cmd "$new_pane")"
+
+member "pi-issue-52:%32" "$(jq -nc --arg wt "$PI_WT" \
+	'{role:"worker", worktree:$wt, issue:"51", review_pr:"", agent:"pi", mode:"autonomous",
+	  model:"", permission_mode:"", profile:"", agent_session_id:"pruned-id", status:"idle", seq:1}')"
+out=$(STUB_PANE_CMD=node APEX_RECOVER_NUDGE=0 apex recover --yes pi-issue-52:%32 2>&1)
+contains "a pruned pi id falls back to the task's own conversation" "resumed conversation pi-worker-id" "$out"
+contains "…and says the record was wrong" "recorded id pruned-id no longer resolves" "$out"
+
+CODEX_WT="$TMPROOT/wt/codex-issue-53"; mkdir -p "$CODEX_WT"
+export CODEX_HOME="$TMPROOT/codex"; CX="$CODEX_HOME/sessions/2026/09/30"; mkdir -p "$CX"
+jq -nc --arg c "$CODEX_WT" '{type:"session_meta", payload:{session_id:"cx-worker-id", cwd:$c}}' \
+	> "$CX/rollout-2026-09-30T10-00-00-cx-worker-id.jsonl"
+sleep 0.05
+jq -nc --arg c "$CODEX_WT" '{type:"session_meta", payload:{session_id:"cx-reviewer-id", cwd:$c}}' \
+	> "$CX/rollout-2026-09-30T11-00-00-cx-reviewer-id.jsonl"
+member "codex-issue-53:%33" "$(jq -nc --arg wt "$CODEX_WT" \
+	'{role:"worker", worktree:$wt, issue:"53", review_pr:"", agent:"codex", mode:"autonomous",
+	  model:"", permission_mode:"", profile:"", agent_session_id:"cx-worker-id", status:"idle", seq:1}')"
+out=$(STUB_PANE_CMD=node APEX_RECOVER_NUDGE=0 apex recover --yes codex-issue-53:%33 2>&1)
+contains "a codex member resumes its recorded thread, not the newest" "resumed conversation cx-worker-id" "$out"
+
 print ""
 print "$PASS passed, $FAIL failed"
 (( FAIL == 0 ))

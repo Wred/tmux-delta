@@ -136,7 +136,9 @@ _pane_is_agent() {
 	tmux list-panes -a -F '#{pane_id}' 2>/dev/null | grep -qxF "$pane" || return 1
 	cmd=$(tmux display-message -p -t "$pane" '#{pane_current_command}' 2>/dev/null)
 	allow=$(tmux show-option -gqv @tmux_delta_apex_agent_cmds 2>/dev/null)
-	[[ -z $allow ]] && allow="node claude codex gemini"
+	# pi is a node script — `node` on macOS, its process title `pi` where
+	# tmux reports that instead. opencode is its own binary.
+	[[ -z $allow ]] && allow="node claude codex gemini pi opencode"
 	local -a allowed=(${=allow})
 	(( ${allowed[(Ie)$cmd]} ))
 }
@@ -2016,18 +2018,86 @@ _claude_effective_mode() {
 	return 1
 }
 
+# _pi_session_dir <worktree> — where pi keeps this directory's conversations:
+# the path with its leading separator dropped and every /, \ and : turned into
+# "-", wrapped in "--" (pi's docs/session-format.md).
+_pi_session_dir() {
+	local wt="$1" root="${PI_CODING_AGENT_SESSION_DIR:-$HOME/.pi/agent/sessions}" m
+	[[ -n $wt ]] || return 1
+	# Canonical, as pi sees its own cwd: a "//" or a symlink in the recorded
+	# path would otherwise mangle to a directory pi never wrote.
+	m="${wt:A}"; m="${m#/}"; m="${m//[\/\\:]/-}"
+	print -r -- "$root/--${m}--"
+}
+
+# _pi_session_for <worktree> <task-marker> — the pi session id of the
+# conversation started in <worktree> whose first user message begins with
+# <task-marker>, newest first; or nothing. Same contract, and the same reason
+# for the marker, as _claude_session_for. Each file's header line records the
+# id and the cwd, so neither is read off the file name.
+_pi_session_for() {
+	local wt="$1" marker="$2" d f hdr first
+	d=$(_pi_session_dir "$wt") || return 1
+	for f in "$d"/*.jsonl(Nom); do
+		hdr=$(head -n1 "$f")
+		[[ $(jq -r '.cwd // empty' <<< "$hdr" 2>/dev/null) == "${wt:A}" ]] || continue
+		if [[ -n $marker ]]; then
+			first=$(jq -r 'select(.type=="message" and .message.role=="user")
+				| .message.content | if type=="string" then . else (map(.text? // empty) | join(" ")) end
+				| gsub("\n"; " ")' "$f" 2>/dev/null | head -n1)
+			[[ $first == "$marker" || $first == "$marker "* ]] || continue
+		fi
+		jq -r '.id // empty' <<< "$hdr"
+		return 0
+	done
+	return 1
+}
+
 # _agent_session_for <agent> <worktree> <issue> <pr> — the agent-native
 # conversation id to resume, for whichever agents expose one.
 _agent_session_for() {
-	local agent="${1:-claude}" wt="$2" issue="$3" pr="$4"
+	local agent="${1:-$DELTA_DEFAULT_AGENT}" wt="$2" issue="$3" pr="$4"
 	case "${agent:t}" in
-		claude|"")
+		claude|pi)
 			source "${SCRIPTS}/lib/agent-prompts.sh"
-			_claude_session_for "$wt" "$(delta_task_marker "$issue" "$pr")"
+			"_${agent:t}_session_for" "$wt" "$(delta_task_marker "$issue" "$pr")"
 			;;
 		codex)    _codex_thread_for "$wt" ;;
 		opencode) _opencode_session_for "$wt" ;;
 		*)        return 1 ;;
+	esac
+}
+
+# _agent_session_exists <agent> <worktree> <id> — does <agent> still hold
+# conversation <id> for <worktree>? What `recover` checks a recorded id
+# against before resuming it: a pruned conversation handed to --resume is the
+# failure that looks like recovery worked.
+_agent_session_exists() {
+	local agent="$1" wt="$2" id="$3" d
+	[[ -n $id && -n $wt ]] || return 1
+	case "${agent:t}" in
+		claude)
+			for d in ${(f)"$(_claude_project_dirs "$wt")"}; do
+				[[ -f "$d/$id.jsonl" ]] && return 0
+			done
+			return 1
+			;;
+		pi)
+			d=$(_pi_session_dir "$wt") || return 1
+			local -a hit=("$d"/*_"$id".jsonl(N))
+			(( ${#hit} ))
+			;;
+		codex)
+			local -a hit=("${CODEX_HOME:-$HOME/.codex}"/sessions/*/*/*/rollout-*"$id".jsonl(N))
+			(( ${#hit} ))
+			;;
+		opencode)
+			local db="${XDG_DATA_HOME:-$HOME/.local/share}/opencode/opencode.db"
+			[[ -f $db ]] || return 1
+			[[ -n $(sqlite3 -readonly "$db" \
+				"select id from session where id = '${id//\'/\'\'}' limit 1;" 2>/dev/null) ]]
+			;;
+		*) return 1 ;;
 	esac
 }
 
@@ -4802,26 +4872,26 @@ _cmd_recover() {
 			fi
 		fi
 
-		# The transcript, not the record, decides what can be resumed. A recorded
-		# id can be wrong — the conversation may have been pruned, or the record
-		# may predate a correction — and handing a dead id to --resume was the
-		# one failure mode worth avoiding: it looks like recovery worked. So
-		# resolve from disk and treat the recorded value as a cache to correct.
+		# The agent's own session store, not the record, decides what can be
+		# resumed: handing a dead id to --resume was the one failure mode worth
+		# avoiding, because it looks like recovery worked. The recorded id is
+		# the member's own report of the conversation it was in (its hooks read
+		# it from the agent, see _record_agent_session), so it wins whenever the
+		# store still holds it — rediscovering it instead can only guess, and
+		# for codex and opencode the guess is "newest in this worktree", which a
+		# worker and its reviewer share. Only a recorded id the store no longer
+		# has is re-derived, and the record corrected.
 		local recorded
 		recorded=$(apex_member_get "$manager" "$s" agent_session_id)
-		sid=$(_agent_session_for "$agent" "$wt" "$issue" "$pr" 2>/dev/null) || sid=""
-		note="resume ${sid:-<none found>}"
-		if [[ -n $recorded && $recorded != "$sid" ]]; then
-			note+=" (recorded id ${recorded} no longer resolves; record corrected)"
-		fi
-		# Only the claude adapter knows how to resume one specific recorded
-		# conversation (DELTA_AGENT_RESUME). codex and opencode both have their
-		# own resume story and their ids are already discoverable
-		# (_codex_thread_for/_opencode_session_for), but wiring their argv is a
-		# separate change — say so rather than resuming something else.
-		if [[ ${agent:t} != claude && -n $sid ]]; then
-			note="fresh (agent '${agent}' has no apex resume support yet; id ${sid} recorded)"
-			sid=""
+		if _agent_session_exists "$agent" "$wt" "$recorded"; then
+			sid="$recorded"
+			note="resume ${sid}"
+		else
+			sid=$(_agent_session_for "$agent" "$wt" "$issue" "$pr" 2>/dev/null) || sid=""
+			note="resume ${sid:-<none found>}"
+			if [[ -n $recorded && $recorded != "$sid" ]]; then
+				note+=" (recorded id ${recorded} no longer resolves; record corrected)"
+			fi
 		fi
 		[[ -z $sid ]] && note="fresh (no resumable conversation found)"
 

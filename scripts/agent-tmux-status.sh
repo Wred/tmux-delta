@@ -69,6 +69,21 @@ if [ -n "$pane" ]; then
       ;;
   esac
   if [ -n "$(tmux show-option -p -t "$pane" -qv @apex_role 2>/dev/null)" ]; then
+    # Tell apex which conversation this member is in (lib/agent-session.sh).
+    # pi and opencode hand it over as DELTA_AGENT_SESSION_ID already. Codex's
+    # notify passes its payload as the last argument, and Claude Code's hooks
+    # pass theirs on stdin — read with a cap, because a caller that leaves
+    # stdin open and silent must not stall the hook.
+    if [ -z "${DELTA_AGENT_SESSION_ID:-}" ] && command -v jq >/dev/null 2>&1; then
+      case "${2:-}" in
+        '{'*) DELTA_AGENT_SESSION_ID=$(printf '%s' "$2" \
+                | jq -r '."thread-id" // .thread_id // .session_id // empty' 2>/dev/null) ;;
+      esac
+      if [ -z "${DELTA_AGENT_SESSION_ID:-}" ] && [ ! -t 0 ] && command -v timeout >/dev/null 2>&1; then
+        DELTA_AGENT_SESSION_ID=$(timeout 1 cat 2>/dev/null | jq -r '.session_id // empty' 2>/dev/null)
+      fi
+      export DELTA_AGENT_SESSION_ID
+    fi
     "$(dirname "$(readlink -f "$0")")/tmux-apex.sh" event "$1" >/dev/null 2>&1 || true
   fi
 fi

@@ -48,13 +48,27 @@ function resolveScript(): string {
 
 const SCRIPT = resolveScript();
 
-export function tmuxStatus(action: "set" | "notify" | "clear") {
+// pi publishes PI_SESSION_ID only to its bash tool's commands, and these
+// scripts run outside any tool call, so the id is handed over explicitly —
+// it is how apex knows which conversation to resume this worker into
+// (scripts/lib/agent-session.sh).
+export function tmuxStatus(action: "set" | "notify" | "clear", sessionId?: string) {
 	if (!process.env.TMUX) return;
-	execFile(SCRIPT, [action], { env: process.env }, () => {});
+	const env = sessionId ? { ...process.env, DELTA_AGENT_SESSION_ID: sessionId } : process.env;
+	execFile(SCRIPT, [action], { env }, () => {});
 }
 
+type Ctx = { sessionManager: { getSessionId(): string } };
+const sid = (ctx: Ctx) => {
+	try {
+		return ctx.sessionManager.getSessionId();
+	} catch {
+		return undefined;
+	}
+};
+
 export default function (pi: ExtensionAPI) {
-	pi.on("agent_start", () => tmuxStatus("set"));
-	pi.on("agent_settled", () => tmuxStatus("clear"));
-	pi.on("session_shutdown", () => tmuxStatus("clear"));
+	pi.on("agent_start", (_e, ctx) => tmuxStatus("set", sid(ctx)));
+	pi.on("agent_settled", (_e, ctx) => tmuxStatus("clear", sid(ctx)));
+	pi.on("session_shutdown", (_e, ctx) => tmuxStatus("clear", sid(ctx)));
 }

@@ -45,9 +45,9 @@ print -r -- "${0:t}${argv_str:+ $argv_str}" >> "$STUB_LOG"
 exit 0
 STUB
 chmod +x "$BIN/pi"
-# Same stub as claude: the only adapter that honours DELTA_AGENT_RESUME.
 cp "$BIN/pi" "$BIN/claude"
 cp "$BIN/pi" "$BIN/codex"
+cp "$BIN/pi" "$BIN/opencode"
 
 # A refusal ends the pane's only command, so it pins the pane before printing.
 # The stub records those writes; nothing else here talks to tmux.
@@ -77,7 +77,10 @@ run() {
 		local kv
 		for kv in "$@"; do export "$kv"; done
 		local st=0 err
-		err=$( { source "$LIB"; delta_agent_exec "$agent" } 2>&1 >/dev/null ) || st=$?
+		# ADAPTER_DIR swaps in a test-only adapter set after the library has
+		# set its own.
+		err=$( { source "$LIB"; DELTA_AGENT_LIBDIR="${ADAPTER_DIR:-$DELTA_AGENT_LIBDIR}"
+			delta_agent_exec "$agent" } 2>&1 >/dev/null ) || st=$?
 		print -r -- "$st|$err"
 	)
 }
@@ -113,22 +116,37 @@ contains "a task prompt launches"       "pi GitHub issue #68." "$(cat "$STUB_LOG
 out=$(run -a claude DELTA_AGENT_MANAGED=1 DELTA_AGENT_RESUME=abc123)
 contains "a resume id launches on an adapter that reads it" "--resume abc123" "$(cat "$STUB_LOG")"
 
+# Every shipped adapter resumes one specific conversation, each in its own
+# spelling, and never falls back to "whatever ran last here" — in a worktree a
+# worker shares with its reviewer, that is a coin flip between the two.
+typeset -A RESUME_ARGV=(
+	pi       "pi --session abc123"
+	codex    "codex resume abc123"
+	opencode "opencode --session abc123"
+)
+for a in pi codex opencode; do
+	out=$(run -a $a DELTA_AGENT_MANAGED=1 DELTA_AGENT_RESUME=abc123)
+	eq       "$a: launches a resume id"     "0|" "$out"
+	contains "$a: with its own spelling"    "${RESUME_ARGV[$a]}" "$(cat "$STUB_LOG")"
+done
+out=$(run -a pi DELTA_AGENT_MANAGED=1 DELTA_AGENT_RESUME=abc123 DELTA_AGENT_PROMPT='GitHub issue #68.')
+eq "a resume id beats the task prompt" "pi --session abc123" "$(cat "$STUB_LOG")"
+
 print ""
 print "delta_agent_exec: resume by id needs an adapter that reads it"
 
-# pi resumes with --continue and opencode the same; codex has `resume --last`.
-# All three mean "whatever ran last in this directory", which in a worktree a
-# worker shares with its reviewer is a coin flip between the two conversations.
-for a in pi codex; do
-	out=$(run -a $a DELTA_AGENT_MANAGED=1 DELTA_AGENT_RESUME=abc123)
-	eq   "$a: refuses a resume id it cannot honour" "78" "${out%%|*}"
-	contains "$a: names the id that would be dropped" "DELTA_AGENT_RESUME=abc123" "$out"
-	eq   "$a: never invokes the agent"              "" "$(cat "$STUB_LOG")"
-done
+# The guard stays for the next adapter: one that ignores DELTA_AGENT_RESUME
+# would attach to whatever conversation ran last in this directory instead.
+ADAPTERS="$TMPROOT/adapters"; mkdir -p "$ADAPTERS/agents"
+print -r -- 'delta_agent_argv() { agent_argv=("${DELTA_AGENT_PROMPT:---continue}") }' > "$ADAPTERS/agents/pi.sh"
+out=$(ADAPTER_DIR="$ADAPTERS" run -a pi DELTA_AGENT_MANAGED=1 DELTA_AGENT_RESUME=abc123)
+eq       "refuses a resume id the adapter cannot honour" "78" "${out%%|*}"
+contains "names the id that would be dropped" "DELTA_AGENT_RESUME=abc123" "$out"
+eq       "never invokes the agent"            "" "$(cat "$STUB_LOG")"
 
-# ...and a task prompt is the documented way out, on those same adapters.
-out=$(run -a pi DELTA_AGENT_MANAGED=1 DELTA_AGENT_RESUME=abc123 DELTA_AGENT_PROMPT='GitHub issue #68.')
-contains "a task prompt makes the launch legal again" "pi GitHub issue #68." "$(cat "$STUB_LOG")"
+# ...and a task prompt is the documented way out.
+out=$(ADAPTER_DIR="$ADAPTERS" run -a pi DELTA_AGENT_MANAGED=1 DELTA_AGENT_RESUME=abc123 DELTA_AGENT_PROMPT='GitHub issue #68.')
+eq "a task prompt makes the launch legal again" "0" "${out%%|*}"
 
 print ""
 print "delta_agent_exec: unmanaged human open"

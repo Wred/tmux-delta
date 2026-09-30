@@ -15,8 +15,13 @@
 delta_agent_argv() {
 	agent_argv=()
 
-	# `resume --last` is a subcommand, so it has to precede every flag.
-	if [[ -z $DELTA_AGENT_PROMPT ]]; then
+	# `resume` is a subcommand, so it has to precede every flag. A specific
+	# thread id beats --last, with no fresh fallback — see the claude adapter
+	# for why a failed resume must not turn into a second run of the task.
+	if [[ -n $DELTA_AGENT_RESUME ]]; then
+		agent_argv+=(resume "$DELTA_AGENT_RESUME")
+		agent_resume_id_honored=1
+	elif [[ -z $DELTA_AGENT_PROMPT ]]; then
 		agent_argv+=(resume --last)
 		agent_argv_fresh_set=1
 	fi
@@ -28,7 +33,7 @@ delta_agent_argv() {
 		agent_argv_fresh=("${(@)agent_argv[3,-1]}")
 	fi
 
-	if [[ -n $DELTA_AGENT_PROMPT ]]; then
+	if [[ -n $DELTA_AGENT_PROMPT && -z $DELTA_AGENT_RESUME ]]; then
 		local prompt="$DELTA_AGENT_PROMPT"
 		[[ -n $DELTA_AGENT_SYSTEM ]] && prompt="${DELTA_AGENT_SYSTEM}"$'\n\n'"${prompt}"
 		agent_argv+=("$prompt")

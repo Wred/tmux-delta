@@ -12,7 +12,13 @@ delta_agent_argv() {
 	[[ -n $DELTA_AGENT_FLAGS  ]] && agent_argv+=(${=DELTA_AGENT_FLAGS})
 	[[ -n $DELTA_AGENT_SYSTEM ]] && agent_argv+=(--append-system-prompt "$DELTA_AGENT_SYSTEM")
 
-	if [[ -n $DELTA_AGENT_PROMPT ]]; then
+	# One specific conversation beats both the prompt and --continue, with no
+	# fresh fallback — see the claude adapter for why a failed resume must not
+	# turn into a second run of the task.
+	if [[ -n $DELTA_AGENT_RESUME ]]; then
+		agent_argv+=(--session "$DELTA_AGENT_RESUME")
+		agent_resume_id_honored=1
+	elif [[ -n $DELTA_AGENT_PROMPT ]]; then
 		agent_argv+=("$DELTA_AGENT_PROMPT")
 	else
 		agent_argv_fresh=("${agent_argv[@]}")

@@ -43,26 +43,36 @@ function resolveScript() {
 
 const SCRIPT = resolveScript();
 
-function tmuxStatus(action) {
+// opencode publishes no session id to child processes at all. These scripts
+// get it handed over explicitly, and the shell tool's commands get it as
+// OPENCODE_SESSION_ID via the shell.env hook — the name
+// scripts/lib/agent-session.sh reads, so `tmux-apex.sh init` run by an
+// opencode manager records which conversation it belongs to.
+function tmuxStatus(action, sessionId) {
 	if (!process.env.TMUX) return;
-	execFile(SCRIPT, [action], { env: process.env }, () => {});
+	const env = sessionId ? { ...process.env, DELTA_AGENT_SESSION_ID: sessionId } : process.env;
+	execFile(SCRIPT, [action], { env }, () => {});
 }
 
 export const TmuxDeltaStatus = async () => ({
-	"tool.execute.before": async () => {
-		tmuxStatus("set");
+	"shell.env": async (input, output) => {
+		if (input?.sessionID) output.env.OPENCODE_SESSION_ID = input.sessionID;
+	},
+	"tool.execute.before": async (input) => {
+		tmuxStatus("set", input?.sessionID);
 	},
 	event: async ({ event }) => {
+		const sessionId = event?.properties?.sessionID;
 		switch (event?.type) {
 			case "permission.asked":
-				tmuxStatus("notify");
+				tmuxStatus("notify", sessionId);
 				break;
 			case "permission.replied":
-				tmuxStatus("set");
+				tmuxStatus("set", sessionId);
 				break;
 			case "session.idle":
 			case "session.error":
-				tmuxStatus("clear");
+				tmuxStatus("clear", sessionId);
 				break;
 		}
 	},
