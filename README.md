@@ -220,13 +220,12 @@ fails), the installer skips this section entirely rather than falling back to
 editing `settings.json` — upgrade to get the hooks. Uninstalling is the
 reverse: `claude plugin uninstall tmux-delta-claude@tmux-delta`.
 
-**pi** — symlink the shipped extension, which wires `agent_start` → `set` and
-`agent_settled` → `clear`:
-
-```zsh
-ln -s ~/.tmux/plugins/tmux-delta/extensions/pi/tmux-status.ts \
-      ~/.pi/agent/extensions/tmux-status.ts
-```
+**pi** — the installer symlinks the shipped extension to
+`~/.pi/agent/extensions/tmux-status.ts`. It wires `agent_start` → `set` and
+`agent_settled` → `clear`. A hand-copied tmux-delta extension already at that
+path (any file that calls `agent-tmux-status.sh`) is moved aside to
+`tmux-status.ts.bak` and replaced; any other file there is left alone and
+reported in the log.
 
 It deliberately does not fire `notify`, because pi has no single "blocked" event
 — the blocking moments are the confirm prompts your own extensions raise. The
@@ -263,13 +262,12 @@ hook and it fires on turn completion, so codex gets the idle ping but neither
 the working robot nor the orange pill. *(Untested — written from the codex docs,
 not verified against an install.)*
 
-### 4. Apex mode skill (optional)
+### 4. Apex mode skill
 
-Symlink the shipped skill so Claude Code can find it:
-
-```zsh
-ln -s ~/.tmux/plugins/tmux-delta/skills/delta-apex ~/.claude/skills/delta-apex
-```
+Installed by the same installer, for every agent: it links `skills/delta-apex`
+into `~/.claude/skills` (Claude Code) and `~/.agents/skills` (pi, codex and
+opencode). Start apex mode with `/delta-apex` in Claude Code, `/skill:delta-apex`
+in pi, or by asking any of them to "turn on apex mode".
 
 ## Configuration
 

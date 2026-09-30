@@ -121,15 +121,60 @@ migrate_claude_settings_hooks() {
 }
 
 # ─── symlink helper: only touch links this script itself owns ────────
+#
+# Three things can already be sitting at <dst>, and only one of them is left
+# alone:
+#   - a symlink into *a* tmux-delta checkout at the same repo-relative path —
+#     ours, possibly from a clone that has since moved. Repointed.
+#   - a regular file that calls agent-tmux-status.sh — a hand-copied tmux-delta
+#     extension from before this installer existed, which goes stale the moment
+#     the shipped one changes (issue: a pi copy fired `notify` on every
+#     agent_end, pinging the apex manager "blocked" at the end of every turn).
+#     Moved aside to <dst>.bak, never deleted, then replaced by the link.
+#   - anything else: someone else's file. Left alone, and said so.
+
+# _repo_rel <src> — <src> relative to the repo root, e.g. extensions/pi/tmux-status.ts
+_repo_rel() { printf '%s' "${1#"$REPO_ROOT"/}"; }
+
+_backup_path() {
+	local dst="$1" bak="$1.bak" n=1
+	while [[ -e "$bak" || -L "$bak" ]]; do bak="$dst.bak.$n"; n=$((n + 1)); done
+	printf '%s' "$bak"
+}
 
 link_if_safe() {
-	local src="$1" dst="$2" label="$3"
-	if [[ -L "$dst" && "$(readlink "$dst")" == "$src" ]]; then
-		skip "$label already linked"
+	local src="$1" dst="$2" label="$3" cur rel
+	rel="$(_repo_rel "$src")"
+	if [[ -L "$dst" ]]; then
+		cur="$(readlink "$dst")"
+		if [[ "$cur" == "$src" ]]; then
+			skip "$label already linked"
+			return
+		fi
+		if [[ "$cur" == */"$rel" ]]; then
+			if $DRY_RUN; then
+				apply "$label: repoint $dst from $cur to $src"
+			else
+				ln -sfn "$src" "$dst"
+				apply "$label: repointed (was $cur)"
+			fi
+			return
+		fi
+	fi
+	if [[ -f "$dst" && ! -L "$dst" ]] && grep -q 'agent-tmux-status\.sh' "$dst" 2>/dev/null; then
+		local bak
+		bak="$(_backup_path "$dst")"
+		if $DRY_RUN; then
+			apply "$label: replace old tmux-delta copy $dst (backup to $bak)"
+		else
+			mv "$dst" "$bak"
+			ln -s "$src" "$dst"
+			apply "$label: replaced old tmux-delta copy (backup: $bak)"
+		fi
 		return
 	fi
 	if [[ -e "$dst" || -L "$dst" ]]; then
-		note "$label: $dst already exists and isn't our symlink — leaving it alone"
+		note "$label: $dst already exists and isn't ours — leaving it alone"
 		return
 	fi
 	if $DRY_RUN; then
@@ -141,10 +186,17 @@ link_if_safe() {
 	apply "$label: linked"
 }
 
-# ─── Claude Code skill ─────────────────────────────────────────────────
+# ─── apex skill ──────────────────────────────────────────────────────────
+#
+# One skill, two discovery roots. Claude Code reads ~/.claude/skills; pi, codex
+# and opencode all read the cross-agent ~/.agents/skills (opencode reads both,
+# and resolves the duplicate by name). Linked whether or not a given agent is
+# installed yet: the link is inert until something reads it, and installing an
+# agent later should not need this script re-run to get apex mode.
 
-install_claude_skill() {
-	link_if_safe "$SKILL_SRC" "$HOME/.claude/skills/delta-apex" "claude skill"
+install_skill() {
+	link_if_safe "$SKILL_SRC" "$HOME/.claude/skills/delta-apex" "skill (claude)"
+	link_if_safe "$SKILL_SRC" "$HOME/.agents/skills/delta-apex" "skill (pi, codex, opencode)"
 }
 
 # ─── pi extension ──────────────────────────────────────────────────────
@@ -184,9 +236,11 @@ install_codex_hook() {
 echo "tmux-delta agent hooks — repo: $REPO_ROOT"
 $DRY_RUN && echo "(dry run — no changes will be made)"
 echo
+echo "apex skill:"
+install_skill
+echo
 echo "Claude Code:"
 install_claude_hooks
-install_claude_skill
 echo
 echo "pi:"
 install_pi_extension
