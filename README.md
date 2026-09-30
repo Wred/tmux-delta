@@ -318,11 +318,16 @@ export TMUX_SESSIONIZER_EXTRA_DIRS="$HOME/.config/tmux/plugins/tmux-delta"  # ad
 
 ### Coding agent
 
-The dev layout (`tmux-dev-layout.sh`) opens a coding agent on the right pane. Override the command via `.envrc` in your project:
+The dev layout (`tmux-dev-layout.sh`) opens a coding agent on the right pane.
+It is `pi` unless you say otherwise; pick any supported agent via `.envrc` in
+your project (or your shell environment):
 
 ```sh
-export CODING_AGENT=claude
+export CODING_AGENT=claude   # or pi, codex, opencode
 ```
+
+The default lives in one place, `scripts/lib/agent-default.sh`. An apex spawn
+with no `--agent` or profile uses the same resolution, `CODING_AGENT` first.
 
 Agents spell the same concepts differently, so the dev layout emits no flags of
 its own. It exports neutral inputs and calls an **adapter** —
@@ -820,16 +825,21 @@ Each entry:
 
 ```json
 "hard": {
-  "agent": "claude",
-  "model": "opus",
-  "agent_flags": "acceptEdits",
+  "agent": "pi",
+  "model": "anthropic/claude-opus-5-5",
   "description": "Tricky refactors, ambiguous specs, anything touching shared/critical code."
 }
 ```
 
 Default tiers ship as `trivial` (haiku) → `easy`/`standard` (sonnet) →
 `hard` (opus) → `extreme` (fable), Anthropic's model tiers cheapest/fastest
-to most capable/expensive, all on the claude agent. Run `tmux-apex.sh
+to most capable/expensive, all on the pi agent with exact `provider/id` model
+ids. pi has no permission modes, so they carry no `agent_flags`; an autonomous
+spawn on them warns that the flags are unclassified (see below) and proceeds.
+`easy` and `standard` are currently identical apart from their descriptions:
+on claude they differed only in permission mode. To run a tier on another
+harness, override it in your user file, or pass `--agent`, `--model` and
+`--agent-flags` together, since all three are spelled per agent. Run `tmux-apex.sh
 profiles` to see the current merged set, since these are meant to be edited
 freely and the shipped names/models are starting points, not fixed policy —
 in particular, model aliases and pricing drift over time and across
@@ -851,9 +861,9 @@ whose permission mode is known to prompt fails immediately, naming both values
 and where the permission mode came from:
 
 ```
-$ tmux-apex.sh spawn --issue 42 --profile hard
+$ tmux-apex.sh spawn --issue 42 --agent claude --agent-flags acceptEdits
 tmux-apex: spawn: --mode autonomous conflicts with permission mode 'acceptEdits'
-  (from profile 'hard' (agent_flags=acceptEdits)).
+  (from --agent-flags acceptEdits).
   ...
     --agent-flags bypassPermissions   run it unattended (overrides the profile)
     --mode interactive                keep the approval prompts and watch it yourself
@@ -889,7 +899,7 @@ a modal prompt indefinitely (observed once here for nearly seven hours, on an
 `--profile` only fills the `--agent`/`--model`/`--agent-flags` fields the
 `spawn` call didn't already set explicitly — pass any of those three
 alongside `--profile` to override just that field for one spawn, e.g.
-`spawn --issue 42 --profile hard --agent-flags bypassPermissions`. Omitting
+`spawn --issue 42 --profile hard --model anthropic/claude-opus-5-5:xhigh`. Omitting
 `--profile` entirely is unchanged from before this feature existed — raw
 `--agent`/`--model`/`--agent-flags` still work with no profile involved.
 

@@ -10,6 +10,7 @@
 # Sourced by tmux-apex.sh (zsh).
 
 APEX_PROFILES_LIBDIR="${0:A:h}"
+source "${APEX_PROFILES_LIBDIR}/agent-default.sh"
 APEX_PROFILES_REPO_FILE="${APEX_PROFILES_LIBDIR}/apex-profiles.json"
 APEX_PROFILES_USER_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/tmux-delta/apex-profiles.json"
 
@@ -48,9 +49,9 @@ apex_profiles_list() {
 	local merged rc
 	merged=$(apex_profiles_merged); rc=$?
 	(( rc == 0 )) || return $rc
-	jq -r '
+	jq -r --arg default_agent "$DELTA_DEFAULT_AGENT" '
 		to_entries[] |
-		[.key, (.value.agent // "claude"), (.value.model // "-"),
+		[.key, (.value.agent // $default_agent), (.value.model // "-"),
 		 (.value.agent_flags // "-"), (.value.description // "")] | @tsv
 	' <<< "$merged" | sort
 }

@@ -16,6 +16,7 @@ _APEX_SPAWN=""
 
 source "${SCRIPTS}/gwt.zsh"
 source "${SCRIPTS}/lib/pr-cache.sh"
+source "${SCRIPTS}/lib/agent-default.sh"
 
 # ─── Directory history ───────────────────────────────────────────────
 
@@ -631,7 +632,7 @@ _report_spawn() {
 # itself with apex without any env-var round-trip.
 _add_agent_pane() {
 	local session="$1" worktree="$2" role="$3" task="$4" manager="$5"
-	local model="$6" perm="$7" mode="$8" agent="${9:-claude}" prompt="${10}"
+	local model="$6" perm="$7" mode="$8" agent="${9:-$DELTA_DEFAULT_AGENT}" prompt="${10}"
 	local issue="${11}" pr="${12}"
 
 	# Idempotency: reuse an existing pane already doing this exact task
@@ -980,7 +981,7 @@ _open_pr_review() {
 	# Gated on _APEX_SPAWN: a human picking a PR whose session is already open
 	# wants to switch to it, not to accumulate a pane per keypress.
 	if [[ -n $_APEX_SPAWN ]] && tmux has-session -t="$selected_name" 2>/dev/null; then
-		local role=worker manager="" model="" perm="" agent=claude kv
+		local role=worker manager="" model="" perm="" agent=$DELTA_DEFAULT_AGENT kv
 		for kv in "${_spawn_env[@]}"; do
 			case "$kv" in
 				CODING_AGENT_ROLE=*)             role="${kv#*=}" ;;
@@ -1122,7 +1123,7 @@ _open_issue() {
 	# (for a session that isn't newly created) launching nothing at all. See the
 	# comment there for the two failure modes this closes (issues #8, #18).
 	if [[ -n $_APEX_SPAWN ]] && tmux has-session -t="$selected_name" 2>/dev/null; then
-		local role=worker manager="" model="" perm="" agent=claude kv
+		local role=worker manager="" model="" perm="" agent=$DELTA_DEFAULT_AGENT kv
 		for kv in "${_spawn_env[@]}"; do
 			case "$kv" in
 				CODING_AGENT_ROLE=*)             role="${kv#*=}" ;;

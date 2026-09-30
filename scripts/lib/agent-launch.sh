@@ -10,7 +10,7 @@
 #
 # <agent_expr> decides how the pane's shell picks its agent binary:
 #   - tmux-dev-layout.sh passes the literal, single-quoted string
-#     '${CODING_AGENT:-claude}' so it's resolved INSIDE the pane, after
+#     '${CODING_AGENT:-<DELTA_DEFAULT_AGENT>}' so it's resolved INSIDE the pane, after
 #     direnv exec loads the worktree's .envrc (the pane doesn't exist yet
 #     when the caller runs, so the agent can't be known any earlier).
 #   - _add_agent_pane already has a concrete, already-resolved agent name

@@ -174,10 +174,18 @@ SCRIPTS_REAL="$SCRIPTS"
 _require_manager() { print -r -- "stub-manager" }
 apex_event() { : }
 
-# The repo's own profiles, not this machine's: a user apex-profiles.json can
-# redefine `hard`, and these assertions are about the shipped tiers.
+# Claude profiles of this test's own, not the shipped ones or this machine's:
+# the guard is about claude's permission modes, and the shipped tiers are free
+# to move to another harness (they now run pi, which has none). The user file
+# replaces a repo profile of the same name, so these win over the shipped ones.
 source "$SCRIPTS/lib/apex-profiles.sh"
-APEX_PROFILES_USER_FILE="$TMPROOT/no-such-user-profiles.json"
+APEX_PROFILES_USER_FILE="$TMPROOT/test-profiles.json"
+cat > "$APEX_PROFILES_USER_FILE" <<'JSON'
+{
+  "easy": {"agent": "claude", "model": "sonnet", "agent_flags": "bypassPermissions"},
+  "hard": {"agent": "claude", "model": "opus",   "agent_flags": "acceptEdits"}
+}
+JSON
 
 # Not a command substitution: `_cmd_spawn` dies by `exit`, and the exit status
 # has to survive to the assertion.
@@ -232,7 +240,7 @@ SCRIPTS="$SCRIPTS_REAL"
 #
 # The guard is only half the fix: a profile whose agent_flags can never run
 # unattended is a profile the manager cannot spawn autonomously at all. Assert
-# every shipped claude profile is either unattended-capable or documented as
+# every shipped profile is either unattended-capable or documented as
 # needing supervision, so the pair stays consistent as profiles are edited.
 
 print -- "shipped profiles"
@@ -241,12 +249,15 @@ source "$SCRIPTS/lib/apex-profiles.sh"
 # assert about, and apex_profiles_merged would pull it in.
 pjson=$(< "$(apex_profiles_repo_file)")
 for name in ${(f)"$(jq -r 'keys[]' <<< "$pjson")"}; do
-	agent=$(jq -r --arg n "$name" '.[$n].agent // "claude"' <<< "$pjson")
+	agent=$(jq -r --arg n "$name" --arg d "$DELTA_DEFAULT_AGENT" '.[$n].agent // $d' <<< "$pjson")
 	flags=$(jq -r --arg n "$name" '.[$n].agent_flags // ""' <<< "$pjson")
 	desc=$(jq -r --arg n "$name" '.[$n].description // ""' <<< "$pjson")
 	_perm_unattended "$flags" "$agent"
 	case $? in
 		0) ok "profile '$name' can run autonomously" ;;
+		# Neither way: spawn lets it through with a warning, which is the
+		# documented behaviour for flags this repo does not classify.
+		2) ok "profile '$name' is unclassified for '$agent' (spawn warns)" ;;
 		*) if [[ ${desc:l} == *(supervis|approval|approve|attended|pause|interactive)* ]]; then
 			   ok "profile '$name' needs supervision and says so"
 		   else

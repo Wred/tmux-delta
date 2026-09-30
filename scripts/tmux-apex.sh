@@ -29,6 +29,7 @@ source "${SCRIPTS}/lib/apex-state.sh"
 source "${SCRIPTS}/lib/apex-authority.sh"
 source "${SCRIPTS}/lib/apex-profiles.sh"
 source "${SCRIPTS}/lib/pr-cache.sh"
+source "${SCRIPTS}/lib/agent-default.sh"
 
 APEX_QUIET_SECS=${APEX_QUIET_SECS:-30}
 
@@ -1609,7 +1610,7 @@ _cmd_relink() {
 # without a human at the keyboard?
 #   0 = yes, 1 = no (it will prompt), 2 = unknown (agent-native argv we can't judge)
 _perm_unattended() {
-	local perm="$1" agent="${2:-claude}"
+	local perm="$1" agent="${2:-$DELTA_DEFAULT_AGENT}"
 
 	# Flags are classified per agent, never universally: a marker one agent
 	# treats as "skip every gate" is an unknown argument to another, and the
@@ -1655,7 +1656,7 @@ _perm_unattended() {
 # so attributing its value to the named profile would send the caller to edit
 # the wrong knob.
 _spawn_check_mode() {
-	local mode="$1" perm="$2" agent="${3:-claude}" profile="$4"
+	local mode="$1" perm="$2" agent="${3:-$DELTA_DEFAULT_AGENT}" profile="$4"
 	local shown="${perm:-<agent default>}"
 	local src="--agent-flags ${perm}"
 	[[ -z $perm ]] && src="no --agent-flags"
@@ -1730,15 +1731,20 @@ _cmd_spawn() {
 		[[ -z $perm  ]] && { perm=$(jq -r '.agent_flags // empty' <<< "$pjson"); perm_profile="$profile" }
 	fi
 
+	# Resolve the agent now rather than leaving it to the pane: the guards below
+	# classify flags per agent, so they must judge the agent that will actually
+	# launch, and pinning CODING_AGENT on the session makes sure it is that one.
+	[[ -z $agent ]] && agent="${CODING_AGENT:-$DELTA_DEFAULT_AGENT}"
+
 	# Only the claude adapter accepts a bare token here (it prepends
 	# --permission-mode). Every other agent gets the value as verbatim argv, so a
 	# bare token would arrive as a stray positional and silently derail the
 	# spawn. Refuse it loudly instead.
-	if [[ -n $perm && $perm != -* && -n $agent && ${agent:t} != claude ]]; then
+	if [[ -n $perm && $perm != -* && ${agent:t} != claude ]]; then
 		_die "spawn: --agent-flags for '${agent}' must be agent-native argv (e.g. --approve, --full-auto), not the claude token '${perm}'"
 	fi
 
-	_spawn_check_mode "$mode" "$perm" "${agent:-claude}" "$perm_profile"
+	_spawn_check_mode "$mode" "$perm" "$agent" "$perm_profile"
 
 	local manager
 	manager=$(_require_manager) || exit 1
@@ -1747,8 +1753,8 @@ _cmd_spawn() {
 	local -a envs=(
 		"CODING_AGENT_ROLE=${role}"
 		"CODING_AGENT_APEX_SESSION=${manager}"
+		"CODING_AGENT=${agent}"
 	)
-	[[ -n $agent ]] && envs+=("CODING_AGENT=${agent}")
 	[[ -n $model ]] && envs+=("CODING_AGENT_MODEL=${model}")
 	[[ -n $perm  ]] && envs+=("CODING_AGENT_PERMISSION_MODE=${perm}")
 
@@ -1797,7 +1803,7 @@ _cmd_spawn() {
 # _register-member <pane_id> <manager> <role> <task> <worktree> [model] [perm] [mode] [agent] [profile] [issue] [pr] [agent_session_id]
 _cmd_register_member() {
 	local pane_id="$1" manager="$2" role="$3" task="$4" worktree="$5"
-	local model="$6" perm="$7" mode="$8" agent="${9:-claude}" profile="${10}"
+	local model="$6" perm="$7" mode="$8" agent="${9:-$DELTA_DEFAULT_AGENT}" profile="${10}"
 	local issue="${11}" pr="${12}" agent_session="${13}"
 	[[ -z $pane_id || -z $manager ]] && _die "_register-member: need <pane_id> <manager>"
 
@@ -4736,6 +4742,8 @@ _cmd_recover() {
 		mode=$(apex_member_get "$manager" "$s" mode)
 		model=$(apex_member_get "$manager" "$s" model)
 		perm=$(apex_member_get "$manager" "$s" permission_mode)
+		# An empty agent is a record from before members stored one, when every
+		# launch was claude — not a request for today's default.
 		agent=$(apex_member_get "$manager" "$s" agent); [[ -z $agent ]] && agent=claude
 		profile=$(apex_member_get "$manager" "$s" profile)
 		issue=$(apex_member_get "$manager" "$s" issue)

@@ -314,27 +314,31 @@ still exist or mean what they used to; check before guessing.
 ```bash
 tmux-apex.sh profiles
 
-tmux-apex.sh spawn --issue 42 --profile standard --mode interactive
-tmux-apex.sh spawn --issue 43 --profile hard --agent-flags bypassPermissions
-tmux-apex.sh spawn --issue 44 --profile easy
-tmux-apex.sh spawn --review-pr 17 --role monitor --profile hard --agent-flags bypassPermissions
+tmux-apex.sh spawn --issue 42 --profile standard
+tmux-apex.sh spawn --issue 43 --profile hard
+tmux-apex.sh spawn --issue 44 --profile easy --mode interactive
+tmux-apex.sh spawn --review-pr 17 --role monitor --profile hard
 ```
+
+The shipped tiers run `pi`, which has no permission modes: its tools run
+without prompting, so the profiles carry no agent flags. `spawn` cannot verify
+that a pi worker will never stop for approval — an installed pi extension can
+still ask — so an autonomous pi spawn prints a warning and goes ahead. That
+warning is expected; it is not a refusal.
 
 A spawn defaults to `--mode autonomous`, which tells the worker to work to
 completion — commit, push, open a draft PR — with nobody watching it. That is
 incompatible with a permission mode that pauses for approval on shell commands,
 so `spawn` refuses the pair outright instead of handing you a worker that stalls
-on its first `git` call: `standard`, `hard` and `extreme` ship `acceptEdits`, so
-an autonomous spawn on those tiers needs `--agent-flags bypassPermissions`
-(overriding just that field), and without it you must pass `--mode interactive`
-and supervise the pane yourself. The refusal names both values, so you do not
-have to remember which tiers are which. Say which you chose and why.
+on its first `git` call. With `--agent claude`, `acceptEdits` and claude's bare
+default are such modes: pass `--agent-flags bypassPermissions`, or
+`--mode interactive` and supervise the pane yourself. The refusal names both
+values. Say which you chose and why.
 
 Do not read that as a guarantee. Claude Code's safety classifier gates
-dangerous operations *regardless* of permission mode, so a `bypassPermissions`
-worker can still sit on a modal prompt for hours. `bypassPermissions` removes
-the blocks that are certain, not all of them — a worker that has gone quiet is
-still worth looking at (see issue #63).
+dangerous operations *regardless* of permission mode, and pi extensions can
+gate them too, so a worker can still sit on a modal prompt for hours. A worker
+that has gone quiet is still worth looking at (see issue #63).
 
 ### Linked pairs — do not relay reviews by hand
 
@@ -378,14 +382,15 @@ Choose a tier per task and say out loud why you chose it — trivial/easy for
 mechanical, well-specified work; standard (sonnet) for most everyday issue
 work; hard (opus) for design work, tricky refactors, and reviews; extreme
 (fable) for the hardest problems, where the strongest available model earns
-its cost. Reach for a different harness (`--agent codex`/`pi`/`opencode`)
-only when you specifically want a second opinion alongside claude, not as
+its cost. Reach for a different harness (`--agent claude`/`codex`/`opencode`)
+only when you specifically want a second opinion alongside pi, not as
 part of the default escalation. Override individual fields when the task's
 specifics warrant it — any explicit `--agent`,
 `--model`, or `--agent-flags` you pass alongside `--profile` wins over that
-profile's value for just that field, as in the `--profile hard
---agent-flags bypassPermissions` example above. Still narrate the tier plus
-whatever you overrode and why.
+profile's value for just that field. Switching harness means overriding all
+three, since model ids and flags are spelled per agent: e.g. `--profile hard
+--agent claude --model opus --agent-flags bypassPermissions`. Still narrate the
+tier plus whatever you overrode and why.
 
 When no profile fits, fall back to the raw flags directly:
 
@@ -406,12 +411,12 @@ tmux-apex.sh spawn --issue 46 --agent codex --agent-flags '--sandbox workspace-w
   `acceptEdits` when you want shell commands to stop and ask. A worker in
   `acceptEdits` **can** stall waiting for a human — that is the tradeoff.
 - `--role monitor` for agents that review or verify rather than implement.
-- `--agent` — which coding agent to run: `claude` (default), `pi`, `codex`, or
-  `opencode`.
+- `--agent` — which coding agent to run: `pi` (the default, and what every
+  shipped profile names), `claude`, `codex`, or `opencode`.
   Only pass it when the human has said to, or a profile already names it;
   otherwise inherit the default. A team can be mixed.
 
-If you do pass `--agent`, `--agent-flags` becomes that agent's own argv, not a
+For every agent but claude, `--agent-flags` is that agent's own argv, not a
 claude permission mode — `--approve` or `--tools read,bash,edit` for pi,
 `--sandbox {read-only|workspace-write|danger-full-access}` plus
 `--ask-for-approval {on-request|never}` for codex, `--auto` for opencode.

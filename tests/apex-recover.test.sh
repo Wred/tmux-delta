@@ -159,6 +159,10 @@ new-session)
 split-window)
 	local s="" i; local -a a=("$@")
 	for (( i = 1; i <= ${#a}; i++ )); do [[ ${a[i]} == -t ]] && s="${a[i+1]}"; done
+	# Real tmux splits the current window when there is no -t. Only a caller
+	# that opts in with STUB_SPLIT_SESSION gets that; the others rely on an
+	# untargeted split landing in no session.
+	[[ -z $s ]] && s="${STUB_SPLIT_SESSION:-}"
 	local p="%$(( $(grep -c '' "$STUB/panes" 2>/dev/null) + 90 ))"
 	printf '%s\t%s\t%s\n' "$p" "$s" "${a[-1]}" >> "$STUB/panes"
 	print -r -- "$p"
@@ -844,6 +848,38 @@ print -r -- 42 > "$STUB/env.$(print -r -- "${HUMAN_OPENED//[^a-zA-Z0-9]/_}").COD
 dl_cmd=$(dl_launch_cmd "$HUMAN_OPENED")
 contains "a human's own open is not marked managed" \
 	"DELTA_AGENT_MANAGED=''" "$dl_cmd"
+
+# The pane resolves CODING_AGENT after direnv loads the worktree's .envrc, so
+# the member record has to name that agent, not the session env's (or the
+# default). Recorded wrongly, every per-agent decision apex makes about this
+# member — permission classification, native delivery, resume — is about a
+# harness that is not running.
+if (( $+commands[direnv] )); then
+	ENVRC_SPAWNED=dl-envrc-session
+	# :A — direnv keys its approval on the path, and TMPROOT can carry a "//".
+	ENVRC_WT="${TMPROOT:A}/dl-envrc-worktree"; mkdir -p "$ENVRC_WT"
+	print -r -- 'export CODING_AGENT=codex' > "$ENVRC_WT/.envrc"
+	export XDG_DATA_HOME="$HOME/.local/share" XDG_CONFIG_HOME="$HOME/.config"
+	direnv allow "$ENVRC_WT" 2>/dev/null
+	for kv in CODING_AGENT_ISSUE=42 "CODING_AGENT_APEX_SESSION=$MANAGER" \
+		CODING_AGENT_ROLE=worker CODING_AGENT=claude; do
+		print -r -- "${kv#*=}" > "$STUB/env.$(print -r -- "${ENVRC_SPAWNED//[^a-zA-Z0-9]/_}").${kv%%=*}"
+	done
+	print -r -- "$ENVRC_SPAWNED" >> "$STUB/sessions"
+	# The stub records dev-layout's splits with an empty session, so the earlier
+	# runs above read as panes of this window and trip its "already split"
+	# guard. Hide them for this run, then put them back.
+	cp "$STUB/panes" "$STUB/panes.keep"
+	awk -F'\t' '$2 != ""' "$STUB/panes.keep" > "$STUB/panes"
+	( cd "$ENVRC_WT" && STUB_SESSION="$ENVRC_SPAWNED" STUB_SPLIT_SESSION="$ENVRC_SPAWNED" \
+		TMUX=fake-socket DEV_EDITOR=true "$SCRIPTS/tmux-dev-layout.sh" ) >/dev/null 2>&1 || true
+	awk -F'\t' -v s="$ENVRC_SPAWNED" '$2 == s' "$STUB/panes" >> "$STUB/panes.keep"
+	mv "$STUB/panes.keep" "$STUB/panes"
+	eq "a member is recorded as the agent its worktree's .envrc picks" "codex" \
+		"$(cat "$APEX_ROOT/$MANAGER/members/$ENVRC_SPAWNED":*.json 2>/dev/null | jq -r '.agent')"
+else
+	print "  skip .envrc agent registration (no direnv)"
+fi
 
 # ─── summary ─────────────────────────────────────────────────────────
 
