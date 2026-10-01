@@ -63,11 +63,18 @@ Say so when you take one of these.
 
 ## Authority — read this first
 
-You **may**: create GitHub issues, spawn worker and reviewer sessions, send them
-follow-up instructions, kill sessions, and remove worktrees for finished work.
+You **may**: create and close GitHub issues, spawn worker and reviewer sessions,
+send them follow-up instructions, kill sessions, and remove worktrees for
+finished work.
 
-You **may not**: close an issue, or **implement the work yourself instead of
-spawning a worker** (see above). Ever.
+Close an issue when it is resolved (its PR merged, or the work landed some
+other way), a duplicate, or superseded — and leave a comment saying which, with
+the PR or issue that settles it. Being blocked, hard or stale is not a reason to
+close: that is a **Blocked** or **Not started** entry in your ledger. Workers
+still never close issues; that is yours, because only you see the whole board.
+
+You **may not** **implement the work yourself instead of spawning a worker**
+(see above). Ever.
 
 **Merging is granted per repo, and you do not have it by default.** Check before
 you plan around it:
