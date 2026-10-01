@@ -19,6 +19,8 @@
 #   5. expiry is durable -> the next relink does not resurrect it
 #   6. other harnesses   -> a pi manager is judged by PI_SESSION_ID, and a
 #                           variable leaked from a parent agent is ignored
+#   7. pane moved        -> the manager's @agent_pane follows its agent, so the
+#                           watcher is not left nudging a dead pane
 
 set -u
 emulate -L zsh
@@ -107,7 +109,7 @@ AGENT_VARS=(CLAUDE_CODE_SESSION_ID PI_SESSION_ID CODEX_THREAD_ID OPENCODE_SESSIO
 relink() {
 	( unset $AGENT_VARS
 	  [[ -n ${1:-} ]] && export CLAUDE_CODE_SESSION_ID="$1"
-	  STUB_SESSION="$SESSION" TMUX_PANE='%1' \
+	  STUB_SESSION="$SESSION" TMUX_PANE="${RELINK_PANE:-%1}" \
 		"$SCRIPTS/tmux-apex.sh" relink ) >/dev/null 2>&1 || true
 }
 
@@ -121,7 +123,7 @@ relink_as() {
 	ln -sf "$(command -v zsh)" "$FAKE/$agent"
 	( unset $AGENT_VARS
 	  export "$@"
-	  STUB_SESSION="$SESSION" TMUX_PANE='%1' \
+	  STUB_SESSION="$SESSION" TMUX_PANE="${RELINK_PANE:-%1}" \
 		"$FAKE/$agent" -c '"$0" relink; :' "$SCRIPTS/tmux-apex.sh" ) >/dev/null 2>&1 || true
 }
 
@@ -183,6 +185,38 @@ print "\ncodex manager"
 setup codex-aaa
 relink_as codex CODEX_THREAD_ID=codex-bbb
 eq "a new codex thread expires it" "" "$(role)"
+
+# ─── 7. the manager's agent moved panes ──────────────────────────────
+
+agent_pane() { cat "$STUB/opt.session.${SESSION}._agent_pane" 2>/dev/null }
+
+print "\nmanager agent in a new pane"
+setup pi-aaa
+print -r -- '%44' > "$STUB/opt.session.${SESSION}._agent_pane"
+RELINK_PANE='%130' relink_as pi PI_SESSION_ID=pi-aaa
+eq "@agent_pane follows the agent" '%130' "$(agent_pane)"
+eq "the move is logged" manager-pane \
+	"$(jq -rs '[.[] | select(.event=="manager-pane")] | last | .event // empty' "$APEX_ROOT/$SESSION/events.jsonl")"
+
+setup pi-aaa
+print -r -- '%44' > "$STUB/opt.session.${SESSION}._agent_pane"
+RELINK_PANE='%130' relink ""
+eq "an unknown conversation does not move it" '%44' "$(agent_pane)"
+
+setup pi-aaa
+print -r -- '%44' > "$STUB/opt.session.${SESSION}._agent_pane"
+print -r -- worker > "$STUB/opt.pane._130._apex_role"
+RELINK_PANE='%130' relink_as pi PI_SESSION_ID=pi-aaa
+eq "a member's pane is never adopted" '%44' "$(agent_pane)"
+
+setup ""
+# No repo on record, so re-derivation does not need $PWD to be that repo.
+jq -c 'del(.repo)' "$APEX_ROOT/$SESSION/apex.json" > "$TMPROOT/apex.json" \
+	&& mv "$TMPROOT/apex.json" "$APEX_ROOT/$SESSION/apex.json"
+print -r -- '%44' > "$STUB/opt.session.${SESSION}._agent_pane"
+rm -f "$STUB/opt.session.${SESSION}._apex_role"
+RELINK_PANE='%130' relink_as pi PI_SESSION_ID=pi-aaa
+eq "a re-derived manager adopts its pane too" '%130' "$(agent_pane)"
 
 print ""
 print "  $PASS passed, $FAIL failed"

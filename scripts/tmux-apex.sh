@@ -1497,6 +1497,29 @@ _apex_manager_agent_gone() {
 	return 0
 }
 
+# _apex_manager_adopt_pane <session> <pane> <agent-session-id> — point the
+# manager's @agent_pane at the pane its agent is running in now.
+#
+# `init` is the only other writer, so a manager whose agent moved to a new pane
+# — restarted in a fresh split, switched harness, the old pane closed — kept an
+# @agent_pane naming a pane that no longer exists. The watcher then logs "no
+# agent pane" every tick and never nudges, and pings surface only through the
+# prompt hook, i.e. when the human types (seen with a pi manager in %130 still
+# pointed at a dead %44).
+#
+# Only with a known conversation id: by the time relink calls this, a known id
+# has already been checked against the one `init` recorded, so the caller is
+# the manager's own conversation and not some other agent sharing its session.
+# A member's pane is never adopted.
+_apex_manager_adopt_pane() {
+	local session="$1" pane="$2" agent="$3"
+	[[ -n $pane && -n $agent ]] || return 0
+	[[ -n $(tmux show-option -p -t "$pane" -qv @apex_role 2>/dev/null) ]] && return 0
+	[[ $(_sopt "$session" @agent_pane) == "$pane" ]] && return 0
+	tmux set-option -t "$session" @agent_pane "$pane" 2>/dev/null
+	apex_event "$session" "$(jq -nc --arg p "$pane" '{event:"manager-pane", agent_pane:$p}')"
+}
+
 _cmd_relink() {
 	local session pane agent=""
 	while (( $# )); do
@@ -1518,7 +1541,9 @@ _cmd_relink() {
 	fi
 
 	if [[ $(_sopt "$session" @apex_role) == manager ]]; then
-		# Already linked — but the watcher may not be (see the header above).
+		# Already linked — but the watcher may not be (see the header above),
+		# and the agent may have moved panes.
+		_apex_manager_adopt_pane "$session" "$pane" "$agent"
 		_apex_watch_start "$session"
 		return 0
 	fi
@@ -1538,6 +1563,7 @@ _cmd_relink() {
 			tmux set-option -t "$session" @apex_role manager
 			[[ -n $repo ]] && tmux set-option -t "$session" @apex_repo "$repo"
 			tmux refresh-client -S 2>/dev/null
+			_apex_manager_adopt_pane "$session" "$pane" "$agent"
 			_apex_watch_start "$session"
 			return 0
 		fi
