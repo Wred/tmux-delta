@@ -391,22 +391,22 @@ _cycle_right() {
 
 _on_enter() {
 	case "$1" in
-		"Sessions> ")    echo "execute-silent(printf '%s\n%s' select {1} > \"\$TMUX_PICKER_OUT\")+abort" ;;
-		"Directories> ") echo "execute-silent(printf '%s\n%s' select {1} > \"\$TMUX_PICKER_OUT\")+abort" ;;
-		"Worktrees> ")   echo "execute-silent(printf '%s\n%s\n%s' select {1} {q} > \"\$TMUX_PICKER_OUT\")+abort" ;;
-		"Issues> ")      echo "execute-silent(printf '%s\n%s' interactive {1} > \"\$TMUX_PICKER_OUT\")+abort" ;;
-		"Issues (mine)> ") echo "execute-silent(printf '%s\n%s' interactive {1} > \"\$TMUX_PICKER_OUT\")+abort" ;;
-		"PRs> ")         echo "execute-silent(printf '%s\n%s' select {1} > \"\$TMUX_PICKER_OUT\")+abort" ;;
-		"Closed PRs> ")  echo "execute-silent(printf '%s\n%s' select {1} > \"\$TMUX_PICKER_OUT\")+abort" ;;
-		"Ready> ")       echo "execute-silent(printf '%s\n%s' select {1} > \"\$TMUX_PICKER_OUT\")+abort" ;;
+		"Sessions> ")    echo "become(printf '%s\n%s' select {1})" ;;
+		"Directories> ") echo "become(printf '%s\n%s' select {1})" ;;
+		"Worktrees> ")   echo "become(printf '%s\n%s\n%s' select {1} {q})" ;;
+		"Issues> ")      echo "become(printf '%s\n%s' interactive {1})" ;;
+		"Issues (mine)> ") echo "become(printf '%s\n%s' interactive {1})" ;;
+		"PRs> ")         echo "become(printf '%s\n%s' select {1})" ;;
+		"Closed PRs> ")  echo "become(printf '%s\n%s' select {1})" ;;
+		"Ready> ")       echo "become(printf '%s\n%s' select {1})" ;;
 	esac
 }
 
 _on_ctrl_a() {
 	case "$1" in
-	"Issues> ") echo "execute-silent(printf '%s\n%s' autonomous {1} > \"\$TMUX_PICKER_OUT\")+abort" ;;
-	"Issues (mine)> ") echo "execute-silent(printf '%s\n%s' autonomous {1} > \"\$TMUX_PICKER_OUT\")+abort" ;;
-	"Ready> ")  echo "execute-silent(printf 'review-all\n' > \"\$TMUX_PICKER_OUT\")+abort" ;;
+	"Issues> ") echo "become(printf '%s\n%s' autonomous {1})" ;;
+	"Issues (mine)> ") echo "become(printf '%s\n%s' autonomous {1})" ;;
+	"Ready> ")  echo "become(printf 'review-all\n')" ;;
 esac
 }
 
@@ -457,7 +457,7 @@ _open_finder() {
 	fi
 }
 
-# Hands the item back through $TMUX_PICKER_OUT rather than opening from an execute():
+# Hands the item back through become() rather than opening from an execute():
 # execute()+abort left a failure with nowhere to be seen, since fzf was torn
 # down before anything printed could be read. Coming back as a mode instead,
 # the open runs after fzf is gone but while the popup is still up, so a failure
@@ -465,7 +465,7 @@ _open_finder() {
 _on_ctrl_o() {
 	case "$1" in
 		"Sessions> "|"Issues> "|"Issues (mine)> "|"PRs> "|"Closed PRs> "|"Ready> "|"Worktrees> ")
-			echo "execute-silent(printf '%s\n%s' browse {1} > \"\$TMUX_PICKER_OUT\")+abort" ;;
+			echo "become(printf '%s\n%s' browse {1})" ;;
 	esac
 }
 
@@ -1213,10 +1213,6 @@ _common_binds=(
 	--bind 'ctrl-x:transform:$TMUX_PICKER --on-ctrl-x "$FZF_PROMPT"'
 )
 
-# fzf actions write their structured result here (see _on_enter).
-export TMUX_PICKER_OUT=$(mktemp)
-trap 'rm -f "$TMUX_PICKER_OUT"' EXIT
-
 # Pre-generate sessions list and header in parallel to reduce fzf startup latency.
 # _tab_header is called as a function (not a subprocess) in the background to avoid
 # re-forking the whole script; _list_sessions runs concurrently in the foreground.
@@ -1264,10 +1260,9 @@ else
 	)
 fi
 
-output=$(<"$TMUX_PICKER_OUT")
 [[ -z $output ]] && exit 0
 
-# Parse structured output written by the fzf enter/ctrl-a/ctrl-o actions
+# Parse structured output from become()
 # Line 1: mode (select | interactive | autonomous | review | browse)
 # Line 2: prefixed item (dir:… | wt:… | issue:…)
 # Line 3: fzf query (worktrees tab only)
