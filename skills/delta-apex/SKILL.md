@@ -571,6 +571,37 @@ Then pick one:
 - **A question only the human can answer** (product decisions, tradeoffs,
   anything irreversible) → surface it to the human. Do not guess on their behalf.
 
+### Never poll for a worker — the worker waits, you get the event
+
+When the next step depends on something external to a worker's work — CI on its
+PR, a deploy, a review, a long build — **you do not poll it.** No `gh pr checks`
+in a loop, no `sleep` and re-check, no `gh run watch`, no `/loop` over a PR. The
+worker that pushed the change is the one that waits for the result; you wait for
+its ping.
+
+Why: every poll spends your context, the scarce thing, on a status that has not
+changed, and a blocking wait freezes you while other workers finish and the
+human writes to you. A worker's context is disposable and its idle time costs
+nothing. Its hooks already turn "finished" into an event you receive for free.
+
+So delegate the waiting:
+
+- **Say it in the brief.** When the work ends in something that must be watched
+  (CI, a check, a deploy), tell the worker to watch it to a conclusion — fix
+  and re-push on red — and only then go idle. Its idle is the event.
+- **If you find yourself about to poll, `send` the worker instead:** "Watch CI
+  on PR #N to completion, fix any failure, and stop only when it is green or you
+  are blocked." Then carry on with other work or wait for the ping.
+- **If the worker is gone** (reaped, dead), the thing to hand off is a new
+  worker or a reviewer, not your own polling loop.
+
+What stays yours is the *one* read at decision time: when a ping says the worker
+is done, check the head commit's `statusCheckRollup` once, against the merge
+criteria. That is verifying a claim, not waiting on one. The same goes for
+`pending` when delivery hooks are known to be broken (see "Turning the mode on"
+— that is a fallback for missing events, not a license to poll for ones that
+will arrive).
+
 ## You are the memory of the effort
 
 An apex session is meant to live a long time — days or weeks, across many
