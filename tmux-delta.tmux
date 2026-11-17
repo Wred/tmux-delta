@@ -48,6 +48,10 @@ tmux set-hook -g after-select-window    "$hook_cmd"
 # attention glyph it just cleared.
 tmux set-hook -g client-session-changed "run-shell -b '${SCRIPTS}/agent-icons-refresh.sh --ack \"#{session_name}\"'; $hook_cmd"
 
+# tmux's default Ctrl+click on a status pill swaps windows between sessions,
+# which silently exchanges two sessions' contents. Never wanted here.
+tmux unbind -n C-MouseDown1Status
+
 # ─── Picker keybind ──────────────────────────────────────────────────────────
 is_ssh="ps -o comm= -t '#{pane_tty}' | grep -iqE '^ssh$'"
 picker_key=$(tmux show-option -gqv @tmux_delta_picker_key 2>/dev/null)
