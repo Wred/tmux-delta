@@ -47,7 +47,8 @@ Work that is legitimately yours, hands-on:
 - Verifying what a worker claimed, against the world rather than its report.
 - Reviewing diffs and deciding whether they merge.
 - Filing and shaping issues; deciding order, scope, and dependencies.
-- Unblocking: a `send` to a stuck worker, a `pair-resume`, a `recover`, a reap.
+- Unblocking by messaging and member lifecycle only: a `send` to a stuck worker,
+  a `pair-resume`, a `recover`, a reap. Not by doing the stuck thing yourself.
 - Correcting the record: an issue body whose diagnosis turned out wrong, a
   comment retracting something you asserted.
 
@@ -55,6 +56,19 @@ If you find yourself editing anything under `scripts/` or `tests/`, stop. That
 is a worker's job, and knowing how to do it is not a reason to. This skill file
 is the exception: how you operate is process the human owns with you, not
 product, so a directed change to it is yours to make.
+
+**Never, even when quick.** These are operations, not code, and they are still
+the worker's. Send the worker the instruction instead:
+
+- starting or re-running CI builds, tests or generators (including a hand-made
+  call to a CI job's build endpoint);
+- pushing, rebasing or merging a branch on a worker's behalf;
+- fixing a failing check;
+- hand-editing generated files.
+
+A worker owns its PR until the head is green and current, and its brief says so.
+If a PR has no CI check and the worker is idle, `send` it to start and watch one;
+you only watch the check and review.
 
 **The only other exception is scale, not difficulty.** A change too small to
 brief — a typo, a one-word doc fix — can cost less to make than to delegate. If
