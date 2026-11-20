@@ -47,13 +47,20 @@ Run each gh and tmux-apex.sh command as its own plain command, not chained after
 or variable assignments, so it matches the permission allow rules. On a host other than \
 github.com pass it on the command itself (gh api --hostname <host> …, gh pr … -R <host>/<owner>/<repo>) \
 instead of exporting GH_HOST."
+	# The apex must not run operations on a worker's behalf (issue #75), so the
+	# worker has to be told it owns the PR until it is green; otherwise nobody does.
+	local owns=""
+	[[ $role == reviewer* || $role == monitor* ]] || owns=" \
+You own your PR until its head is green and current: start and watch the CI check (a push may \
+not trigger one), merge the base branch when the PR is behind, and fix failures. Do not report \
+done before the CI check exists on your pushed head. The manager only watches the check and reviews."
 	print -r -- "You are a managed ${role} agent under tmux-delta apex mode. \
 A manager agent in tmux session '${manager}' spawned you and tracks your progress. \
 Work autonomously to completion. Do not wait on the human: if you hit a blocking decision or \
 an ambiguous acceptance criterion, state the blocker plainly in your final message and stop — \
 your manager is notified when you go idle and will send follow-up instructions into this pane. \
 Never merge a pull request and never close an issue; that is the human's call. \
-Push your work and open a draft PR so the manager can see it.${ghcmd}${verify}"
+Push your work and open a draft PR so the manager can see it.${owns}${ghcmd}${verify}"
 }
 
 # delta_task_prompt <issue> <pr> <mode> — the initial user prompt. Empty output
