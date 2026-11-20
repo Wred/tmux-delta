@@ -25,6 +25,7 @@ run_case() {
 		'"$BLOCK"'
 		pr_cache_read() { : }
 		tmux() { return 0 }
+		uname() { print Darwin }  # Linux CI would send xdg-open to /dev/null
 		open() { print -r -- "OPEN: $1" }
 		xdg-open() { print -r -- "OPEN: $1" }
 		gh() {
@@ -50,9 +51,12 @@ out=$(run_case "issue" 1 "" "error connecting to code.devsnc.com" \
 	&& ok "a failing \`gh issue view\` notifies" \
 	|| bad "a failing \`gh issue view\` notifies" "got: $out"
 
-BRANCH=$(git -C "${0:A:h:h}" branch --show-current)
+# A scratch repo on a named branch: CI checks out a detached HEAD, which has none.
+REPO=$(mktemp -d); trap 'rm -rf "$REPO"' EXIT
+git -C "$REPO" init -q -b testbranch
+BRANCH=testbranch
 out=$(run_case "branch" 1 "" "error connecting to code.devsnc.com" \
-	'_browse_or_report "dir:$PWD"') || :
+	'_browse_or_report "dir:'"$REPO"'"') || :
 [[ $out == *"⚠"*"$BRANCH"*"code.devsnc.com"* ]] \
 	&& ok "a branch with no resolvable URL notifies" \
 	|| bad "a branch with no resolvable URL notifies" "got: $out"
@@ -71,7 +75,7 @@ out=$(run_case "ok" 0 "https://github.com/o/r/pull/42" "" '_browse_or_report "pr
 	|| bad "a resolved PR url opens, and reports nothing" "got: $out"
 
 out=$(run_case "branchpr" 0 $'42\thttps://github.com/o/r/pull/42' "" \
-	'_browse_or_report "dir:$PWD"') || :
+	'_browse_or_report "dir:'"$REPO"'"') || :
 [[ $out == *"OPEN: https://github.com/o/r/pull/42"* && $out != *⚠* ]] \
 	&& ok "_browse_repo splits the number+url lookup correctly" \
 	|| bad "_browse_repo splits the number+url lookup correctly" "got: $out"
