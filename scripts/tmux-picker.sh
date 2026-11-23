@@ -327,8 +327,8 @@ _tab_header() {
 _switch_tab() {
 	local tab=$1
 	case $tab in
-		sessions)  echo "change-prompt(Sessions> )+reload($TMUX_PICKER --list-sessions)+transform-header($TMUX_PICKER --tab-header sessions)+clear-query" ;;
-		dirs)      echo "change-prompt(Directories> )+reload($TMUX_PICKER --list-dirs)+transform-header($TMUX_PICKER --tab-header dirs)+clear-query" ;;
+		sessions)  echo "change-prompt(  Sessions> )+reload($TMUX_PICKER --list-sessions)+transform-header($TMUX_PICKER --tab-header sessions)+clear-query" ;;
+		dirs)      echo "change-prompt(  Directories> )+reload($TMUX_PICKER --list-dirs)+transform-header($TMUX_PICKER --tab-header dirs)+clear-query" ;;
 		worktrees)
 			local current_wt pos=1
 			current_wt=$(git rev-parse --show-toplevel 2>/dev/null)
@@ -339,32 +339,32 @@ _switch_tab() {
 					[[ ${line%%$'\t'*} == "wt:${current_wt}" ]] && pos=$i && break
 				done < <("$TMUX_PICKER" --list-worktrees 2>/dev/null)
 			fi
-			echo "change-prompt(Worktrees> )+reload-sync($TMUX_PICKER --list-worktrees)+transform-header($TMUX_PICKER --tab-header worktrees)+clear-query+pos($pos)"
+			echo "change-prompt(  Worktrees> )+reload-sync($TMUX_PICKER --list-worktrees)+transform-header($TMUX_PICKER --tab-header worktrees)+clear-query+pos($pos)"
 			;;
-		issues)    echo "change-prompt(Issues> )+reload-sync($TMUX_PICKER --list-issues)+transform-header($TMUX_PICKER --tab-header issues)+clear-query" ;;
-		"issues-mine") echo "change-prompt(Issues (mine)> )+reload-sync($TMUX_PICKER --list-issues mine)+transform-header($TMUX_PICKER --tab-header issues)+clear-query" ;;
-		prs)       echo "change-prompt(PRs> )+reload-sync($TMUX_PICKER --list-prs)+transform-header($TMUX_PICKER --tab-header prs)+clear-query" ;;
-		closed)    echo "change-prompt(Closed PRs> )+reload-sync($TMUX_PICKER --list-prs-closed)+transform-header($TMUX_PICKER --tab-header closed)+clear-query" ;;
-		ready)     echo "change-prompt(Ready> )+reload-sync($TMUX_PICKER --list-prs-ready)+transform-header($TMUX_PICKER --tab-header ready)+clear-query" ;;
+		issues)    echo "change-prompt(  Issues> )+reload-sync($TMUX_PICKER --list-issues)+transform-header($TMUX_PICKER --tab-header issues)+clear-query" ;;
+		"issues-mine") echo "change-prompt(  Issues (mine)> )+reload-sync($TMUX_PICKER --list-issues mine)+transform-header($TMUX_PICKER --tab-header issues)+clear-query" ;;
+		prs)       echo "change-prompt(  PRs> )+reload-sync($TMUX_PICKER --list-prs)+transform-header($TMUX_PICKER --tab-header prs)+clear-query" ;;
+		closed)    echo "change-prompt(  Closed PRs> )+reload-sync($TMUX_PICKER --list-prs-closed)+transform-header($TMUX_PICKER --tab-header closed)+clear-query" ;;
+		ready)     echo "change-prompt(  Ready> )+reload-sync($TMUX_PICKER --list-prs-ready)+transform-header($TMUX_PICKER --tab-header ready)+clear-query" ;;
 	esac
 }
 
 _cycle_left() {
 	if git rev-parse --git-dir &>/dev/null; then
 		case "$1" in
-			"Sessions> ")    _switch_tab prs ;;
-			"Directories> ") _switch_tab sessions ;;
-			"Issues> ")      _switch_tab dirs ;;
-			"Issues (mine)> ") _switch_tab dirs ;;
-			"Worktrees> ")   _switch_tab issues ;;
-			"PRs> ")         _switch_tab worktrees ;;
-			"Closed PRs> ")  _switch_tab prs ;;
-			"Ready> ")       _switch_tab closed ;;
+			"  Sessions> ")    _switch_tab prs ;;
+			"  Directories> ") _switch_tab sessions ;;
+			"  Issues> ")      _switch_tab dirs ;;
+			"  Issues (mine)> ") _switch_tab dirs ;;
+			"  Worktrees> ")   _switch_tab issues ;;
+			"  PRs> ")         _switch_tab worktrees ;;
+			"  Closed PRs> ")  _switch_tab prs ;;
+			"  Ready> ")       _switch_tab closed ;;
 		esac
 	else
 		case "$1" in
-			"Sessions> ")    _switch_tab dirs ;;
-			"Directories> ") _switch_tab sessions ;;
+			"  Sessions> ")    _switch_tab dirs ;;
+			"  Directories> ") _switch_tab sessions ;;
 		esac
 	fi
 }
@@ -372,63 +372,63 @@ _cycle_left() {
 _cycle_right() {
 	if git rev-parse --git-dir &>/dev/null; then
 		case "$1" in
-			"Sessions> ")    _switch_tab dirs ;;
-			"Directories> ") _switch_tab issues ;;
-			"Issues> ")      _switch_tab worktrees ;;
-			"Issues (mine)> ") _switch_tab worktrees ;;
-			"Worktrees> ")   _switch_tab prs ;;
-			"PRs> ")         _switch_tab closed ;;
-			"Closed PRs> ")  _switch_tab ready ;;
-			"Ready> ")       _switch_tab dirs ;;
+			"  Sessions> ")    _switch_tab dirs ;;
+			"  Directories> ") _switch_tab issues ;;
+			"  Issues> ")      _switch_tab worktrees ;;
+			"  Issues (mine)> ") _switch_tab worktrees ;;
+			"  Worktrees> ")   _switch_tab prs ;;
+			"  PRs> ")         _switch_tab closed ;;
+			"  Closed PRs> ")  _switch_tab ready ;;
+			"  Ready> ")       _switch_tab dirs ;;
 		esac
 	else
 		case "$1" in
-			"Sessions> ")    _switch_tab dirs ;;
-			"Directories> ") _switch_tab sessions ;;
+			"  Sessions> ")    _switch_tab dirs ;;
+			"  Directories> ") _switch_tab sessions ;;
 		esac
 	fi
 }
 
 _on_enter() {
 	case "$1" in
-		"Sessions> ")    echo "become(printf '%s\n%s' select {1})" ;;
-		"Directories> ") echo "become(printf '%s\n%s' select {1})" ;;
-		"Worktrees> ")   echo "become(printf '%s\n%s\n%s' select {1} {q})" ;;
-		"Issues> ")      echo "become(printf '%s\n%s' interactive {1})" ;;
-		"Issues (mine)> ") echo "become(printf '%s\n%s' interactive {1})" ;;
-		"PRs> ")         echo "become(printf '%s\n%s' select {1})" ;;
-		"Closed PRs> ")  echo "become(printf '%s\n%s' select {1})" ;;
-		"Ready> ")       echo "become(printf '%s\n%s' select {1})" ;;
+		"  Sessions> ")    echo "become(printf '%s\n%s' select {1})" ;;
+		"  Directories> ") echo "become(printf '%s\n%s' select {1})" ;;
+		"  Worktrees> ")   echo "become(printf '%s\n%s\n%s' select {1} {q})" ;;
+		"  Issues> ")      echo "become(printf '%s\n%s' interactive {1})" ;;
+		"  Issues (mine)> ") echo "become(printf '%s\n%s' interactive {1})" ;;
+		"  PRs> ")         echo "become(printf '%s\n%s' select {1})" ;;
+		"  Closed PRs> ")  echo "become(printf '%s\n%s' select {1})" ;;
+		"  Ready> ")       echo "become(printf '%s\n%s' select {1})" ;;
 	esac
 }
 
 _on_ctrl_a() {
 	case "$1" in
-	"Issues> ") echo "become(printf '%s\n%s' autonomous {1})" ;;
-	"Issues (mine)> ") echo "become(printf '%s\n%s' autonomous {1})" ;;
-	"Ready> ")  echo "become(printf 'review-all\n')" ;;
+	"  Issues> ") echo "become(printf '%s\n%s' autonomous {1})" ;;
+	"  Issues (mine)> ") echo "become(printf '%s\n%s' autonomous {1})" ;;
+	"  Ready> ")  echo "become(printf 'review-all\n')" ;;
 esac
 }
 
 _on_ctrl_y() {
 	case "$1" in
-		"Issues> ")        _switch_tab issues-mine ;;
-		"Issues (mine)> ") _switch_tab issues ;;
+		"  Issues> ")        _switch_tab issues-mine ;;
+		"  Issues (mine)> ") _switch_tab issues ;;
 	esac
 }
 
 _on_ctrl_x() {
 	case "$1" in
-		"Sessions> ")  echo "execute($TMUX_PICKER --delete-session {1})+abort" ;;
-		"Worktrees> ") echo "execute($TMUX_PICKER --delete-wt {1})+abort" ;;
+		"  Sessions> ")  echo "execute($TMUX_PICKER --delete-session {1})+abort" ;;
+		"  Worktrees> ") echo "execute($TMUX_PICKER --delete-wt {1})+abort" ;;
 	esac
 }
 
 _on_ctrl_e() {
 	case "$1" in
-		"Sessions> ")    echo "execute($TMUX_PICKER --open-finder {1})+abort" ;;
-		"Directories> ") echo "execute($TMUX_PICKER --open-finder {1})+abort" ;;
-		"Worktrees> ")   echo "execute($TMUX_PICKER --open-finder {1})+abort" ;;
+		"  Sessions> ")    echo "execute($TMUX_PICKER --open-finder {1})+abort" ;;
+		"  Directories> ") echo "execute($TMUX_PICKER --open-finder {1})+abort" ;;
+		"  Worktrees> ")   echo "execute($TMUX_PICKER --open-finder {1})+abort" ;;
 	esac
 }
 
@@ -464,7 +464,7 @@ _open_finder() {
 # can print there and wait to be dismissed.
 _on_ctrl_o() {
 	case "$1" in
-		"Sessions> "|"Issues> "|"Issues (mine)> "|"PRs> "|"Closed PRs> "|"Ready> "|"Worktrees> ")
+		"  Sessions> "|"  Issues> "|"  Issues (mine)> "|"  PRs> "|"  Closed PRs> "|"  Ready> "|"  Worktrees> ")
 			echo "become(printf '%s\n%s' browse {1})" ;;
 	esac
 }
@@ -1237,7 +1237,7 @@ fi
 if git rev-parse --git-dir &>/dev/null; then
 	output=$(echo "$_sessions_list" | fzf --ansi \
 		--delimiter=$'\t' --with-nth=2 \
-		--prompt 'Sessions> ' \
+		--prompt '  Sessions> ' \
 		--header "$_header" \
 		"${_common_binds[@]}" \
 		--bind "load:pos($_current_session_pos)+unbind(load)" \
@@ -1253,7 +1253,7 @@ if git rev-parse --git-dir &>/dev/null; then
 else
 	output=$(echo "$_sessions_list" | fzf --ansi \
 		--delimiter=$'\t' --with-nth=2 \
-		--prompt 'Sessions> ' \
+		--prompt '  Sessions> ' \
 		--header "$_header" \
 		"${_common_binds[@]}" \
 		--bind "load:pos($_current_session_pos)+unbind(load)" \
