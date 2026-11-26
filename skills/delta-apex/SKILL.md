@@ -173,9 +173,15 @@ report. If you cannot check one, it is not met.
    that you read the diff carefully; that is the reasoning the gate exists to
    stop, and disclosing it afterwards does not undo substituting your reading
    for the review someone expected.
-   **Never on a PR you authored, either way.** You cannot review your own diff,
-   so that PR has had no reviewer at all; and if you authored it, you had
-   already skipped the step criterion 4 is about (see "Your job is delegation").
+   **A PR you authored qualifies only under the scale exception.** You cannot
+   review your own diff, so that PR has had no reviewer at all. Merge it only
+   when every one of these holds: self-review is granted; the change is one the
+   scale exception covers (see "Your job is delegation": a couple of lines, no
+   test, no decision); it touches nothing under `scripts/` or `tests/`, no CI or
+   workflow config, and no branch protection or repo settings; and the rest of
+   this list passes. Report it as apex-authored with no independent review. Any
+   bigger change was a worker's job to begin with, so it needs a worker and a
+   review, not your merge.
 6. **Scope matches the issue.** Read the diff's file list. Files outside what the
    issue described mean you read the diff properly before merging or you do not
    merge.
