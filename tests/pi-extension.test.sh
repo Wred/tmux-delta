@@ -44,6 +44,7 @@ STUB
 cat > "$T/scripts/apex-manager-notify.sh" <<'STUB'
 #!/usr/bin/env zsh
 print -r -- "$*" >> "$LOG/notify"
+[[ -e $LOG/slow ]] && sleep 1
 if [[ ( $1 == poll || $1 == prompt ) && -s $LOG/pending ]]; then
 	print "[apex] pending events since you last checked:"; cat "$LOG/pending"; : > "$LOG/pending"
 fi
@@ -59,6 +60,9 @@ import { join } from "node:path";
 const T = process.env.T, LOG = process.env.LOG;
 const ext = await import(join(T, "extensions/pi/tmux-status.ts"));
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+// Positive outcomes are awaited, not slept for: a tick spawns processes, and a
+// loaded CI runner can take longer than any fixed slack.
+const until = async (pred, ms = 6000) => { for (const end = Date.now() + ms; !pred() && Date.now() < end; ) await sleep(50); };
 let pass = 0, fail = 0;
 const ok = (name, fn) => { try { fn(); console.log(`  ok   ${name}`); pass++; } catch (e) { console.error(`  FAIL ${name}\n       ${e.message}`); fail++; } };
 const read = (f) => { try { return readFileSync(join(LOG, f), "utf8"); } catch { return ""; } };
@@ -73,10 +77,14 @@ async function start(ident) {
 	mkdirSync(LOG, { recursive: true });
 	process.env.IDENT = ident;
 	const handlers = {}, sent = [], statuses = [];
-	const state = { idle: true, editor: "" };
+	const state = { idle: true, editor: "", stale: false };
 	const pi = {
 		on: (ev, fn) => { handlers[ev] = fn; },
-		sendMessage: (message, options) => sent.push({ message, options }),
+		// A `pi` used after its session was replaced throws (pi docs).
+		sendMessage: (message, options) => {
+			if (state.stale) throw new Error("stale pi");
+			sent.push({ message, options });
+		},
 	};
 	const ctx = {
 		sessionManager: { getSessionId: () => "sess-1" },
@@ -85,7 +93,8 @@ async function start(ident) {
 	};
 	ext.default(pi);
 	await handlers.session_start({}, ctx);
-	return { handlers, sent, statuses, state, ctx, stop: () => handlers.session_shutdown({}, ctx) };
+	return { handlers, sent, statuses, state, ctx,
+		stop: async () => { await handlers.session_shutdown({}, ctx); state.stale = true; } };
 }
 const PING = "[apex] session=w:%5 role=worker status=idle — branch=b.\n";
 const TICK = 1400;
@@ -117,6 +126,7 @@ console.log("manager: polite");
 	const x = await start("mgr\t%1\tmanager\t\t");
 	x.state.idle = false;
 	writeFileSync(join(LOG, "pending"), PING); touchMembers();
+	await until(() => x.statuses.at(-1) === "apex: 1 pending");
 	await sleep(TICK);
 	ok("busy: no turn is started", () => assert.equal(x.sent.length, 0));
 	ok("busy: nothing is consumed", () => assert.doesNotMatch(read("notify"), /poll/));
@@ -125,7 +135,7 @@ console.log("manager: polite");
 	await sleep(TICK);
 	ok("idle with a draft: no turn is started", () => assert.equal(x.sent.length, 0));
 	x.state.editor = "";
-	await sleep(TICK);
+	await until(() => x.sent.length > 0);
 	ok("idle and empty: delivered once", () => assert.equal(x.sent.length, 1));
 	ok("…starting a turn", () => assert.deepEqual(x.sent[0].options, { deliverAs: "followUp", triggerTurn: true }));
 	ok("…with the pending text", () => assert.match(x.sent[0].message.content, /session=w:%5/));
@@ -141,7 +151,8 @@ console.log("manager: quiet");
 {
 	const x = await start("mgr\t%1\tmanager\t\tquiet");
 	writeFileSync(join(LOG, "pending"), PING); touchMembers();
-	await sleep(TICK * 2);
+	await until(() => x.statuses.at(-1) === "apex: 1 pending");
+	await sleep(TICK);
 	ok("idle and empty: still no turn", () => assert.equal(x.sent.length, 0));
 	ok("nothing is consumed", () => assert.doesNotMatch(read("notify"), /poll/));
 	ok("the pending count is shown", () => assert.equal(x.statuses.at(-1), "apex: 1 pending"));
@@ -156,13 +167,37 @@ console.log("manager: eager");
 	const x = await start("mgr\t%1\tmanager\t\teager");
 	x.state.idle = false; x.state.editor = "draft";
 	writeFileSync(join(LOG, "pending"), PING); touchMembers();
+	await until(() => x.statuses.at(-1) === "apex: 1 pending");
 	await sleep(TICK);
 	ok("busy: no turn is started", () => assert.equal(x.sent.length, 0));
 	x.state.idle = true;
-	await sleep(TICK);
+	await until(() => x.sent.length > 0);
 	ok("idle: a turn is started, draft or not", () =>
 		assert.deepEqual(x.sent.map((s) => s.options), [{ deliverAs: "followUp", triggerTurn: true }]));
 	await x.stop();
+}
+
+// ── session replaced mid-delivery ──
+console.log("session replaced mid-delivery");
+{
+	const x = await start("mgr\t%1\tmanager\t\t");
+	writeFileSync(join(LOG, "slow"), "");
+	writeFileSync(join(LOG, "pending"), PING); touchMembers();
+	await until(() => /^poll$/m.test(read("notify"))); // a slow `poll` is in flight
+	ok("poll is in flight", () => assert.match(read("notify"), /^poll$/m));
+	await x.stop();
+	await sleep(1500);
+	ok("nothing is sent into the replaced session", () => assert.equal(x.sent.length, 0));
+	ok("…and pi survives it", () => assert.ok(true));
+}
+{
+	const x = await start("mgr\t%1\tmanager\t\t");
+	x.state.stale = true;
+	writeFileSync(join(LOG, "pending"), PING); touchMembers();
+	await until(() => /^poll$/m.test(read("notify")));
+	await sleep(500);
+	ok("a throwing sendMessage does not crash pi", () => assert.ok(true));
+	await x.handlers.session_shutdown({}, x.ctx);
 }
 
 // ── member inbox ──
@@ -176,7 +211,7 @@ console.log("member inbox");
 		JSON.stringify({ at: 1, from: "mgr", text: "[apex from:mgr] one" }) + "\n" +
 		JSON.stringify({ at: 2, from: "mgr", text: "[apex from:mgr] two" }) + "\n");
 	writeFileSync(join(inbox, "w:%5.jsonl"), "x\n");
-	await sleep(TICK);
+	await until(() => x.sent.length >= 2);
 	ok("reads its own inbox through check", () => assert.match(read("apex"), /^check --json w:%5$/m));
 	ok("injects each message, oldest first", () =>
 		assert.deepEqual(x.sent.map((s) => s.message.content), ["[apex from:mgr] one", "[apex from:mgr] two"]));

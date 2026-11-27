@@ -194,6 +194,8 @@ export default function (pi: ExtensionAPI) {
 		status(waiting ? `apex: ${waiting} pending` : undefined);
 		if (!waiting || !mayWake(id.wake, idle(), editor())) return;
 		const text = await pending("poll", ctxRef && sid(ctxRef));
+		// Shut down while `poll` ran: this `pi` is stale and would throw.
+		if (!ctxRef) return;
 		waiting = 0;
 		status(undefined);
 		if (!text) return;
@@ -208,6 +210,7 @@ export default function (pi: ExtensionAPI) {
 	async function memberTick(id: Ident, now: number) {
 		if (!changed(join(APEX_ROOT, id.manager, "inbox", `${id.member}.jsonl`), now)) return;
 		const out = await run(APEX, ["check", "--json", id.member]);
+		if (!ctxRef) return;
 		for (const line of out.split("\n")) {
 			let text: unknown;
 			try {
@@ -244,7 +247,8 @@ export default function (pi: ExtensionAPI) {
 		ctxRef = ctx;
 		if (process.env.TMUX && process.env.TMUX_PANE) {
 			await run("tmux", ["set-option", "-p", "-t", process.env.TMUX_PANE, "@apex_native_delivery", String(process.pid)]);
-			timer ??= setInterval(() => void tick(), 1_000);
+			// An unhandled rejection would take pi down with it.
+			timer ??= setInterval(() => void tick().catch(() => {}), 1_000);
 			timer.unref?.();
 		}
 		carried = await pending("session-start", sid(ctx));
