@@ -48,7 +48,12 @@ case "$1" in
 			*pane_id*)         printf '%s\n' "${CLIENT_PANE:-$MGR_PANE}" ;;
 			*)                 printf '%s\n' "${PANE_CMD:-node}" ;;
 		esac ;;
-	show-option)  printf '%s\n' "" ;;
+	show-option)
+		# Only the in-process advertisement (issue #78) ever answers.
+		case "$*" in
+			*@apex_native_delivery*) printf '%s\n' "${NATIVE_PID:-}" ;;
+			*)                       printf '%s\n' "" ;;
+		esac ;;
 	send-keys)
 		shift; args="$*"
 		printf '%s\n' "$args" >> "$KEYS_LOG"
@@ -448,6 +453,23 @@ contains "and submitted" "Enter" "$(keys)"
 # UserPromptSubmit hook attaches the real `pending` output as context, so
 # duplicating it here would only risk the two disagreeing.
 lacks "the nudge does not restate the event itself" "status=idle" "$(keys)"
+
+# A manager whose extension takes delivery in-process (pi, issue #78) must
+# never be typed into: the extension pulls `pending` itself.
+reset
+member 'w:%7' idle 3 -1
+out=$(NATIVE_PID=$$ tick)
+eq "a manager that advertises native delivery is not typed into" "" "$(keys)"
+contains "…and the tick says why" "takes delivery in-process" "$out"
+eq "…and nothing is consumed" "w:%7#3" "$(_apex_pending_sig "$MGR")"
+
+# A crashed extension leaves the option behind; its pid is dead, so the
+# manager falls back to the typed nudge rather than going deaf.
+reset
+member 'w:%7' idle 3 -1
+sleep 30 & dead=$!; kill $dead; wait $dead 2>/dev/null || true
+out=$(NATIVE_PID=$dead tick)
+contains "a dead advertiser's manager is nudged as before" "[apex] a member just changed state" "$(keys)"
 
 # ── not nudging twice for one event ───────────────────────────────────
 # A nudge can sit queued behind a long manager turn. Re-sending every second

@@ -715,6 +715,24 @@ line, since it executes in the *tmux server's* environment rather than the
 caller's, and the daemon records the values it actually started with so
 `watch --status` and `doctor` report those rather than the reader's own defaults.
 
+**pi delivers in-process instead** (issue #78). The pi extension sets the pane
+option `@apex_native_delivery` to its pid at session start, and `watch` never
+types into a manager pane that advertises it. The extension watches the member
+records itself and injects pending pings with `pi.sendMessage`, by the tmux
+option `@apex_wake_mode` (manager session, falling back to global; **default
+`polite`**):
+
+| `@apex_wake_mode` | Starts a turn |
+|-------|-----|
+| `quiet` | never — a footer count, delivered with the next human message |
+| `polite` (default) | only when the agent is idle **and** the editor is empty; otherwise as `quiet` until both hold |
+| `eager` | as soon as the agent is idle |
+
+`send`, pair relays and `recover` nudges to an advertising pi *member* go into
+its inbox (`$XDG_CACHE_HOME/tmux-delta/apex/<manager>/inbox/<member>.jsonl`,
+format in the `tmux-apex.sh` header), which the extension drains and injects as
+follow-ups. `tmux-apex.sh check [--peek] <member>` prints the unread messages.
+
 This deliberately is not `/loop 1s`: a `/loop` tick spends a full manager turn
 whether or not anything happened, which is why that fallback has to be slow.
 Here the polling is free and only the events cost.
@@ -914,6 +932,8 @@ them when launching the agent:
 | `@apex_role` | manager + members | `manager` \| `worker` \| `monitor` |
 | `@apex_session` | members | manager's session name |
 | `@apex_task` | members | `issue:42` or `pr:17` |
+| `@apex_wake_mode` | manager session or global | pi manager wake mode: `quiet` \| `polite` (default) \| `eager` |
+| `@apex_native_delivery` | agent panes (pane-scoped) | pid of an extension that takes apex delivery in-process (pi) |
 | `@agent_pane` | any dev-layout session | pane id of the coding-agent split |
 | `@agent_present` | agent panes (pane-scoped) | `1` once a hook has fired there |
 | `@agent_working` / `@agent_needs_attention` | agent panes + session aggregate | `1` |
