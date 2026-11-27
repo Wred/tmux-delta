@@ -5,6 +5,8 @@
 #     apex.json            manager metadata
 #     members/<session>.json  one per managed session
 #     events.jsonl            append-only transition log
+#     inbox/<member>.jsonl    messages for an in-process member (see `check`
+#                             in tmux-apex.sh for the format)
 #
 # Sourced by tmux-apex.sh (zsh). Writes are atomic (mktemp in-dir + mv),
 # matching the convention in lib/pr-cache.sh.
@@ -16,6 +18,7 @@ apex_file() { printf '%s/%s/apex.json' "$APEX_ROOT" "$1"; }
 apex_members_dir()  { printf '%s/%s/members' "$APEX_ROOT" "$1"; }
 apex_member_file()  { printf '%s/%s/members/%s.json' "$APEX_ROOT" "$1" "$2"; }
 apex_events_file()  { printf '%s/%s/events.jsonl' "$APEX_ROOT" "$1"; }
+apex_inbox_file()   { printf '%s/%s/inbox/%s.jsonl' "$APEX_ROOT" "$1" "$2"; }
 
 apex_init_dirs() {
 	mkdir -p "$(apex_members_dir "$1")"

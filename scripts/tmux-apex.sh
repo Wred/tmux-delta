@@ -19,8 +19,27 @@
 # poller, not an agent turn, that watches durable state at ~1s and nudges the
 # manager's pane only when `pending` has something — see `watch`.
 #
-# Subcommands: init stop relink recover spawn send event status pending reap
-#              profiles watch doctor authority
+# In-process delivery (issue #78). An agent extension that can inject messages
+# into its own conversation (tmux-delta's pi extension) advertises that by
+# setting the pane option @apex_native_delivery to its own pid; it is trusted
+# only while that pid is alive. For such a pane nothing is ever typed:
+#   - `watch` does not nudge an advertising manager; the extension pulls
+#     `pending` itself (wake mode: tmux option @apex_wake_mode, default polite).
+#   - `send`, pair relays and `recover` nudges to an advertising pi member are
+#     stored in that member's inbox, which the extension drains with `check`.
+#
+# Inbox format, shared by any adapter that consumes it:
+#   path     $APEX_ROOT/<manager>/inbox/<member>.jsonl  (<member> = session:%pane)
+#   lines    one JSON object per line, oldest first, append-only:
+#            {"at": <epoch secs>, "from": "<sender label>", "text": "<message>"}
+#            `text` already carries the "[apex from:<label>] " tag.
+#   handled  <path>.handled holds the count of leading lines already handled;
+#            everything after it is unread. Writers and `check` serialise on
+#            the flock <path>.lock.
+#   read it  tmux-apex.sh check [--peek] [--json] <member>
+#
+# Subcommands: init stop relink recover spawn send check event status pending
+#              reap profiles watch doctor authority
 
 SELF="${0:A}"
 SCRIPTS="${SELF:h}"
@@ -2211,9 +2230,19 @@ _opencode_session_for() {
 # enqueuing, so it's backgrounded rather than run synchronously — this can
 # only confirm the message was handed off, not that it was acted on, same
 # as the send-keys path it replaces.
+#
+# pi: stored in the member's inbox (see the header) when its pane advertises
+# in-process delivery; the extension injects it. Returns 2, not 1, when the
+# store itself fails: that pane must never be typed into, so the caller reports
+# a failed delivery instead of falling back to send-keys.
 _send_native() {
-	local agent="$1" wt="$2" text="$3" id
+	local agent="$1" wt="$2" text="$3" manager="${4:-}" target="${5:-}" from="${6:-}" id
 	case "$agent" in
+		pi)
+			[[ -n $manager && -n $target ]] || return 1
+			_pane_native_delivery "$(_agent_pane "$target")" || return 1
+			_inbox_put "$manager" "$target" "$from" "$text" || return 2
+			;;
 		codex)
 			id=$(_codex_thread_for "$wt") || return 1
 			timeout 8 codex queue --thread "$id" --message "$text" >/dev/null 2>&1
@@ -2224,6 +2253,72 @@ _send_native() {
 			;;
 		*) return 1 ;;
 	esac
+}
+
+# _pane_native_delivery <pane> — 0 when a live extension in <pane> takes apex
+# delivery in-process (it sets @apex_native_delivery to its pid; see header).
+# The pid check keeps a crashed agent's leftover option from muting the pane.
+_pane_native_delivery() {
+	local pid
+	[[ -n ${1:-} ]] || return 1
+	pid=$(tmux show-option -p -t "$1" -qv @apex_native_delivery 2>/dev/null)
+	[[ $pid == <-> ]] && kill -0 "$pid" 2>/dev/null
+}
+
+# _inbox_put <manager> <member> <from> <text> — append one message to the
+# member's inbox. Non-zero when it was not stored.
+_inbox_put() {
+	local file line held=1 rc=0
+	file=$(apex_inbox_file "$1" "$2")
+	mkdir -p "${file%/*}" 2>/dev/null || return 1
+	line=$(jq -nc --arg from "$3" --arg text "$4" --argjson at "$(date +%s)" \
+		'{at:$at, from:$from, text:$text}') || return 1
+	# Unlocked on timeout rather than dropped, like member writes: a lost
+	# message is worse than a racy append.
+	apex_lock_acquire "$file.lock" && held=0
+	print -r -- "$line" 2>/dev/null >> "$file" || rc=1
+	(( held == 0 )) && apex_lock_release "$file.lock"
+	return $rc
+}
+
+# check [--peek] [--json] <member> — print the member's unread inbox messages,
+# oldest first, and mark them handled unless --peek. Plain output is each
+# message's text; --json prints the raw inbox lines (what an extension reads).
+_cmd_check() {
+	local peek=false json=false member="" a
+	for a in "$@"; do
+		case "$a" in
+			--peek) peek=true ;;
+			--json) json=true ;;
+			-*)     _die "check: unknown option '$a'" ;;
+			*)      member="$a" ;;
+		esac
+	done
+	[[ -n $member ]] || _die "check: usage: check [--peek] [--json] <member>"
+	local manager
+	manager=$(_resolve_manager "$member") || _die "check: no apex manager for '$member'"
+
+	local file seen
+	file=$(apex_inbox_file "$manager" "$member")
+	[[ -f $file ]] || return 0
+	# Fail rather than read unlocked: a racing second reader would hand the
+	# same messages over twice, while a failed check leaves them unread.
+	apex_lock_acquire "$file.lock" || _die "check: could not lock $file"
+	seen=$(cat "$file.handled" 2>/dev/null) || seen=0
+	[[ $seen == <-> ]] || seen=0
+	local out
+	local -a lines=()
+	out=$(tail -n "+$(( seen + 1 ))" "$file")
+	[[ -n $out ]] && lines=("${(@f)out}")
+	if (( ${#lines} )); then
+		if $json; then
+			print -rl -- "${lines[@]}"
+		else
+			print -rl -- "${lines[@]}" | jq -r '.text'
+		fi
+		$peek || apex_write_atomic "$file.handled" "$(( seen + ${#lines} ))"
+	fi
+	apex_lock_release "$file.lock"
 }
 
 # ─── send ────────────────────────────────────────────────────────────
@@ -2280,10 +2375,14 @@ _deliver() {
 	if [[ -n $manager ]]; then
 		agent=$(apex_member_get "$manager" "$target" agent)
 		wt=$(apex_member_get "$manager" "$target" worktree)
-		if _send_native "$agent" "$wt" "$full"; then
-			_DELIVER_VIA="native: $agent"
+		local nrc=0
+		_send_native "$agent" "$wt" "$full" "$manager" "$target" "${from:-manager}" || nrc=$?
+		if (( nrc == 0 )); then
+			# An inbox store is not a read: say which it was.
+			[[ $agent == pi ]] && _DELIVER_VIA="inbox: $agent" || _DELIVER_VIA="native: $agent"
 			return 0
 		fi
+		(( nrc == 2 )) && return 4
 	fi
 
 	pane=$(_agent_pane "$target")
@@ -2350,7 +2449,11 @@ _cmd_send() {
 		 + (if $spliced != "" then {spliced_onto:$spliced} else {} end)
 		 + (if $unconf != "" then {unconfirmed:true} else {} end)')"
 
-	print "Delivered to $target (${_DELIVER_VIA})."
+	if [[ $_DELIVER_VIA == inbox:* ]]; then
+		print "Stored in $target's inbox (${_DELIVER_VIA}); its extension injects it in-process. Not yet confirmed read."
+	else
+		print "Delivered to $target (${_DELIVER_VIA})."
+	fi
 	if [[ -n ${APEX_SEND_UNCONFIRMED:-} ]]; then
 		print "NOTE: the input box never drained, but the pane stayed busy — assumed submitted, not re-sent."
 	fi
@@ -5263,6 +5366,12 @@ _apex_watch_tick() {
 
 	local pane
 	pane=$(_agent_pane "$manager")
+	# The manager's extension pulls `pending` itself; typing would only
+	# interrupt the human (issue #78).
+	if _pane_native_delivery "$pane"; then
+		print -r -- "$manager takes delivery in-process; not typing"
+		return 0
+	fi
 	if ! _pane_is_agent "$pane"; then
 		print -r -- "no agent pane for $manager; not delivering"
 		return 0
@@ -5792,6 +5901,7 @@ case "${1:-}" in
 	relink)   shift; _cmd_relink "$@" ;;
 	spawn)    shift; _cmd_spawn "$@" ;;
 	send)     shift; _cmd_send "$@" ;;
+	check)    shift; _cmd_check "$@" ;;
 	link)     shift; _cmd_link "$@" ;;
 	unlink)   shift; _cmd_unlink "$@" ;;
 	pair-resume) shift; _cmd_pair_resume "$@" ;;
@@ -5830,6 +5940,8 @@ case "${1:-}" in
 		print "                                 (--mode autonomous is refused with a permission mode"
 		print "                                  that pauses for approval, e.g. acceptEdits)"
 		print "  send <session> <text>          message a session's coding agent"
+		print "  check [--peek] [--json] <member>  print a member's unread inbox messages,"
+		print "                                 oldest first; marks them handled unless --peek"
 		print "  link --worker M --reviewer M   run an automatic fix/re-review loop between two"
 		print "                                 members on one PR; the manager is only pinged"
 		print "                                 once it terminates"

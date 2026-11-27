@@ -64,6 +64,13 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y zsh tmux jq
 
+      # pi-extension runs the pi extension under node, which needs type
+      # stripping (>= 22.6); the runner's default node is older.
+      - if: matrix.suite == 'pi-extension'
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
       # en_US.UTF-8 — agent-icons compares Nerd Font glyphs, which need a
       # UTF-8 locale for zsh's pattern matching to line up.
       - name: Generate en_US.UTF-8 locale

@@ -283,6 +283,13 @@ invisible until the human types. `doctor` reports whether it is running, and
 agent turn and costs you nothing until something actually happens, so leave it
 alone; you do not need a `/loop` heartbeat on top of it.
 
+A pi manager is never typed into: its extension delivers pings in-process. When
+it may start a turn for them is the tmux option `@apex_wake_mode` (manager
+session, else global): `quiet` never does, `polite` (the default) only when you
+are idle and the human's editor is empty, `eager` as soon as you are idle. A pi
+member's messages go to its inbox instead of its pane; `tmux-apex.sh check
+--peek <member>` shows what it has not read yet.
+
 `tmux-apex.sh watch` returns as soon as the poller is up, so it is safe to run
 in a tool call. Never run `watch --daemon` yourself — that is the blocking loop
 `run-shell` invokes, and it will hang your turn until the harness times out.
